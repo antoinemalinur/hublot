@@ -82,6 +82,3 @@ projets, réglages et erreurs ; les 7 lents lancent réellement les moteurs.
 - La clé de transcription reste dans l’environnement du VPS.
 - Le profil Apple gratuit expire après 7 jours : l’app doit alors être
   reconstruite et réinstallée depuis Xcode.
-
-Le journal détaillé des décisions, incidents et mesures se trouve dans
-[`JOURNAL.md`](JOURNAL.md).
