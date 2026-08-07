@@ -46,6 +46,12 @@ final class Dictation {
     private var recorder: AVAudioRecorder?
     private var ticker: Task<Void, Never>?
     private var file: URL?
+    private var closing: RecorderDelegate?
+
+    /// Vrai quand l'enregistrement s'est arrêté de lui-même sur la limite. La
+    /// zone de saisie le dit, au lieu de continuer à afficher « j'écoute »
+    /// devant un micro déjà coupé.
+    private(set) var reachedLimit = false
 
     private let log = Logger(subsystem: "hublot", category: "dictation")
 
@@ -78,11 +84,18 @@ final class Dictation {
                 AVNumberOfChannelsKey: 1,
                 AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue,
             ])
-            recorder.record()
+            // La limite est confiée au recorder plutôt qu'à notre minuteur : le
+            // nôtre se contentait de cesser de compter, et l'enregistrement,
+            // lui, continuait indéfiniment derrière un compteur figé à 3:00.
+            let closing = RecorderDelegate()
+            recorder.delegate = closing
+            recorder.record(forDuration: Self.limit.seconds)
 
             self.recorder = recorder
+            self.closing = closing
             self.file = url
             elapsed = .zero
+            reachedLimit = false
             phase = .recording
             ticker = Task { [weak self] in await self?.tick() }
         } catch {
@@ -92,19 +105,39 @@ final class Dictation {
     }
 
     /// Arrête et rend l'audio. `nil` si rien d'exploitable n'a été capté.
-    func stop() -> Data? {
+    ///
+    /// **Elle attend** que le fichier soit vraiment écrit, et c'est tout son
+    /// intérêt. `AVAudioRecorder.stop()` rend la main avant que l'AAC soit
+    /// clos : il reste à vider le dernier tampon et à poser l'index du
+    /// conteneur `m4a`. Lire le fichier dans la foulée donnait un enregistrement
+    /// amputé de sa fin — et d'autant plus amputé que la dictée était longue.
+    /// Groq transcrivait fidèlement ce qu'on lui envoyait ; c'est nous qui lui
+    /// envoyions une phrase coupée.
+    func stop() async -> Data? {
         ticker?.cancel()
         ticker = nil
-        recorder?.stop()
-        recorder = nil
+
+        guard let recorder, let closing, let file else {
+            phase = .idle
+            self.file = nil
+            return nil
+        }
+        // L'écran doit montrer la transcription en cours pendant qu'on attend
+        // la fermeture du fichier : c'est court, mais ce n'est plus l'écoute.
+        phase = .transcribing
+        if recorder.isRecording { recorder.stop() }
+        await closing.finished()
+
+        self.recorder = nil
+        self.closing = nil
+        self.file = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
 
-        defer { file = nil }
-        guard let file, let data = try? Data(contentsOf: file) else {
+        defer { try? FileManager.default.removeItem(at: file) }
+        guard let data = try? Data(contentsOf: file) else {
             phase = .idle
             return nil
         }
-        try? FileManager.default.removeItem(at: file)
 
         // Un appui malencontreux produit un fichier d'en-tête et rien d'autre.
         // Le monter jusqu'à Groq pour s'entendre répondre du vide serait une
@@ -113,7 +146,7 @@ final class Dictation {
             phase = .idle
             return nil
         }
-        phase = .transcribing
+        log.info("dictée de \(self.caption, privacy: .public) — \(data.count) octets")
         return data
     }
 
@@ -122,6 +155,7 @@ final class Dictation {
         ticker = nil
         recorder?.stop()
         recorder = nil
+        closing = nil
         if let file { try? FileManager.default.removeItem(at: file) }
         file = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -138,6 +172,11 @@ final class Dictation {
         return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 
+    /// Ce que fait le micro, en trois mots. Affirmer « j'écoute » devant un
+    /// enregistrement arrêté par la limite serait faux — et c'est exactement ce
+    /// qu'affichait un compteur figé à 3:00.
+    var listening: String { reachedLimit ? "limite atteinte" : "j'écoute" }
+
     // MARK: Interne
 
     private func tick() async {
@@ -145,7 +184,54 @@ final class Dictation {
             try? await Task.sleep(for: .milliseconds(200))
             guard !Task.isCancelled, phase == .recording else { return }
             elapsed += .milliseconds(200)
-            if elapsed >= Self.limit { return }
+            if elapsed >= Self.limit {
+                reachedLimit = true
+                return
+            }
+        }
+    }
+
+    /// Le témoin de fermeture du fichier.
+    ///
+    /// `AVAudioRecorder` ne rend cette information que par délégué : il n'existe
+    /// aucune propriété à interroger, et aucune durée d'attente qu'on puisse
+    /// choisir sans se tromper. C'est donc la seule façon correcte de savoir
+    /// que l'enregistrement est complet sur le disque.
+    @MainActor
+    private final class RecorderDelegate: NSObject, AVAudioRecorderDelegate {
+        private var waiting: CheckedContinuation<Void, Never>?
+        private var isDone = false
+
+        /// Rend la main quand le fichier est clos — tout de suite s'il l'est
+        /// déjà, ce qui est le cas quand la limite a coupé l'enregistrement
+        /// avant qu'on y touche.
+        func finished() async {
+            guard !isDone else { return }
+            await withCheckedContinuation { continuation in
+                if isDone {
+                    continuation.resume()
+                } else {
+                    waiting = continuation
+                }
+            }
+        }
+
+        private func complete() {
+            isDone = true
+            waiting?.resume()
+            waiting = nil
+        }
+
+        nonisolated func audioRecorderDidFinishRecording(
+            _ recorder: AVAudioRecorder, successfully flag: Bool
+        ) {
+            Task { @MainActor in self.complete() }
+        }
+
+        nonisolated func audioRecorderEncodeErrorDidOccur(
+            _ recorder: AVAudioRecorder, error: (any Error)?
+        ) {
+            Task { @MainActor in self.complete() }
         }
     }
 

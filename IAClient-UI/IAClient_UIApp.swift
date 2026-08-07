@@ -51,7 +51,9 @@ struct RootView: View {
                         engine: chat.engine,
                         plan: chat.plan,
                         turns: chat.turns,
-                        onSend: { text in Task { await chat.send(text) } },
+                        onSend: { text, images in
+                            Task { await chat.send(text, attachments: images) }
+                        },
                         onBack: { model.closeConversation() },
                         configOptions: chat.configOptions,
                         status: chat.metrics,
@@ -60,9 +62,17 @@ struct RootView: View {
                             Task { await chat.choose(option, value: value) }
                         },
                         isWorking: chat.isWorking,
+                        isReconnecting: model.isReconnecting,
                         onStop: { Task { await chat.cancel() } },
                         onDictate: { audio in try? await chat.transcribe(audio) }
                     )
+                } else {
+                    // Le fil peut disparaître sous l'écran : une reprise de
+                    // liaison le détruit avant de le reconstruire. Pendant ce
+                    // battement, il faut montrer quelque chose — l'écran vide
+                    // qui tenait lieu de réponse ici ne laissait qu'une issue,
+                    // tuer l'application.
+                    ReconnectingView(onGiveUp: { model.closeConversation() })
                 }
             }
         }

@@ -252,18 +252,28 @@ nonisolated struct SetModeParams: Encodable, Sendable {
 
 nonisolated enum ContentBlock: Codable, Sendable, Hashable {
     case text(String)
-    /// Tout ce qui n'est pas du texte : image, lien de ressource, ressource
-    /// embarquée. Conservé brut plutôt qu'ignoré — hors périmètre v1, mais on
-    /// ne perd pas la donnée.
+    /// Une image jointe à la demande : `{"type":"image","mimeType":…,"data":…}`,
+    /// la charge en base64. La forme est celle d'ACP, et c'est aussi celle que
+    /// le serveur du VPS attend pour la poser sur son disque.
+    case image(mimeType: String, data: String)
+    /// Tout ce qui n'est ni texte ni image : lien de ressource, ressource
+    /// embarquée. Conservé brut plutôt qu'ignoré — on ne perd pas la donnée.
     case other(JSONValue)
 
-    private enum CodingKeys: String, CodingKey { case type, text }
+    private enum CodingKeys: String, CodingKey { case type, text, mimeType, data }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        if try container.decodeIfPresent(String.self, forKey: .type) == "text" {
+        switch try container.decodeIfPresent(String.self, forKey: .type) {
+        case "text":
             self = .text(try container.decodeIfPresent(String.self, forKey: .text) ?? "")
-        } else {
+        case "image":
+            self = .image(
+                mimeType: try container.decodeIfPresent(String.self, forKey: .mimeType)
+                    ?? "image/jpeg",
+                data: try container.decodeIfPresent(String.self, forKey: .data) ?? ""
+            )
+        default:
             self = .other(try JSONValue(from: decoder))
         }
     }
@@ -274,6 +284,11 @@ nonisolated enum ContentBlock: Codable, Sendable, Hashable {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode("text", forKey: .type)
             try container.encode(text, forKey: .text)
+        case .image(let mimeType, let data):
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode("image", forKey: .type)
+            try container.encode(mimeType, forKey: .mimeType)
+            try container.encode(data, forKey: .data)
         case .other(let value):
             try value.encode(to: encoder)
         }

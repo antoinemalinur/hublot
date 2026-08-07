@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import json
 import os
@@ -32,6 +33,7 @@ import urllib.error
 import urllib.request
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -407,12 +409,23 @@ def write_gap_handoff(engine: str, gap: list[dict[str, Any]], reason: str,
     return bot.HANDOFF_FILE
 
 
+# Les tours en vol, par identifiant de conversation — **toutes liaisons
+# confondues**. Un tour survit au socket qui l'a lancé ; le registre est ce qui
+# permet à la reprise suivante de le retrouver au lieu d'en lancer un second sur
+# le même fichier de conversation.
+ACTIVE_TURNS: dict[str, "PromptTurn"] = {}
+
+
 class PromptTurn:
     """Un tour : lance le moteur choisi, traduit sa sortie, rend un stopReason."""
 
     def __init__(self, session: "Session", text: str) -> None:
         self.session = session
         self.text = text
+        # Franchi quand le tour a vraiment rendu la main. Un `cancel()` envoie
+        # un signal ; il ne dit pas que le processus est mort, et repartir avant
+        # remettrait deux moteurs sur le même fichier.
+        self.finished = asyncio.Event()
         self.process: asyncio.subprocess.Process | None = None
         self.cancelled = False
         self.tools: dict[str, dict[str, Any]] = {}
@@ -485,6 +498,34 @@ class PromptTurn:
     def _write_gap_handoff(self, engine: str, gap: list[dict[str, Any]], reason: str) -> str:
         return write_gap_handoff(engine, gap, reason, self.session.cwd, self.text)
 
+    # Trente-deux mégaoctets : de quoi contenir n'importe quel événement d'un
+    # des deux moteurs, y compris le résultat d'une lecture de gros fichier.
+    STREAM_LIMIT = 32 * 1024 * 1024
+
+    async def _read_event(self, stream: asyncio.StreamReader) -> bytes:
+        """Une ligne d'événement, ou vide à la fin du flux.
+
+        Une ligne plus longue que le tampon est **sautée**, jamais fatale : le
+        tour continue en perdant un événement, au lieu de s'arrêter net sur une
+        exception. La limite est déjà large ; ceci est la ceinture qui va avec
+        les bretelles, parce que le prix d'une erreur ici se paie sous la forme
+        d'une conversation qui se fige sans explication.
+        """
+        while True:
+            try:
+                return await stream.readline()
+            except ValueError:
+                log("événement au-delà du tampon, sauté")
+                # `readline` a laissé la ligne dans le tampon : on la jette
+                # jusqu'au prochain saut de ligne pour reprendre sur un
+                # événement entier.
+                while True:
+                    chunk = await stream.read(65536)
+                    if not chunk:
+                        return b""
+                    if b"\n" in chunk:
+                        break
+
     # -- Claude : le seul chemin réellement streamé -------------------------
 
     async def _run_claude(self, handoff_path: str | None) -> str:
@@ -538,12 +579,24 @@ class PromptTurn:
             *args, cwd=self.session.cwd,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            # La même limite que pour Codex, et pour la même raison — sauf
+            # qu'ici elle manquait, sur le chemin qui sert tous les jours.
+            #
+            # Un événement de Claude tient sur **une** ligne, et certains sont
+            # énormes : le résultat d'une lecture de fichier, une longue
+            # réponse, une image encodée. Au-delà des 64 Kio par défaut,
+            # `readline` ne tronque pas — il lève. Le tour mourait alors en
+            # plein milieu sur une `ValueError`, l'app recevait un `-32602`
+            # qu'elle n'affichait nulle part, et le dernier outil restait « en
+            # cours » pour toujours. C'est très exactement le symptôme de la
+            # réponse qui « s'arrête d'écrire ».
+            limit=self.STREAM_LIMIT,
         )
         stop_reason = "end_turn"
         assert self.process.stdout is not None
 
         while True:
-            line = await self.process.stdout.readline()
+            line = await self._read_event(self.process.stdout)
             if not line:
                 break
             line = line.strip()
@@ -818,7 +871,7 @@ class PromptTurn:
                 # Une ligne JSON contient le message complet. La limite asyncio
                 # par défaut (64 Kio) coupe donc précisément les longues
                 # réponses que ce chemin doit savoir rendre.
-                limit=4 * 1024 * 1024,
+                limit=self.STREAM_LIMIT,
             )
         finally:
             if handoff_path:
@@ -827,7 +880,7 @@ class PromptTurn:
         stop_reason = "end_turn"
         assert self.process.stdout is not None
         while True:
-            line = await self.process.stdout.readline()
+            line = await self._read_event(self.process.stdout)
             if not line:
                 break
             line = line.strip()
@@ -1343,7 +1396,7 @@ class Connection:
             "protocolVersion": PROTOCOL_VERSION,
             "agentCapabilities": {
                 "loadSession": True,
-                "promptCapabilities": {"image": False, "embeddedContext": False},
+                "promptCapabilities": {"image": True, "embeddedContext": False},
                 # `resume` n'est pas annoncé : on ne l'implémente pas, et le
                 # client doit pouvoir se fier à ce qu'on déclare.
                 "sessionCapabilities": {"list": {}, "delete": {}},
@@ -1758,16 +1811,87 @@ class Connection:
         bot.journal("acp_session_deleted", session=session_id, cwd=cwd)
         return {"deleted": removed}
 
+    # Les formats qu'un iPhone produit, et rien de plus : une extension inconnue
+    # deviendrait un fichier que le moteur ouvrirait sans savoir quoi en faire.
+    IMAGE_TYPES = {
+        "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+        "image/heic": ".heic", "image/heif": ".heif", "image/webp": ".webp",
+        "image/gif": ".gif",
+    }
+    IMAGE_LIMIT = 12 * 1024 * 1024
+
+    def _store_images(self, cwd: str, blocks: list[Any]) -> list[str]:
+        """Pose les images jointes sur le disque du VPS et rend leurs chemins.
+
+        Ni Claude ni Codex ne lisent du base64 : ils lisent des fichiers. Écrire
+        l'image dans le dépôt et donner son chemin est donc le seul chemin qui
+        marche pour les deux, sans dépendre d'un mode d'entrée particulier de
+        l'un des deux CLI.
+
+        Les images vivent dans `.hublot/images/`, un dossier qui s'ignore
+        lui-même côté git : on ne salit pas le dépôt qu'on pilote avec des
+        captures d'écran envoyées depuis le téléphone.
+        """
+        images = [
+            block for block in blocks
+            if isinstance(block, dict) and block.get("type") == "image"
+        ]
+        if not images:
+            return []
+
+        folder = Path(cwd) / ".hublot" / "images"
+        folder.mkdir(parents=True, exist_ok=True)
+        ignore = folder.parent / ".gitignore"
+        if not ignore.exists():
+            ignore.write_text("*\n", encoding="utf-8")
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        paths: list[str] = []
+        for index, block in enumerate(images, start=1):
+            mime = str(block.get("mimeType") or "image/jpeg").lower()
+            suffix = self.IMAGE_TYPES.get(mime)
+            if suffix is None:
+                log(f"image ignorée : type {mime} non pris en charge")
+                continue
+            try:
+                raw = base64.b64decode(str(block.get("data") or ""), validate=True)
+            except (ValueError, binascii.Error):
+                log("image ignorée : base64 illisible")
+                continue
+            if not raw or len(raw) > self.IMAGE_LIMIT:
+                log(f"image ignorée : {len(raw)} octets hors bornes")
+                continue
+            target = folder / f"{stamp}-{index}{suffix}"
+            target.write_bytes(raw)
+            paths.append(str(target))
+        return paths
+
     async def _prompt(self, params: dict[str, Any]) -> dict[str, Any]:
         session = self.sessions.get(str(params.get("sessionId") or ""))
         if session is None:
             raise ValueError("session inconnue")
 
+        blocks = params.get("prompt") or []
         text = "\n".join(
             str(block.get("text") or "")
-            for block in params.get("prompt") or []
+            for block in blocks
             if block.get("type") == "text"
         ).strip()
+
+        # Les images d'abord : elles peuvent constituer à elles seules la
+        # demande — « regarde ça » se dit très bien sans un mot.
+        paths = await asyncio.to_thread(self._store_images, session.cwd, blocks)
+        if paths:
+            listing = "\n".join(f"- {path}" for path in paths)
+            preamble = (
+                "Image jointe à cette demande, lis-la avec l'outil Read avant de répondre :"
+                if len(paths) == 1
+                else "Images jointes à cette demande, lis-les avec l'outil Read "
+                     "avant de répondre :"
+            )
+            joined = f"{preamble}\n{listing}"
+            text = f"{text}\n\n{joined}" if text else joined
+
         if not text:
             return {"stopReason": "end_turn"}
 
@@ -1780,12 +1904,30 @@ class Connection:
         if session.turn is not None:
             raise ValueError("un tour est déjà en cours dans cette conversation")
 
+        # Un tour survit à la liaison qui l'a lancé : le moteur continue, et sa
+        # réponse sera rejouée au chargement suivant. Mais chaque reprise crée
+        # une `Session` neuve, qui ne sait rien du tour resté en vol — et deux
+        # `claude --resume` sur le **même** fichier de conversation se marchent
+        # dessus. Le registre est global pour cette raison précise.
+        orphan = ACTIVE_TURNS.get(session.id)
+        if orphan is not None:
+            log(f"tour orphelin arrêté sur {session.id}")
+            await orphan.cancel()
+            try:
+                await asyncio.wait_for(orphan.finished.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                log(f"tour orphelin toujours vivant sur {session.id}, on continue")
+
         turn = PromptTurn(session, text)
         session.turn = turn
+        ACTIVE_TURNS[session.id] = turn
         try:
             stop_reason = await turn.run()
         finally:
             session.turn = None
+            turn.finished.set()
+            if ACTIVE_TURNS.get(session.id) is turn:
+                del ACTIVE_TURNS[session.id]
         return {"stopReason": stop_reason}
 
     async def _cancel(self, params: dict[str, Any]) -> None:

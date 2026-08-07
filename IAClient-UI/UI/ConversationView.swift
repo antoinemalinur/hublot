@@ -12,6 +12,7 @@
 //
 
 import MarkdownUI
+import PhotosUI
 import SwiftUI
 
 struct ConversationView: View {
@@ -20,7 +21,7 @@ struct ConversationView: View {
     var plan: [PlanEntry] = []
     let turns: [Turn]
     /// Vide pour les écrans témoins, branché sur `ChatSession.send` en vrai.
-    var onSend: (String) -> Void = { _ in }
+    var onSend: (String, [Attachment]) -> Void = { _, _ in }
     /// `nil` masque le retour : sur un écran témoin il n'y a nulle part où aller.
     var onBack: (() -> Void)?
     /// Les réglages tels que l'agent les décrit. Vide sur un écran témoin.
@@ -32,6 +33,9 @@ struct ConversationView: View {
     /// Vrai pendant qu'un tour tourne : le bouton d'envoi devient un bouton
     /// d'arrêt, et c'est le seul moyen de reprendre la main avant la fin.
     var isWorking = false
+    /// Vrai pendant qu'on se rebranche : le chrome le dit, plutôt que de laisser
+    /// croire à une réponse qui met du temps à venir.
+    var isReconnecting = false
     var onStop: () -> Void = {}
     /// Transcrit une dictée. `nil` désactive le micro — écrans témoins.
     var onDictate: ((Data) async -> String?)?
@@ -68,7 +72,8 @@ struct ConversationView: View {
             .safeAreaInset(edge: .top, spacing: 0) {
                 SessionChrome(
                     title: sessionTitle, engine: engine, machine: machine, plan: plan,
-                    status: status, contextPercent: contextPercent, onBack: onBack,
+                    status: status, contextPercent: contextPercent,
+                    isReconnecting: isReconnecting, onBack: onBack,
                     onRadiography: { showingRadiography = true }
                 )
             }
@@ -217,6 +222,7 @@ struct SessionChrome: View {
     var status: SessionStatus?
     var contextPercent: Int?
     var commands: [String] = []
+    var isReconnecting = false
     var onBack: (() -> Void)?
     var onRadiography: (() -> Void)?
 
@@ -282,7 +288,24 @@ struct SessionChrome: View {
             // fusionnaient en une forme molle avec une encoche — l'effet d'union
             // du Liquid Glass, spectaculaire entre deux boutons, laid entre un
             // titre et une ligne de chiffres.
-            if let bar = StatusBar.label(status: status, contextPercent: contextPercent) {
+            // Une liaison qui se refait doit se dire. Quand elle se taisait, une
+            // conversation coupée en plein tour ressemblait exactement à une
+            // conversation lente — et on attendait devant une réponse qui
+            // n'arrivait plus.
+            if isReconnecting {
+                HStack(spacing: Hublot.unit * 0.75) {
+                    Image(systemName: "bolt.horizontal.circle")
+                        .font(.system(size: 10, weight: .medium))
+                    Text("reprise de la liaison…")
+                }
+                .font(.hublotMetaEmphasis)
+                .foregroundStyle(Hublot.ember)
+                .padding(.horizontal, Hublot.unit * 1.25)
+                .padding(.vertical, Hublot.unit * 0.5)
+                .glassEffect(.regular, in: .capsule)
+                .padding(.leading, Hublot.unit * 2.5)
+                .transition(.opacity.combined(with: .offset(y: -6)))
+            } else if let bar = StatusBar.label(status: status, contextPercent: contextPercent) {
                 Text(bar)
                     .foregroundStyle(Hublot.meta)
                     .lineLimit(1)
@@ -293,6 +316,7 @@ struct SessionChrome: View {
             }
         }
         .padding(.bottom, Hublot.unit * 1.5)
+        .animation(.snappy(duration: 0.25), value: isReconnecting)
         .background { EdgeScrim(edge: .top).ignoresSafeArea() }
     }
 }
@@ -414,17 +438,28 @@ struct Composer: View {
     var isWorking = false
     var onStop: () -> Void = {}
     var onDictate: ((Data) async -> String?)?
-    let onSend: (String) -> Void
+    let onSend: (String, [Attachment]) -> Void
 
     @State private var draft = ""
     @State private var dictation = Dictation()
+    /// Les images jointes à la demande en cours d'écriture.
+    @State private var attachments: [Attachment] = []
+    /// La sélection brute du sélecteur système, vidée dès qu'elle est lue.
+    @State private var picked: [PhotosPickerItem] = []
+    @State private var isImporting = false
+
+    /// Vrai dès qu'il y a quelque chose à envoyer — une image seule suffit.
+    private var hasSomethingToSend: Bool { !draft.isEmpty || !attachments.isEmpty }
 
     /// Ce que le bouton fait, dans l'ordre de priorité : arrêter un
     /// enregistrement, arrêter un tour, envoyer ce qui est écrit, dicter.
     private func act() {
         if dictation.phase == .recording {
-            guard let audio = dictation.stop() else { return }
             Task {
+                // `stop()` attend que le fichier soit clos avant de le rendre :
+                // le prendre sans attendre donnait un enregistrement amputé de
+                // sa fin, et donc une transcription tronquée.
+                guard let audio = await dictation.stop() else { return }
                 let text = await onDictate?(audio)
                 if let text, !text.isEmpty {
                     // On ajoute à ce qui est déjà là plutôt que de l'écraser :
@@ -438,23 +473,39 @@ struct Composer: View {
             return
         }
         if isWorking { onStop(); return }
-        if !draft.isEmpty {
+        if hasSomethingToSend {
             // Le champ et le bouton possèdent le même état. Quand le brouillon
             // vivait dans ``ConversationView``, le TextField focalisé pouvait
             // réappliquer sa valeur d'édition après que la vue parente l'avait
             // vidé : la demande partait, mais le texte restait affiché.
             let text = draft
+            let images = attachments
             draft = ""
-            onSend(text)
+            attachments = []
+            onSend(text, images)
             return
         }
         Task { await dictation.start() }
     }
 
+    /// Charge ce que le sélecteur a rendu. Une image illisible est ignorée sans
+    /// bruit : c'est un cas de photothèque, pas une faute de l'utilisateur.
+    private func absorb(_ items: [PhotosPickerItem]) async {
+        isImporting = true
+        defer { isImporting = false }
+        for item in items {
+            guard let data = try? await item.loadTransferable(type: Data.self),
+                let attachment = await Attachment.make(from: data)
+            else { continue }
+            withAnimation(.snappy(duration: 0.25)) { attachments.append(attachment) }
+        }
+        picked = []
+    }
+
     private var glyph: String {
         if dictation.phase == .recording { "stop.fill" }
         else if isWorking { "stop.fill" }
-        else if draft.isEmpty { "mic.fill" }
+        else if !hasSomethingToSend { "mic.fill" }
         else { "arrow.up" }
     }
 
@@ -515,6 +566,39 @@ struct Composer: View {
                     .transition(.opacity.combined(with: .offset(y: 8)))
                 }
 
+                // Ce qu'on s'apprête à montrer, au-dessus de ce qu'on écrit :
+                // une pièce jointe qu'on ne voit pas est une pièce jointe qu'on
+                // envoie par accident.
+                if !attachments.isEmpty || isImporting {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: Hublot.unit) {
+                            ForEach(attachments) { attachment in
+                                AttachmentChip(attachment: attachment) {
+                                    withAnimation(.snappy(duration: 0.25)) {
+                                        attachments.removeAll { $0.id == attachment.id }
+                                    }
+                                }
+                            }
+                            if isImporting {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(Hublot.ember)
+                                    .frame(width: 62, height: 62)
+                                    .glassEffect(
+                                        .regular,
+                                        in: .rect(cornerRadius: Hublot.radius, style: .continuous)
+                                    )
+                            }
+                        }
+                        .padding(.trailing, Hublot.unit * 2)
+                        // Le halo du bouton de retrait déborde du cadre : sans
+                        // cette marge il se fait couper par le défilement.
+                        .padding(.top, Hublot.unit * 0.75)
+                    }
+                    .scrollClipDisabled()
+                    .transition(.opacity.combined(with: .offset(y: 8)))
+                }
+
                 // Le bouton est un cercle de 34 pt centré dans la capsule ; la
                 // saisie garde la même marge verticale de chaque côté. Aligné
                 // en bas, il « tombait » dès que le texte passait sur deux
@@ -530,7 +614,7 @@ struct Composer: View {
                                 .fill(Hublot.removed)
                                 .frame(width: 7, height: 7)
                                 .shadow(color: Hublot.removed.opacity(0.8), radius: 5)
-                            Text("\(dictation.caption) · j'écoute")
+                            Text("\(dictation.caption) · \(dictation.listening)")
                                 .font(.system(size: 16))
                                 .foregroundStyle(Hublot.prose)
                                 .contentTransition(.numericText())
@@ -539,13 +623,31 @@ struct Composer: View {
                         .padding(.leading, Hublot.unit * 2)
                         .frame(minHeight: 34)
                     } else {
+                        // Le trombone est à gauche, dans la capsule : joindre
+                        // une image appartient à la saisie, pas au chrome. Il
+                        // s'efface pendant une dictée — on ne choisit pas une
+                        // photo en parlant.
+                        PhotosPicker(
+                            selection: $picked, maxSelectionCount: 4,
+                            matching: .images, photoLibrary: .shared()
+                        ) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(
+                                    attachments.isEmpty ? Hublot.meta : Hublot.ember
+                                )
+                                .frame(width: 32, height: 34)
+                                .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Joindre une image")
+
                         TextField(placeholder, text: $draft, axis: .vertical)
                             .textFieldStyle(.plain)
                             .font(.system(size: 16))
                             .foregroundStyle(Hublot.prose)
                             .focused($isWriting)
                             .lineLimit(1...6)
-                            .padding(.leading, Hublot.unit * 2)
                     }
 
                     // Un seul bouton, quatre offices. Deux ou trois boutons
@@ -580,6 +682,47 @@ struct Composer: View {
         }
         .background { EdgeScrim(edge: .bottom).ignoresSafeArea() }
         .animation(.snappy(duration: 0.28), value: isWriting)
+        .onChange(of: picked) { _, items in
+            guard !items.isEmpty else { return }
+            Task { await absorb(items) }
+        }
+    }
+}
+
+/// Une image jointe, dans le composer : la vignette, son poids, et de quoi la
+/// retirer.
+///
+/// Le poids est affiché parce qu'il se paie — une capture d'écran part depuis un
+/// réseau mobile, et savoir avant d'envoyer vaut mieux que le découvrir après.
+struct AttachmentChip: View {
+    let attachment: Attachment
+    let onRemove: () -> Void
+
+    var body: some View {
+        AttachedImage(data: attachment.jpeg, side: 62)
+            .overlay(alignment: .bottom) {
+                Text(attachment.size)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Hublot.prose)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 2)
+                    .background(Hublot.abyss.opacity(0.75), in: .capsule)
+                    .padding(3)
+            }
+            .overlay(alignment: .topTrailing) {
+                Button(action: onRemove) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(Hublot.abyss)
+                        .frame(width: 18, height: 18)
+                        .background(Hublot.ember, in: .circle)
+                        .shadow(color: Hublot.ember.opacity(0.5), radius: 5)
+                        .contentShape(.circle)
+                }
+                .buttonStyle(.plain)
+                .offset(x: 6, y: -6)
+                .accessibilityLabel("Retirer l'image")
+            }
     }
 }
 

@@ -132,21 +132,36 @@ final class ChatSession {
 
     // MARK: Envoi
 
-    func send(_ text: String) async {
+    /// Envoie une demande, avec ou sans images.
+    ///
+    /// Les images passent **avant** le texte dans la liste de blocs : c'est
+    /// l'ordre que recommande Anthropic pour la vision, et celui qui donne les
+    /// réponses les plus fidèles quand la question porte sur ce qu'on montre.
+    func send(_ text: String, attachments: [Attachment] = []) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let sessionId else { return }
+        // Une image seule est une demande valable : « regarde ça ». Ce qu'elle
+        // veut dire, le serveur l'écrira à côté du chemin du fichier.
+        guard !trimmed.isEmpty || !attachments.isEmpty, let sessionId else { return }
 
         isReplaying = false
         isPrompting = true
-        turns.append(.user(.init(id: UUID().uuidString, text: trimmed)))
+        turns.append(
+            .user(
+                .init(
+                    id: UUID().uuidString, text: trimmed,
+                    images: attachments.map(\.jpeg)
+                )
+            )
+        )
         // Le titre reste celui du projet : c'est lui qu'on pilote, et le
         // remplacer par la première question faisait perdre de vue où l'on
         // travaille dès le premier message.
 
         do {
+            let blocks = attachments.map(\.block) + (trimmed.isEmpty ? [] : [.text(trimmed)])
             let result = try await connection.call(
                 "session/prompt",
-                PromptParams(sessionId: sessionId, prompt: [.text(trimmed)]),
+                PromptParams(sessionId: sessionId, prompt: blocks),
                 as: PromptResult.self,
                 timeout: nil
             )

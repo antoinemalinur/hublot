@@ -60,6 +60,8 @@ projets, réglages et erreurs ; les 7 lents lancent réellement les moteurs.
 - sélection Claude/Codex, modèles, effort et permissions décrits par le serveur ;
 - bascule de moteur avec passation du seul contexte manquant ;
 - quotas et contexte du moteur sélectionné ;
+- envoi de photos : l’image est réduite sur le téléphone, posée sur le VPS et
+  lue par le moteur ;
 - dictée via Whisper, notifications locales et arrêt d’un tour ;
 - Radiographie spatiale des fichiers et services observés, avec chronologie ;
 - lecture du `CLAUDE.md` d’un projet.

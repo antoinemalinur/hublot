@@ -74,6 +74,12 @@ actor WebSocketTransport: ACPTransport {
         // s'en tient à l'en-tête, que `URLSessionWebSocketTask` sait poser.
 
         let task = session.webSocketTask(with: request)
+        // `URLSessionWebSocketTask` refuse par défaut toute trame de plus d'un
+        // mégaoctet — et il ne la saute pas : il **coupe la liaison**, avec pour
+        // seul signe une erreur de lecture. Le `rawInput` d'une écriture de
+        // fichier suffit à dépasser ce plafond, et la conversation s'arrêtait
+        // alors au milieu d'un outil, sans un mot.
+        task.maximumMessageSize = 16 * 1024 * 1024
         self.task = task
         task.resume()
 

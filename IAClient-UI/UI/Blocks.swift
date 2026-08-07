@@ -8,6 +8,7 @@
 
 import MarkdownUI
 import SwiftUI
+import UIKit
 
 // MARK: - Gouttière
 
@@ -81,13 +82,65 @@ struct UserBlock: View {
                 .frame(width: 2)
                 .shadow(color: Hublot.ember.opacity(0.5), radius: 4)
                 .frame(width: Hublot.gutter)
-            Text(turn.text)
-                .font(.hublotProse)
-                .foregroundStyle(Hublot.prose)
-                .lineSpacing(Hublot.proseLine - Hublot.proseSize)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: Hublot.unit) {
+                if !turn.images.isEmpty {
+                    // Ce qu'on a montré fait partie de ce qu'on a dit : sans
+                    // l'image dans le fil, on relit une question qui parle
+                    // d'un « ça » disparu.
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: Hublot.unit) {
+                            ForEach(Array(turn.images.enumerated()), id: \.offset) { _, data in
+                                AttachedImage(data: data, side: 96)
+                            }
+                        }
+                    }
+                    .scrollClipDisabled()
+                }
+                if !turn.text.isEmpty {
+                    Text(turn.text)
+                        .font(.hublotProse)
+                        .foregroundStyle(Hublot.prose)
+                        .lineSpacing(Hublot.proseLine - Hublot.proseSize)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Une image du fil ou du composer, au même carré arrondi partout.
+///
+/// Le décodage est fait une fois, à la construction : dans un `LazyVStack` la
+/// vue est reconstruite à chaque défilement, et refaire un `UIImage(data:)` à
+/// chaque passe fait tomber la fréquence d'affichage dès la deuxième capture
+/// d'écran jointe.
+struct AttachedImage: View {
+    private let decoded: UIImage?
+    private let side: CGFloat
+
+    init(data: Data, side: CGFloat = 96) {
+        self.decoded = UIImage(data: data)
+        self.side = side
+    }
+
+    var body: some View {
+        Group {
+            if let decoded {
+                Image(uiImage: decoded)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Rectangle().fill(Hublot.surface)
+            }
+        }
+        .frame(width: side, height: side)
+        .clipShape(.rect(cornerRadius: Hublot.radius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Hublot.radius, style: .continuous)
+                .strokeBorder(Hublot.rule, lineWidth: 1)
+        }
     }
 }
 

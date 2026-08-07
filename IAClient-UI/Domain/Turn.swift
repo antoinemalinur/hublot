@@ -50,6 +50,13 @@ struct NoticeTurn: Identifiable {
 struct UserTurn: Identifiable {
     let id: String
     var text: String
+    /// Les images jointes, en JPEG déjà réduit.
+    ///
+    /// Elles ne survivent pas à une reprise du fil : `session/load` rejoue les
+    /// demandes en texte, et le chemin de l'image sur le VPS y figure alors en
+    /// toutes lettres. C'est un compromis assumé — renvoyer les pixels dans
+    /// chaque rejeu d'historique coûterait plus cher que ce qu'il rapporte.
+    var images: [Data] = []
 }
 
 /// Le texte de l'agent, tel qu'il arrive par `agent_message_chunk`.

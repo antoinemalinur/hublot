@@ -62,6 +62,21 @@ final class AppModel {
     private var reconnectTask: Task<Void, Never>?
     private var openProject: ProjectListResult.Project?
 
+    /// La conversation qu'on regarde, retenue **au-delà** de la liaison qui la
+    /// porte.
+    ///
+    /// Une reprise détruit le fil — il tient un socket mort — mais l'écran reste
+    /// sur `.conversation`. Sans ce souvenir, la vue n'avait plus rien à
+    /// afficher : un écran blanc sans bouton ni retour, dont on ne sortait qu'en
+    /// tuant l'application. C'était le symptôme visible ; la cause est que
+    /// `teardown()` jette le fil sans que personne ne sache le reconstruire.
+    private struct OpenConversation {
+        var sessionId: String
+        var cwd: String
+        var title: String
+    }
+    private var openConversation: OpenConversation?
+
     /// Les derniers plafonds annoncés, quelle que soit la conversation.
     ///
     /// Ils décrivent la machine, pas un fil : les garder ici est la seule façon
@@ -138,6 +153,7 @@ final class AppModel {
 
             await loadProjects()
             if case .connection = screen { screen = .projects }
+            await restoreConversation()
         } catch {
             // Un jeton refusé demande une intervention ; tout le reste est une
             // panne passagère qu'on ne doit pas faire porter à l'utilisateur.
@@ -151,20 +167,77 @@ final class AppModel {
         }
     }
 
-    /// Retient les plafonds poussés sur la liaison, sans se soucier de quelle
-    /// session ils viennent : ils sont les mêmes pour toutes.
+    /// Surveille la liaison : les plafonds qu'elle pousse, et sa mort.
+    ///
+    /// Les plafonds valent pour toutes les conversations, d'où le fait de les
+    /// retenir ici. La mort, elle, n'était surveillée **nulle part** : quand le
+    /// socket tombait au milieu d'un tour — redémarrage du service, réseau qui
+    /// s'absente, téléphone en veille — le fil restait affiché tel quel, un
+    /// outil en cours pour toujours, et rien ne repartait avant un aller-retour
+    /// par l'écran d'accueil. C'est l'unique raison pour laquelle une réponse
+    /// « s'arrêtait d'écrire ».
     private func watchStatus(on connection: ACPConnection) async {
         let events = await connection.subscribe()
         statusWatch?.cancel()
         statusWatch = Task { [weak self] in
             for await event in events {
                 guard !Task.isCancelled else { return }
-                guard case .update(let notification) = event,
-                    case .usage(_, _, let pushed) = notification.update,
-                    let pushed
-                else { continue }
-                self?.lastStatus = pushed
+                switch event {
+                case .update(let notification):
+                    guard case .usage(_, _, let pushed) = notification.update, let pushed
+                    else { continue }
+                    self?.lastStatus = pushed
+                case .disconnected(let error):
+                    self?.linkLost(error)
+                    return
+                default:
+                    continue
+                }
             }
+        }
+    }
+
+    /// La liaison est tombée sans qu'on l'ait demandé : on reprend seul.
+    ///
+    /// Une coupure volontaire passe par `teardown()`, qui annule ce guetteur
+    /// avant de fermer — on n'arrive donc ici que sur une mort subie.
+    private func linkLost(_ error: Error?) {
+        guard connection != nil, isConfigured else { return }
+        log.notice("liaison tombée : \(error?.localizedDescription ?? "flux terminé", privacy: .public)")
+        isReconnecting = true
+        // Le serveur, lui, continue son tour et enregistrera la réponse : la
+        // reprise la rejouera par `session/load`. Rien n'est perdu, à condition
+        // de se rebrancher.
+        scheduleReconnect()
+    }
+
+    /// Remet en place la conversation qu'on regardait avant la coupure.
+    ///
+    /// `session/load` rejoue tout l'historique, y compris ce que le moteur a
+    /// écrit pendant qu'on n'écoutait plus : c'est ce qui rend une réponse
+    /// interrompue par une coupure récupérable, au lieu d'être perdue.
+    private func restoreConversation() async {
+        guard case .conversation = screen, chat == nil,
+            let open = openConversation, let connection
+        else { return }
+
+        await present(
+            sessionId: open.sessionId, cwd: open.cwd, title: open.title,
+            setup: nil, isResuming: true
+        )
+        do {
+            let setup = try await connection.call(
+                "session/load",
+                LoadSessionParams(sessionId: open.sessionId, cwd: open.cwd),
+                as: SessionSetup.self
+            )
+            chat?.apply(setup)
+        } catch {
+            // On retombe sur la liste des conversations : un écran vide n'est
+            // jamais une réponse acceptable à un échec.
+            log.error("reprise du fil impossible : \(error.localizedDescription, privacy: .public)")
+            closeConversation()
+            failure = error.localizedDescription
         }
     }
 
@@ -172,6 +245,7 @@ final class AppModel {
     func disconnect() async {
         reconnectTask?.cancel()
         reconnectTask = nil
+        openConversation = nil
         await teardown()
         screen = .connection
     }
@@ -366,6 +440,7 @@ final class AppModel {
         session.apply(setup)
         closeChat()
         chat = session
+        openConversation = .init(sessionId: sessionId, cwd: cwd, title: title)
         screen = .conversation
     }
 
@@ -380,6 +455,9 @@ final class AppModel {
 
     func closeConversation() {
         closeChat()
+        // Quitter un fil est délibéré : une reprise ne doit pas le rouvrir
+        // dans le dos de celui qui vient d'en sortir.
+        openConversation = nil
         // On revient aux conversations du projet, pas aux projets : enchaîner
         // deux fils sur le même dépôt est le cas courant.
         if let project = openProject {
@@ -409,12 +487,24 @@ final class AppModel {
     /// c'est mort on reprend — sans rien demander.
     func handleForeground() async {
         guard isConfigured, screen != .connection else { return }
-        guard let connection else {
-            scheduleReconnect()
+
+        // Une reprise déjà entamée pendant la veille : on ne la double pas, on
+        // la précipite. Attendre son prochain essai — jusqu'à trente secondes —
+        // laissait l'écran figé sur un fil mort juste au moment où l'on revient
+        // le consulter.
+        if isReconnecting || connection == nil {
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            reconnectAttempt = 0
+            await connect()
             return
         }
+        guard let connection else { return }
         do {
-            try await connection.call("hublot/projects", Empty())
+            // Une échéance courte : c'est un test de vie, pas un appel utile.
+            // Trente secondes à fixer un écran qui ne répond pas, c'est ce
+            // qu'on cherche justement à éviter.
+            try await connection.call("hublot/projects", Empty(), timeout: .seconds(8))
             reconnectAttempt = 0
             isReconnecting = false
         } catch {
