@@ -20,10 +20,21 @@ import SwiftUI
 final class AppModel {
 
     enum Screen: Equatable {
+        /// Au démarrage, quand on a déjà de quoi se connecter.
+        ///
+        /// Sans cet état, l'écran de départ était le **formulaire de
+        /// connexion** : une page de réglages déjà remplie, affichée à chaque
+        /// ouverture pendant que la liaison s'établissait, comme si elle
+        /// attendait qu'on retape quelque chose. Elle ne doit apparaître que
+        /// lorsqu'il y a vraiment un réglage à corriger.
+        case launching
         case connection
         case projects
         case sessions(ProjectListResult.Project)
         case conversation
+
+        /// Vrai tant qu'aucun contenu du VPS n'est encore affiché.
+        var isEntry: Bool { self == .launching || self == .connection }
     }
 
     // MARK: Réglages
@@ -103,6 +114,10 @@ final class AppModel {
         // écriture explicite, l'adresse et le jeton fournis au lancement
         // n'étaient jamais retenus.
         persist()
+
+        // Le jeton est dans le trousseau : il n'y a rien à demander, donc rien
+        // à montrer qui ressemble à une question.
+        screen = isConfigured ? .launching : .connection
     }
 
     private func persist() {
@@ -152,11 +167,13 @@ final class AppModel {
             Task { await Notifier.requestAuthorization() }
 
             await loadProjects()
-            if case .connection = screen { screen = .projects }
+            if screen.isEntry { screen = .projects }
             await restoreConversation()
         } catch {
             // Un jeton refusé demande une intervention ; tout le reste est une
-            // panne passagère qu'on ne doit pas faire porter à l'utilisateur.
+            // panne passagère qu'on ne doit pas faire porter à l'utilisateur —
+            // et surtout pas en lui remettant sous les yeux un formulaire dont
+            // le contenu est parfaitement bon.
             if isRejected(error) {
                 failure = "Jeton refusé par le serveur."
                 screen = .connection
@@ -165,6 +182,16 @@ final class AppModel {
                 scheduleReconnect()
             }
         }
+    }
+
+    /// Ouvre les réglages de liaison à la demande — l'issue de secours d'un
+    /// démarrage qui n'aboutit pas. C'est le seul chemin qui montre ce
+    /// formulaire sans qu'une erreur l'ait exigé.
+    func showConnectionSettings() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        isReconnecting = false
+        screen = .connection
     }
 
     /// Surveille la liaison : les plafonds qu'elle pousse, et sa mort.
@@ -487,6 +514,10 @@ final class AppModel {
     /// c'est mort on reprend — sans rien demander.
     func handleForeground() async {
         guard isConfigured, screen != .connection else { return }
+        // Le tout premier passage au premier plan tombe en même temps que la
+        // connexion du lancement. Sans ce garde-fou, l'app ouvrirait deux
+        // liaisons en parallèle à chaque démarrage.
+        guard !isBusy else { return }
 
         // Une reprise déjà entamée pendant la veille : on ne la double pas, on
         // la précipite. Attendre son prochain essai — jusqu'à trente secondes —

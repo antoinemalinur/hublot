@@ -104,21 +104,14 @@ struct ProjectsView: View {
     }
 
     private var actions: some View {
-        Button {
+        ActionButton(title: "Nouveau projet", symbol: "plus") {
             withAnimation(.snappy(duration: 0.25)) { isCreating = true }
             namingProject = true
-        } label: {
-            HStack {
-                Spacer()
-                Label("Nouveau projet", systemImage: "plus")
-                    .font(.system(size: 15, weight: .medium))
-                Spacer()
-            }
-            .padding(.vertical, Hublot.unit * 1.25)
         }
-        .buttonStyle(.glassProminent)
-        .tint(Hublot.ember)
         .disabled(model.isBusy || isCreating)
+        // La capsule épouse son texte et se centre, au lieu de barrer l'écran :
+        // le verre n'existe que si on voit le fond de chaque côté.
+        .frame(maxWidth: .infinity)
         .padding(.horizontal, Hublot.unit * 2)
         .padding(.top, Hublot.unit * 6)
         .padding(.bottom, Hublot.unit)

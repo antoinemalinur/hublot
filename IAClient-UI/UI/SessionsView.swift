@@ -113,20 +113,11 @@ struct SessionsView: View {
     }
 
     private var actions: some View {
-        Button {
+        ActionButton(title: "Nouvelle conversation", symbol: "plus.bubble") {
             Task { await model.startSession(in: project) }
-        } label: {
-            HStack {
-                Spacer()
-                Label("Nouvelle conversation", systemImage: "plus.bubble")
-                    .font(.system(size: 15, weight: .medium))
-                Spacer()
-            }
-            .padding(.vertical, Hublot.unit * 1.25)
         }
-        .buttonStyle(.glassProminent)
-        .tint(Hublot.ember)
         .disabled(model.isBusy)
+        .frame(maxWidth: .infinity)
         .padding(.horizontal, Hublot.unit * 2)
         .padding(.top, Hublot.unit * 6)
         .padding(.bottom, Hublot.unit)

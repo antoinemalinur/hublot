@@ -144,6 +144,18 @@ nonisolated struct ProjectListResult: Decodable, Sendable {
         var updatedAt: Date?
 
         var id: String { path }
+
+        #if DEBUG
+            /// De quoi peupler l'écran témoin, avec les vrais noms du VPS.
+            static let samples: [Self] = [
+                .init(name: "Tous les dépôts", path: "/root/repos", sessionCount: 3,
+                      updatedAt: .now),
+                .init(name: "office-chess", path: "/root/repos/office-chess", sessionCount: 7,
+                      updatedAt: .now.addingTimeInterval(-3_600)),
+                .init(name: "tg-claude", path: "/root/repos/tg-claude", sessionCount: 2,
+                      updatedAt: .now.addingTimeInterval(-86_400)),
+            ]
+        #endif
     }
 }
 

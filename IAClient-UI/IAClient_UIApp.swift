@@ -17,6 +17,12 @@ struct IAClient_UIApp: App {
                 // changement, pas seulement lorsqu'un tour réel tombe juste.
                 if UserDefaults.standard.bool(forKey: "HublotRadiographyDemo") {
                     RadiographyView.demo
+                } else if UserDefaults.standard.bool(forKey: "HublotProjectsDemo") {
+                    // `-HublotProjectsDemo 1` rend la liste des projets sans
+                    // serveur. Même raison que ci-dessus : un écran qu'on ne
+                    // peut photographier qu'en étant connecté au VPS n'est
+                    // vérifié que lorsqu'on y pense.
+                    ProjectsView(model: .demo(projects: ProjectListResult.Project.samples))
                 } else {
                     RootView()
                 }
@@ -38,6 +44,8 @@ struct RootView: View {
     var body: some View {
         Group {
             switch model.screen {
+            case .launching:
+                HoldingView(purpose: .launching) { model.showConnectionSettings() }
             case .connection:
                 ConnectionView(model: model)
             case .projects:
@@ -72,14 +80,15 @@ struct RootView: View {
                     // battement, il faut montrer quelque chose — l'écran vide
                     // qui tenait lieu de réponse ici ne laissait qu'une issue,
                     // tuer l'application.
-                    ReconnectingView(onGiveUp: { model.closeConversation() })
+                    HoldingView(purpose: .reconnecting) { model.closeConversation() }
                 }
             }
         }
         .task {
             // Le jeton est déjà dans le trousseau : rouvrir l'app ne devrait
-            // pas obliger à retaper sur « Se connecter ».
-            guard model.isConfigured, model.screen == .connection else { return }
+            // ni obliger à retaper sur « Se connecter », ni même montrer le
+            // formulaire qui porte ce bouton.
+            guard model.isConfigured, model.screen == .launching else { return }
             await model.connect()
 
             #if DEBUG
