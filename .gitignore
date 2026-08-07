@@ -1,0 +1,13 @@
+build/
+.DS_Store
+*.xcuserdatad/
+xcuserdata/
+.swiftpm/
+node_modules/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.log
+*.ips

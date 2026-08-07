@@ -1,6 +1,6 @@
 //
 //  IAClient_UIApp.swift
-//  IAClient-UI
+//  Hublot
 //
 //  Created by Antoine Malinur on 2026-08-05.
 //
@@ -11,7 +11,120 @@ import SwiftUI
 struct IAClient_UIApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            #if DEBUG
+                // `-HublotRadiographyDemo 1` rend la carte sans serveur : une
+                // feature visuelle doit pouvoir être photographiée à chaque
+                // changement, pas seulement lorsqu'un tour réel tombe juste.
+                if UserDefaults.standard.bool(forKey: "HublotRadiographyDemo") {
+                    RadiographyView.demo
+                } else {
+                    RootView()
+                }
+            #else
+                RootView()
+            #endif
         }
     }
+}
+
+/// La racine : connexion → projets → conversations → fil.
+///
+/// La connexion n'est demandée qu'une fois. Ensuite l'app se rebranche seule —
+/// au lancement, et au retour au premier plan après une veille.
+struct RootView: View {
+    @State private var model = AppModel()
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        Group {
+            switch model.screen {
+            case .connection:
+                ConnectionView(model: model)
+            case .projects:
+                ProjectsView(model: model)
+            case .sessions(let project):
+                SessionsView(model: model, project: project)
+            case .conversation:
+                if let chat = model.chat {
+                    ConversationView(
+                        sessionTitle: chat.title,
+                        engine: chat.engine,
+                        plan: chat.plan,
+                        turns: chat.turns,
+                        onSend: { text in Task { await chat.send(text) } },
+                        onBack: { model.closeConversation() },
+                        configOptions: chat.configOptions,
+                        status: chat.metrics,
+                        contextPercent: chat.contextPercent,
+                        onChoose: { option, value in
+                            Task { await chat.choose(option, value: value) }
+                        },
+                        isWorking: chat.isWorking,
+                        onStop: { Task { await chat.cancel() } },
+                        onDictate: { audio in try? await chat.transcribe(audio) }
+                    )
+                }
+            }
+        }
+        .task {
+            // Le jeton est déjà dans le trousseau : rouvrir l'app ne devrait
+            // pas obliger à retaper sur « Se connecter ».
+            guard model.isConfigured, model.screen == .connection else { return }
+            await model.connect()
+
+            #if DEBUG
+                await runScenario(on: model)
+            #endif
+        }
+
+        .onChange(of: scenePhase) { _, phase in
+            // Le socket meurt en silence pendant la veille : c'est au retour au
+            // premier plan qu'on s'en aperçoit, pas avant.
+            guard phase == .active else { return }
+            Task { await model.handleForeground() }
+        }
+    }
+
+    #if DEBUG
+        /// Le parcours joué au lancement, pour qu'un écran soit vérifiable en
+        /// capture sans qu'on ait à le viser du doigt.
+        ///
+        ///     -HublotProject <nom>       ouvre les conversations d'un dépôt
+        ///     -HublotOpening "…"         ouvre un fil et pose la question
+        ///     -HublotSecondSession 1     en ouvre un premier et le quitte
+        ///                                avant — c'est la condition qui a
+        ///                                fait disparaître une trame sur deux
+        ///
+        /// Le troisième mérite son existence : le bug le plus coûteux du
+        /// projet ne se voyait qu'à la **deuxième** conversation ouverte, et
+        /// aucune vérification ne l'atteignait puisqu'elles n'en ouvraient
+        /// jamais qu'une.
+        private func runScenario(on model: AppModel) async {
+            let defaults = UserDefaults.standard
+            if let name = defaults.string(forKey: "HublotProject"), !name.isEmpty,
+                let project = model.projects.first(where: { $0.name == name })
+            {
+                await model.open(project)
+            }
+
+            guard let opening = defaults.string(forKey: "HublotOpening"), !opening.isEmpty
+            else { return }
+
+            func target() -> ProjectListResult.Project? {
+                if case .sessions(let project) = model.screen { return project }
+                return model.projects.first
+            }
+
+            if defaults.bool(forKey: "HublotSecondSession"), let project = target() {
+                await model.startSession(in: project)
+                model.closeConversation()
+                try? await Task.sleep(for: .seconds(1))
+            }
+
+            if model.chat == nil, let project = target() {
+                await model.startSession(in: project)
+            }
+            if let chat = model.chat { await chat.send(opening) }
+        }
+    #endif
 }
