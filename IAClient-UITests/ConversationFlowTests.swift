@@ -147,6 +147,33 @@ struct ConversationFlowTests {
         #expect(await harness.until { chat.title == "Dernière demande rejouée" })
     }
 
+    @Test("La reprise attend que tout l'historique soit assemblé avant de paraître")
+    @MainActor
+    func replayBarrierDrainsHistoryBeforePresentation() async throws {
+        let harness = try await Harness()
+        let chat = await harness.session(id: harness.recordedSession, isResuming: true)
+
+        let setup = try await harness.connection.call(
+            "session/load",
+            LoadSessionParams(
+                sessionId: harness.recordedSession,
+                cwd: "/root/repos/office-chess"
+            ),
+            as: SessionSetup.self
+        )
+        chat.apply(setup)
+        await chat.finishReplay()
+
+        let prose = chat.turns.compactMap {
+            if case .assistant(let turn) = $0 { turn.markdown } else { nil }
+        }.joined(separator: "\n")
+        #expect(prose.contains("La base ne désigne aucun gagnant"))
+        #expect(chat.turns.contains {
+            if case .toolCall = $0 { return true }
+            return false
+        })
+    }
+
     @Test("Un lot d'outils se replie une fois par type d'action")
     func toolRowsGroupByKindWithinAContiguousBatch() throws {
         let turns: [Turn] = [
@@ -500,11 +527,13 @@ final class Harness {
         return condition()
     }
 
-    func session(id: String, status: SessionStatus? = nil) async -> ChatSession {
+    func session(
+        id: String, status: SessionStatus? = nil, isResuming: Bool = false
+    ) async -> ChatSession {
         ChatSession(
             connection: connection, events: await connection.subscribe(),
             workingDirectory: "/root/repos/office-chess", sessionId: id,
-            title: "office-chess", status: status
+            title: "office-chess", isResuming: isResuming, status: status
         )
     }
 
@@ -562,14 +591,15 @@ actor ReplayTransport: ACPTransport {
         else { return }
 
         switch method {
-        case "session/prompt":
+        case "session/prompt", "session/load":
             for line in recorded where line.contains("\"method\"") {
                 continuation?.yield(Data(line.utf8))
             }
             if let id = outgoing["id"] as? Int {
-                continuation?.yield(
-                    Data(#"{"jsonrpc":"2.0","id":\#(id),"result":{"stopReason":"end_turn"}}"#.utf8)
-                )
+                let result = method == "session/prompt"
+                    ? #"{"stopReason":"end_turn"}"#
+                    : "{}"
+                continuation?.yield(Data(#"{"jsonrpc":"2.0","id":\#(id),"result":\#(result)}"#.utf8))
             }
         default:
             if let id = outgoing["id"] as? Int {

@@ -324,18 +324,23 @@ final class AppModel {
             let open = openConversation, let connection
         else { return }
 
-        await present(
+        guard let session = await prepare(
             sessionId: open.sessionId, cwd: open.cwd, title: open.title,
             setup: nil, isResuming: true
-        )
+        ) else { return }
         do {
             let setup = try await connection.call(
                 "session/load",
                 LoadSessionParams(sessionId: open.sessionId, cwd: open.cwd),
                 as: SessionSetup.self
             )
-            chat?.apply(setup)
+            session.apply(setup)
+            await session.finishReplay()
+            reveal(
+                session, sessionId: open.sessionId, cwd: open.cwd, title: open.title
+            )
         } catch {
+            await session.disconnect()
             // On retombe sur la liste des conversations : un écran vide n'est
             // jamais une réponse acceptable à un échec.
             log.error("reprise du fil impossible : \(error.localizedDescription, privacy: .public)")
@@ -490,13 +495,13 @@ final class AppModel {
         isBusy = true
         defer { isBusy = false }
 
-        // Le fil est ouvert AVANT la demande : l'agent rejoue l'historique par
-        // `session/update` *avant* de répondre à `session/load`. Créer le fil
-        // après la réponse revenait à jeter tout le passé.
-        await present(
+        // Le consommateur est ouvert AVANT la demande : l'agent rejoue
+        // l'historique par `session/update` avant de répondre à `session/load`.
+        // L'écran, lui, ne paraît qu'après la barrière de fin de rejeu.
+        guard let session = await prepare(
             sessionId: summary.sessionId, cwd: cwd, title: summary.displayTitle,
             setup: nil, isResuming: true
-        )
+        ) else { return }
 
         do {
             let setup = try await connection.call(
@@ -504,8 +509,14 @@ final class AppModel {
                 LoadSessionParams(sessionId: summary.sessionId, cwd: cwd),
                 as: SessionSetup.self
             )
-            chat?.apply(setup)
+            session.apply(setup)
+            await session.finishReplay()
+            reveal(
+                session, sessionId: summary.sessionId, cwd: cwd,
+                title: summary.displayTitle
+            )
         } catch {
+            await session.disconnect()
             closeConversation()
             failure = "« \(summary.displayTitle) » : \(error.localizedDescription)"
         }
@@ -531,7 +542,21 @@ final class AppModel {
         sessionId: String, cwd: String, title: String, setup: SessionSetup?,
         isResuming: Bool = false
     ) async {
-        guard let connection else { return }
+        guard let session = await prepare(
+            sessionId: sessionId, cwd: cwd, title: title,
+            setup: setup, isResuming: isResuming
+        ) else { return }
+        reveal(session, sessionId: sessionId, cwd: cwd, title: title)
+    }
+
+    /// Construit le consommateur avant `session/load`, mais ne le publie pas
+    /// encore dans l'interface. Il peut ainsi assembler chaque notification
+    /// sans exposer au lecteur le défilement du rejeu.
+    private func prepare(
+        sessionId: String, cwd: String, title: String, setup: SessionSetup?,
+        isResuming: Bool
+    ) async -> ChatSession? {
+        guard let connection else { return nil }
         // L'abonnement est ouvert **avant** que le fil existe : entre les deux,
         // c'est son tampon qui retient ce qui arrive.
         let events = await connection.subscribe()
@@ -541,6 +566,12 @@ final class AppModel {
             status: lastStatus
         )
         session.apply(setup)
+        return session
+    }
+
+    private func reveal(
+        _ session: ChatSession, sessionId: String, cwd: String, title: String
+    ) {
         closeChat()
         chat = session
         openConversation = .init(sessionId: sessionId, cwd: cwd, title: title)

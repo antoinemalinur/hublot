@@ -75,6 +75,49 @@ final class HublotScreenTests: XCTestCase {
     }
 
     @MainActor
+    func testConversationAppearsAlreadyAtTheBottomWithoutVisibleCatchUp() {
+        launch("HublotConversationDemo")
+
+        let last = app.staticTexts["FIN DU FIL — réponse la plus récente."]
+        XCTAssertTrue(last.waitForExistence(timeout: 1))
+        XCTAssertTrue(last.isHittable)
+        let settledFrame = last.frame
+
+        RunLoop.current.run(until: Date().addingTimeInterval(0.7))
+        XCTAssertEqual(last.frame.minY, settledFrame.minY, accuracy: 1)
+        XCTAssertFalse(element("jump-to-latest").exists)
+    }
+
+    @MainActor
+    func testSendingDismissesTheKeyboard() {
+        launch("HublotConversationDemo")
+
+        let input = element("composer-input")
+        XCTAssertTrue(input.waitForExistence(timeout: 5))
+        input.tap()
+        input.typeText("Vérifie ce correctif")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+
+        element("composer-action").tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 3))
+    }
+
+    @MainActor
+    func testNewProjectActionDisappearsWhileFiltering() {
+        launch("HublotProjectsDemo")
+
+        let action = element("new-project")
+        XCTAssertTrue(action.waitForExistence(timeout: 5))
+        let filter = element("project-filter")
+        XCTAssertTrue(filter.waitForExistence(timeout: 5))
+        filter.tap()
+        filter.typeText("office")
+
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+        XCTAssertTrue(action.waitForNonExistence(timeout: 3))
+    }
+
+    @MainActor
     func testRadiographyCloseWorksOnTheFirstTap() {
         launch("HublotConversationDemo")
 

@@ -108,6 +108,9 @@ final class ChatSession {
     private var isPrompting = false
     /// L'envoi suspendu en attente de son jalon de fin de tour.
     private var settlement: CheckedContinuation<Void, Never>?
+    /// L'ouverture d'un ancien fil reste hors écran jusqu'à ce que toutes les
+    /// notifications de `session/load` aient traversé sa file FIFO.
+    private var historySettlement: CheckedContinuation<Void, Never>?
 
     private let log = Logger(subsystem: "hublot", category: "session")
 
@@ -155,6 +158,17 @@ final class ChatSession {
         pump = nil
         status = .idle
         release()
+    }
+
+    /// Attend la barrière placée derrière le rejeu par `ACPConnection`.
+    /// Contrairement à un délai arbitraire, elle reste exacte quelle que soit
+    /// la longueur du fil ou la vitesse de l'appareil.
+    func finishReplay() async {
+        guard isReplaying, let sessionId, pump != nil else { return }
+        await withCheckedContinuation { continuation in
+            historySettlement = continuation
+            Task { await connection.finishHistory(session: sessionId) }
+        }
     }
 
     // MARK: Envoi
@@ -238,6 +252,8 @@ final class ChatSession {
     /// Libère l'envoi en cours. Appelée par le jalon, et par toute sortie de la
     /// boucle — une liaison coupée ne doit pas laisser `send` suspendu.
     private func release() {
+        historySettlement?.resume()
+        historySettlement = nil
         settlement?.resume()
         settlement = nil
     }
@@ -319,6 +335,12 @@ final class ChatSession {
                 guard id == sessionId else { continue }
                 finishStreaming(reason: reason)
                 release()
+
+            case .historyFinished(let id):
+                guard id == sessionId else { continue }
+                isReplaying = false
+                historySettlement?.resume()
+                historySettlement = nil
 
             case .disconnected(let error):
                 status = error.map { .failed($0.localizedDescription) } ?? .idle

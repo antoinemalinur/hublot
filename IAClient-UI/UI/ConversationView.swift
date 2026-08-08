@@ -51,17 +51,6 @@ struct ConversationView: View {
     /// suit la réponse qui s'écrit, ou s'il laisse lire là où on est.
     @State private var isPinned = true
 
-    /// Vrai pendant la brève fenêtre où le fil se met en place.
-    ///
-    /// L'ancrage bas de `ScrollView` cale la position sur le contenu **mesuré**.
-    /// Or un historique rejoué arrive par morceaux, et les hauteurs réelles —
-    /// Markdown, blocs de code colorés — ne se connaissent qu'après coup : la
-    /// vue se posait donc sur une estimation, et on rouvrait une longue
-    /// conversation au milieu, obligé de faire glisser jusqu'en bas pour lire
-    /// la dernière réponse. On redescend tant que ça bouge, et on s'arrête au
-    /// premier geste.
-    @State private var isSettling = true
-
     /// La position du fil, pilotable.
     ///
     /// Elle remplace un `ScrollViewReader` qui visait une sentinelle par son
@@ -114,11 +103,6 @@ struct ConversationView: View {
             .defaultScrollAnchor(.bottom)
             .scrollPosition($position)
             .scrollDismissesKeyboard(.interactively)
-            .onScrollPhaseChange { _, phase in
-                // Un geste vaut décision : on cesse de ramener vers le bas.
-                if phase == .interacting { isSettling = false }
-            }
-            .task { await settle() }
             .onChange(of: turns.count) { _, _ in
                 guard isPinned else { return }
                 withAnimation(.easeOut(duration: 0.2)) { position.scrollTo(edge: .bottom) }
@@ -149,7 +133,6 @@ struct ConversationView: View {
                 .overlay(alignment: .topTrailing) {
                     if !isPinned {
                         JumpToLatest {
-                            isSettling = false
                             withAnimation(.easeOut(duration: 0.25)) {
                                 position.scrollTo(edge: .bottom)
                             }
@@ -174,19 +157,6 @@ struct ConversationView: View {
         }
     }
 
-    /// Ramène le fil en bas tant que sa hauteur bouge encore.
-    ///
-    /// Deux secondes et demie, ou le premier geste : passé ce délai, un
-    /// historique de deux cents blocs a fini de se mesurer, et insister
-    /// reviendrait à empêcher de remonter lire.
-    private func settle() async {
-        let deadline = ContinuousClock.now + .seconds(2.5)
-        while isSettling, ContinuousClock.now < deadline {
-            position.scrollTo(edge: .bottom)
-            try? await Task.sleep(for: .milliseconds(90))
-        }
-        isSettling = false
-    }
 }
 
 /// Le retour au direct. Il n'apparaît que lorsqu'on a quitté le bas du fil —
@@ -731,6 +701,10 @@ struct Composer: View {
             // vidé : la demande partait, mais le texte restait affiché.
             let text = draft
             let images = attachments
+            // Envoyer signifie passer de l'écriture à la lecture. Libérer le
+            // focus ferme immédiatement le clavier et rend sa hauteur au fil
+            // pendant que la réponse commence à arriver.
+            isWriting = false
             draft = ""
             attachments = []
             onSend(text, images)
@@ -901,6 +875,7 @@ struct Composer: View {
                             .font(.system(size: 16))
                             .foregroundStyle(Hublot.prose)
                             .focused($isWriting)
+                            .accessibilityIdentifier("composer-input")
                             .lineLimit(1...6)
                     }
 
@@ -921,6 +896,7 @@ struct Composer: View {
                         .frame(width: 34, height: 34)
                     }
                     .buttonStyle(.glassProminent)
+                    .accessibilityIdentifier("composer-action")
                     .tint(dictation.phase == .recording ? Hublot.removed : Hublot.ember)
                     .disabled(dictation.phase == .transcribing)
                     .animation(.snappy(duration: 0.2), value: isWorking)
@@ -1145,7 +1121,7 @@ struct CommandPalette: View {
                     label: "/root/repos/office-chess/scripts/validation-complete.sh",
                     engine: "claude", elapsed: 134, quiet: 1
                 ),
-                activityAt: .now, isWorking: true
+                activityAt: .now, isWorking: false
             )
         }
     }

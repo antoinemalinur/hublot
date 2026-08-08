@@ -29,6 +29,11 @@ actor ACPConnection {
         /// traiter directement revenait à déclarer le tour fini avant d'avoir
         /// posé sa dernière phrase. Passer par la file rétablit l'ordre.
         case turnFinished(sessionId: String, reason: StopReason?)
+        /// Barrière placée derrière le rejeu de `session/load`. L'écran attend
+        /// que son consommateur l'ait reçue avant de montrer l'historique : il
+        /// apparaît ainsi directement à sa position finale, sans rattrapage
+        /// visible vers le bas.
+        case historyFinished(sessionId: String)
     }
 
     private let transport: any ACPTransport
@@ -84,6 +89,13 @@ actor ACPConnection {
     /// Range la fin d'un tour derrière tout ce qui a déjà été diffusé.
     func finishTurn(session: String, reason: StopReason?) {
         broadcast(.turnFinished(sessionId: session, reason: reason))
+    }
+
+    /// Range une barrière derrière toutes les trames de l'historique déjà
+    /// diffusées. Comme chaque abonné reçoit un flux FIFO, sa réception prouve
+    /// que le fil a fini d'assembler le rejeu.
+    func finishHistory(session: String) {
+        broadcast(.historyFinished(sessionId: session))
     }
 
     // MARK: Cycle de vie

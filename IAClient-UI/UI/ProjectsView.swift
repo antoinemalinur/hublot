@@ -16,6 +16,7 @@ struct ProjectsView: View {
     @State private var isCreating = false
     @State private var newName = ""
     @FocusState private var namingProject: Bool
+    @FocusState private var isFiltering: Bool
 
     private var visible: [ProjectListResult.Project] {
         guard !search.isEmpty else { return model.projects }
@@ -63,7 +64,9 @@ struct ProjectsView: View {
                 .padding(.bottom, Hublot.unit * 12)
             }
             .safeAreaInset(edge: .top, spacing: 0) { header }
-            .safeAreaInset(edge: .bottom, spacing: 0) { actions }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if !isFiltering && !namingProject { actions }
+            }
             .refreshable { await model.loadProjects() }
         }
         .preferredColorScheme(.dark)
@@ -99,6 +102,8 @@ struct ProjectsView: View {
                     .foregroundStyle(Hublot.prose)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                    .focused($isFiltering)
+                    .accessibilityIdentifier("project-filter")
             }
             .padding(.horizontal, Hublot.unit * 1.5)
             .padding(.vertical, Hublot.unit)
@@ -116,6 +121,7 @@ struct ProjectsView: View {
             namingProject = true
         }
         .disabled(model.isBusy || isCreating)
+        .accessibilityIdentifier("new-project")
         // La capsule épouse son texte et se centre, au lieu de barrer l'écran :
         // le verre n'existe que si on voit le fond de chaque côté.
         .frame(maxWidth: .infinity)
