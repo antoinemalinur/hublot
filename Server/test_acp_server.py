@@ -10,6 +10,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 
@@ -275,6 +276,149 @@ class ClaudeAuthenticationTests(unittest.IsolatedAsyncioTestCase):
             }):
                 (Path(empty) / ".credentials.json").write_text("{}", encoding="utf-8")
                 self.assertIn("OAuth", acp_server.claude_auth_source())
+
+
+class ClaudeQuotaTests(unittest.TestCase):
+    """Ce que `/usage` sait dire, et ce qu'il faut en tirer sans se tromper.
+
+    Les deux exemples viennent de vrais relevés du 8 août 2026 — un Mac en CLI
+    2.1.225 et le VPS, une version plus ancienne. Ils n'écrivent pas la date de
+    la même façon, ce qui est tout le problème de cette lecture : le CLI n'offre
+    aucune sortie structurée.
+    """
+
+    MAC = (
+        "You are currently using your subscription to power your Claude Code usage\n"
+        "\n"
+        "Current session: 42% used · resets Aug 8 at 9:10pm (America/Toronto)\n"
+        "Current week (all models): 91% used · resets Aug 10 at 12:59pm (America/Toronto)\n"
+    )
+    VPS = (
+        "You are currently using your subscription to power your Claude Code usage\n"
+        "\n"
+        "Current session: 52% used · resets Aug 8, 9:10pm (America/Toronto)\n"
+        "Current week (all models): 92% used · resets Aug 10, 1pm (America/Toronto)\n"
+    )
+
+    def test_both_wordings_give_the_same_two_windows(self) -> None:
+        for label, text, session in (("mac", self.MAC, 42), ("vps", self.VPS, 52)):
+            with self.subTest(label):
+                windows = acp_server.parse_claude_usage(text)
+                self.assertEqual(windows["five_hour"]["percent"], session)
+                self.assertIsNotNone(windows["five_hour"]["resetsAt"])
+                self.assertIn("seven_day", windows)
+
+    def test_the_session_window_is_the_five_hour_one(self) -> None:
+        # « Current session » est la fenêtre 5 h, « Current week » l'hebdo. Les
+        # intervertir afficherait la semaine sous l'étiquette « 5H ».
+        windows = acp_server.parse_claude_usage(self.VPS)
+        self.assertEqual(windows["five_hour"]["percent"], 52)
+        self.assertEqual(windows["seven_day"]["percent"], 92)
+
+    def test_an_hour_without_minutes_is_read(self) -> None:
+        # « resets Aug 10, 1pm » — le CLI omet les minutes à l'heure pile.
+        moment = acp_server.parse_usage_moment("Aug 10, 1pm (America/Toronto)")
+        self.assertIsNotNone(moment)
+        self.assertIn("13:00", str(moment))
+
+    def test_an_unreadable_reset_keeps_the_percentage(self) -> None:
+        # Une jauge sans compte à rebours vaut mieux que pas de jauge.
+        windows = acp_server.parse_claude_usage("Current session: 7% used · resets bientôt\n")
+        self.assertEqual(windows["five_hour"]["percent"], 7)
+        self.assertIsNone(windows["five_hour"]["resetsAt"])
+
+    def test_prose_without_any_window_yields_nothing(self) -> None:
+        self.assertEqual(acp_server.parse_claude_usage("Total cost: $0.0000"), {})
+
+    def test_the_environment_token_is_dropped_for_this_call_only(self) -> None:
+        # Le jeton de `setup-token` fait tourner les moteurs mais ferme
+        # `/usage`, et il l'emporte sur la session dès qu'il est présent.
+        seen: dict[str, Any] = {}
+
+        def fake_run(_args, **kwargs):
+            seen.update(kwargs["env"])
+            return types.SimpleNamespace(
+                returncode=0, stdout=json.dumps({"result": self.VPS}), stderr="",
+            )
+
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "jeton"}), \
+             mock.patch.object(acp_server.subprocess, "run", side_effect=fake_run):
+            windows = acp_server.claude_quota_windows()
+            # L'environnement du serveur, lui, garde son jeton : les tours en
+            # dépendent, et c'est ce qui fait qu'une session morte ne coûte que
+            # la jauge.
+            self.assertEqual(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), "jeton")
+
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", seen)
+        self.assertEqual(windows["five_hour"]["percent"], 52)
+
+
+class CodexQuotaTests(unittest.TestCase):
+    """La réponse réelle de `account/rateLimits/read`, relevée le 8 août 2026."""
+
+    SNAPSHOT = {
+        "limitId": "codex",
+        "primary": {"usedPercent": 0, "windowDurationMins": 10080,
+                    "resetsAt": 1786830360},
+        "secondary": None,
+        "planType": "plus",
+    }
+
+    def test_the_weekly_window_is_ranged_by_its_announced_duration(self) -> None:
+        # Ce compte n'expose que l'hebdomadaire, en `primary`. La ranger d'office
+        # en « 5 h » affichait une semaine sous une étiquette de cinq heures.
+        with mock.patch.object(acp_server, "codex_rate_limits", return_value=self.SNAPSHOT):
+            windows = acp_server.codex_quota_windows()
+        self.assertEqual(list(windows), ["seven_day"])
+        self.assertEqual(windows["seven_day"]["percent"], 0)
+        self.assertTrue(str(windows["seven_day"]["resetsAt"]).startswith("2026-"))
+
+    def test_a_short_window_would_land_on_the_five_hour_slot(self) -> None:
+        snapshot = dict(self.SNAPSHOT)
+        snapshot["secondary"] = {"usedPercent": 12.4, "windowDurationMins": 300,
+                                 "resetsAt": 1786830360}
+        with mock.patch.object(acp_server, "codex_rate_limits", return_value=snapshot):
+            windows = acp_server.codex_quota_windows()
+        self.assertEqual(windows["five_hour"]["percent"], 12)
+        self.assertEqual(windows["seven_day"]["percent"], 0)
+
+    def test_an_empty_snapshot_never_raises(self) -> None:
+        with mock.patch.object(acp_server, "codex_rate_limits", return_value={}):
+            self.assertEqual(acp_server.codex_quota_windows(), {})
+
+
+class QuotaCacheTests(unittest.TestCase):
+    """`send_status` passe ici toutes les huit secondes pendant un tour."""
+
+    def test_a_second_reader_within_the_window_does_not_relaunch_anything(self) -> None:
+        calls = []
+
+        def fetch() -> dict[str, Any]:
+            calls.append(1)
+            return {"five_hour": {"percent": 3, "resetsAt": None}}
+
+        cache = acp_server.QuotaCache(ttl=900.0, retry=120.0)
+        self.assertEqual(cache.read(fetch)["five_hour"]["percent"], 3)
+        cache.read(fetch)
+        cache.read(fetch)
+        self.assertEqual(len(calls), 1, "une seule lecture par fenêtre")
+
+    def test_a_failure_keeps_the_last_measurement_and_backs_off(self) -> None:
+        # Sans ce garde-fou, un moteur mal authentifié faisait naître un
+        # processus toutes les huit secondes, et la jauge clignotait.
+        cache = acp_server.QuotaCache(ttl=900.0, retry=120.0)
+        cache.read(lambda: {"five_hour": {"percent": 55, "resetsAt": None}})
+        cache.next_read = 0.0
+
+        boom = []
+
+        def failing() -> dict[str, Any]:
+            boom.append(1)
+            raise RuntimeError("/usage a rendu 1")
+
+        self.assertEqual(cache.read(failing)["five_hour"]["percent"], 55)
+        self.assertEqual(cache.read(failing)["five_hour"]["percent"], 55)
+        self.assertEqual(len(boom), 1, "on ne réessaie pas à chaque mesure")
 
 
 if __name__ == "__main__":

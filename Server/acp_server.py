@@ -27,16 +27,20 @@ import binascii
 import hashlib
 import json
 import os
+import queue
 import re
 import struct
+import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 BASE = os.environ.get("TG_CLAUDE_BASE", "/opt/tg-claude")
 sys.path.insert(0, BASE)
@@ -51,10 +55,6 @@ import usage as usage_meter  # noqa: E402
 HOST = os.environ.get("ACP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ACP_PORT", "8325"))
 TOKEN = os.environ.get("ACP_TOKEN") or ""
-QUOTA_WEB_URL = os.environ.get(
-    "ACP_QUOTA_URL", "http://127.0.0.1:8322/api/quota"
-)
-QUOTA_WEB_TOKEN = os.environ.get("QUOTA_WEB_TOKEN", "")
 PROTOCOL_VERSION = 1
 
 
@@ -1353,68 +1353,295 @@ class PromptTurn:
 
 
 # ---------------------------------------------------------------------------
+# Les plafonds
+#
+# Chaque moteur connaît le sien, et lui seul sait le dire. Hublot passait
+# pourtant par un tableau de bord web appartenant à un autre projet, qui
+# relançait le CLI pour Codex et sondait un endpoint HTTP pour Claude. Deux
+# conséquences, payées le 8 août 2026 : une conversation qui s'ouvre déclenchait
+# un appel réseau chez un tiers, et cet endpoint — agressivement limité —
+# répondait 429 toute la journée, si bien que la jauge affichait une mesure de
+# quatorze heures comme si elle venait d'être prise.
+#
+# On demande donc à chaque moteur ce qu'il sait :
+#
+#   Codex   `codex app-server` → `account/rateLimits/read`. Local, gratuit,
+#           rien ne part sur le réseau, donc rien ne peut se faire limiter.
+#   Claude  `claude -p /usage`. C'est un appel HTTP, lui, et il n'y a pas
+#           d'autre voie : en mode `--print` le CLI n'appelle jamais la
+#           statusline (le canal qui alimente la barre d'un terminal) et son
+#           flux ne porte qu'une alarme au-delà de 75 %, pas un compteur.
+# ---------------------------------------------------------------------------
+WEEK_MINUTES = 7 * 24 * 60
+
+# `/usage` frappe un endpoint qui bannit pour un quart d'heure au moindre excès.
+# Une jauge de cinq heures n'a aucun besoin d'être plus fraîche que ça.
+CLAUDE_QUOTA_TTL = 900.0
+# `codex app-server` est local et gratuit, mais lancer un processus toutes les
+# huit secondes — la cadence des mesures de contexte — n'aurait aucun sens.
+CODEX_QUOTA_TTL = 300.0
+# Après un échec on réessaie vite, mais pas à chaque mesure : sans ce délai, un
+# moteur mal authentifié faisait naître un processus toutes les huit secondes.
+QUOTA_RETRY = 120.0
+QUOTA_TIMEOUT = 25.0
+
+MONTHS = {name: index for index, name in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+# « Current session: 52% used · resets Aug 8, 9:10pm (America/Toronto) »
+USAGE_WINDOW = re.compile(
+    r"^Current\s+(?P<window>session|week)\b[^:]*:\s*"
+    r"(?P<percent>\d+(?:[.,]\d+)?)\s*%\s*used"
+    r"(?:[^A-Za-z\n]*resets\s+(?P<when>[^\n]+))?",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Deux versions du CLI écrivent déjà « Aug 8 at 9:10pm » et « Aug 8, 9:10pm », et
+# l'heure pile perd ses minutes (« Aug 10, 1pm »). D'où cette tolérance.
+USAGE_MOMENT = re.compile(
+    r"(?P<month>[A-Za-z]{3})[a-z]*\s+(?P<day>\d{1,2})"
+    r"(?:\s*,|\s+at)?\s*"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<half>am|pm)"
+    r"(?:\s*\((?P<zone>[^)\n]+)\))?",
+    re.IGNORECASE,
+)
+
+
+class QuotaCache:
+    """Une mesure partagée par toutes les conversations, relue rarement.
+
+    `send_status` passe ici toutes les huit secondes pendant un tour. Sans ce
+    cache, chaque conversation ouverte ferait naître un processus — ou un appel
+    à un endpoint qui bannit — au même rythme.
+
+    Un échec ne vide jamais la valeur : une jauge un peu vieille vaut mieux
+    qu'une jauge qui clignote.
+    """
+
+    def __init__(self, ttl: float, retry: float) -> None:
+        self.ttl = ttl
+        self.retry = retry
+        self.value: dict[str, Any] = {}
+        self.next_read = 0.0
+        # Le verrou évite la ruée : dix conversations qui s'ouvrent ensemble ne
+        # doivent produire qu'une seule lecture.
+        self.lock = threading.Lock()
+
+    def read(self, fetch: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        now = time.monotonic()
+        with self.lock:
+            if now < self.next_read:
+                return self.value
+            try:
+                fresh = fetch()
+            except Exception as exc:  # noqa: BLE001 — jamais fatal pour un tour
+                log(f"plafonds illisibles : {exc!r}")
+                self.next_read = now + self.retry
+                return self.value
+            if fresh:
+                self.value = fresh
+                self.next_read = now + self.ttl
+            else:
+                self.next_read = now + self.retry
+            return self.value
+
+
+CLAUDE_QUOTA = QuotaCache(CLAUDE_QUOTA_TTL, QUOTA_RETRY)
+CODEX_QUOTA = QuotaCache(CODEX_QUOTA_TTL, QUOTA_RETRY)
+
+
+def claude_quota_windows() -> dict[str, Any]:
+    """Les plafonds de Claude, demandés au CLI comme le ferait un terminal.
+
+    `CLAUDE_CODE_OAUTH_TOKEN` est écarté **pour ce seul appel**. Le jeton de
+    `setup-token` fait tourner les moteurs mais n'ouvre pas `/usage`, qui exige
+    la session `claude.ai` ; et il l'emporte sur elle dès qu'il est présent dans
+    l'environnement. Les deux identités cohabitent donc, chacune pour ce qu'elle
+    sait faire — et une session qui expire ne coûte plus que la jauge, jamais le
+    moteur. C'est très précisément la panne du 8 août : la session est morte, et
+    avec elle **tous** les tours Claude.
+    """
+    env = dict(os.environ)
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    done = subprocess.run(
+        ["claude", "-p", "/usage", "--output-format", "json"],
+        capture_output=True, text=True, timeout=QUOTA_TIMEOUT,
+        env=env, cwd=REPOS_BASE, stdin=subprocess.DEVNULL,
+    )
+    if done.returncode != 0:
+        raise RuntimeError(f"/usage a rendu {done.returncode}")
+    payload = json.loads(done.stdout)
+    return parse_claude_usage(str(payload.get("result") or ""))
+
+
+def parse_claude_usage(text: str) -> dict[str, Any]:
+    """Les deux fenêtres de `/usage`, prises dans sa prose.
+
+    Le CLI n'offre aucune sortie structurée : `--output-format json` se contente
+    d'emballer la même phrase anglaise. On la lit donc, et un reset illisible ne
+    fait pas perdre le pourcentage — une jauge sans compte à rebours vaut mieux
+    que pas de jauge.
+    """
+    windows: dict[str, Any] = {}
+    for match in USAGE_WINDOW.finditer(text):
+        key = "five_hour" if match.group("window").lower() == "session" else "seven_day"
+        windows[key] = {
+            "percent": round(float(match.group("percent").replace(",", "."))),
+            "resetsAt": parse_usage_moment(match.group("when") or ""),
+        }
+    return windows
+
+
+def parse_usage_moment(text: str) -> str | None:
+    """« Aug 8, 9:10pm (America/Toronto) » → un instant ISO 8601.
+
+    L'année n'est jamais écrite : on prend la prochaine occurrence de cette
+    date, ce qui traverse correctement le passage de décembre à janvier.
+    """
+    match = USAGE_MOMENT.search(text)
+    if not match:
+        return None
+    month = MONTHS.get(match.group("month").lower())
+    if month is None:
+        return None
+    hour = int(match.group("hour")) % 12
+    if match.group("half").lower() == "pm":
+        hour += 12
+    # Sans fuseau lisible, celui de la machine : c'est dans le sien que le CLI
+    # a écrit l'heure. Prendre UTC par défaut décalerait le reset de plusieurs
+    # heures — un compte à rebours faux est pire qu'absent.
+    zone = datetime.now().astimezone().tzinfo or timezone.utc
+    if match.group("zone"):
+        try:
+            zone = ZoneInfo(match.group("zone").strip())
+        except Exception:  # noqa: BLE001 — fuseau inconnu de la machine
+            pass
+    now = datetime.now(zone)
+    for year in (now.year, now.year + 1):
+        try:
+            moment = datetime(year, month, int(match.group("day")), hour,
+                              int(match.group("minute") or 0), tzinfo=zone)
+        except ValueError:
+            return None
+        if moment >= now - timedelta(days=1):
+            return moment.isoformat()
+    return None
+
+
+def codex_quota_windows() -> dict[str, Any]:
+    """Les plafonds de Codex, demandés à son `app-server`.
+
+    Même source que la barre d'état d'un terminal Codex, et sur ce compte elle
+    n'expose que l'hebdomadaire (`secondary` est nul). C'est la durée annoncée
+    qui range la fenêtre, jamais sa position : classer d'office la première en
+    « 5 h » affichait une semaine sous une étiquette de cinq heures.
+    """
+    snapshot = codex_rate_limits()
+    windows: dict[str, Any] = {}
+    for entry in (snapshot.get("primary"), snapshot.get("secondary")):
+        if not isinstance(entry, dict) or entry.get("usedPercent") is None:
+            continue
+        try:
+            duration = int(entry.get("windowDurationMins"))
+            percent = round(float(entry["usedPercent"]))
+        except (TypeError, ValueError):
+            continue
+        key = "seven_day" if duration >= WEEK_MINUTES else "five_hour"
+        windows[key] = {"percent": percent, "resetsAt": epoch_to_iso(entry.get("resetsAt"))}
+    return windows
+
+
+def epoch_to_iso(value: Any) -> str | None:
+    try:
+        return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def codex_rate_limits() -> dict[str, Any]:
+    """Le dialogue JSON-RPC minimal avec `codex app-server`.
+
+    L'entrée reste ouverte jusqu'à la réponse : fermer stdin tout de suite fait
+    sortir le serveur avant qu'il ait répondu — mesuré, il rend la main en
+    0,8 s sans rien avoir dit. La lecture passe par un fil et une file, parce
+    qu'un `readline` bloquant sur un processus muet immobiliserait le fil du
+    pool jusqu'à la fin des temps.
+    """
+    process = subprocess.Popen(
+        ["codex", "app-server", "--stdio"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, bufsize=1,
+    )
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def pump(stream: Any) -> None:
+        for line in stream:
+            lines.put(line)
+        lines.put(None)
+
+    threading.Thread(target=pump, args=(process.stdout,), daemon=True).start()
+    try:
+        assert process.stdin is not None
+        for message in (
+            {"id": 1, "method": "initialize", "params": {
+                "clientInfo": {"name": "hublot", "version": "1.0.0"},
+                "capabilities": {"experimentalApi": True},
+            }},
+            {"method": "initialized"},
+            {"id": 2, "method": "account/rateLimits/read"},
+        ):
+            process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+
+        deadline = time.monotonic() + QUOTA_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("codex app-server : délai dépassé")
+            try:
+                line = lines.get(timeout=remaining)
+            except queue.Empty:
+                raise TimeoutError("codex app-server : délai dépassé") from None
+            if line is None:
+                raise RuntimeError("codex app-server : arrêté sans répondre")
+            try:
+                reply = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if reply.get("id") != 2:
+                continue
+            if "error" in reply:
+                raise RuntimeError(f"codex app-server : {reply['error']}")
+            result = reply.get("result") or {}
+            by_id = result.get("rateLimitsByLimitId")
+            found = by_id.get("codex") if isinstance(by_id, dict) else None
+            return found if isinstance(found, dict) else (result.get("rateLimits") or {})
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+# ---------------------------------------------------------------------------
 # Session ACP
 # ---------------------------------------------------------------------------
 def quota_snapshot(engine: str = "claude") -> dict[str, Any]:
-    """Les plafonds du moteur actif, tels que leurs sondes les ont relevés.
+    """Les plafonds du moteur actif, demandés au moteur lui-même.
 
-    Claude vient du snapshot de son moniteur. Codex vient du tableau de quotas
-    local, lui-même alimenté par `account/rateLimits/read` de `codex app-server`.
-    On ne mélange jamais les deux : montrer le 5 h Claude sous une pastille
+    On ne mélange jamais les deux : montrer le 5 h de Claude sous une pastille
     Codex était une donnée vraie attribuée au mauvais moteur — donc fausse.
     """
     if engine == "codex":
-        return codex_quota_snapshot()
-
-    try:
-        raw = json.loads(Path(bot.CLAUDE_USAGE_STATE).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    usage = raw.get("usage_raw") or {}
-    windows = {}
-    for key in ("five_hour", "seven_day"):
-        entry = usage.get(key) or {}
-        percent = entry.get("utilization")
-        if percent is None:
-            continue
-        windows[key] = {
-            "percent": round(float(percent)),
-            "resetsAt": entry.get("resets_at"),
-        }
-    return windows
-
-
-def codex_quota_snapshot() -> dict[str, Any]:
-    """Les fenêtres Codex déjà mises en cache par le service de quotas local."""
-    request = urllib.request.Request(QUOTA_WEB_URL)
-    if QUOTA_WEB_TOKEN:
-        request.add_header("Authorization", f"Bearer {QUOTA_WEB_TOKEN}")
-    try:
-        with urllib.request.urlopen(request, timeout=2) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
-        return {}
-
-    codex = payload.get("codex") if isinstance(payload, dict) else None
-    if not isinstance(codex, dict):
-        return {}
-
-    windows: dict[str, Any] = {}
-    # Le service nomme les fenêtres par leur durée réelle ; ACP garde les noms
-    # employés par la structure `SessionStatus` du client.
-    for source, target in (("short", "five_hour"), ("weekly", "seven_day")):
-        entry = codex.get(source)
-        if not isinstance(entry, dict) or entry.get("used_percent") is None:
-            continue
-        try:
-            percent = round(float(entry["used_percent"]))
-        except (TypeError, ValueError):
-            continue
-        windows[target] = {
-            "percent": percent,
-            "resetsAt": entry.get("resets_at"),
-        }
-    return windows
+        return CODEX_QUOTA.read(codex_quota_windows)
+    return CLAUDE_QUOTA.read(claude_quota_windows)
 
 
 def running_turns() -> list[dict[str, Any]]:
@@ -2340,7 +2567,6 @@ async def main() -> None:
     bot.restore_persisted_state()
     # Le même moniteur que le relais Telegram : c'est lui qui rend Claude
     # indisponible à 98 % et le restaure sur la fenêtre hebdomadaire.
-    import threading
     threading.Thread(target=bot.usage_monitor, daemon=True,
                      name="claude-usage-monitor").start()
 

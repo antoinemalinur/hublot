@@ -37,16 +37,19 @@ enum StatusBar {
     static func cells(status: SessionStatus?, contextPercent: Int?) -> [Cell] {
         var parts: [Cell] = []
 
-        // Les abonnements n'exposent pas les mêmes fenêtres. Claude fournit
-        // normalement 5 h ; Codex, sur ce compte, fournit la semaine. Afficher
-        // inconditionnellement le 5 h revenait à laisser le quota Claude sous
-        // une session Codex.
+        // Les deux moteurs ne se mesurent pas sur la même durée, et c'est la
+        // fenêtre qui les bloque qu'il faut montrer. Claude est plafonné par sa
+        // session de 5 h ; Codex, par sa semaine — `account/rateLimits/read` ne
+        // lui rend d'ailleurs que celle-là, `secondary` est nul. Le repli reste
+        // là pour l'abonnement qui exposerait l'autre, mais il ne décide plus :
+        // demander le 5 h en premier à Codex affichait sa semaine sous une
+        // étiquette de cinq heures.
         let quota: (label: String, window: SessionStatus.Window)?
         if status?.engine == Engine.codex.rawValue {
-            if let short = status?.fiveHour {
-                quota = ("5H", short)
-            } else if let weekly = status?.weekly {
+            if let weekly = status?.weekly {
                 quota = ("7J", weekly)
+            } else if let short = status?.fiveHour {
+                quota = ("5H", short)
             } else {
                 quota = nil
             }

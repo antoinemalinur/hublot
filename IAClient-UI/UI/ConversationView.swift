@@ -1082,6 +1082,32 @@ struct CommandPalette: View {
         /// Il reste entièrement local : une panne réseau ne peut ni le vider,
         /// ni changer ses libellés, ni rendre un test de mise en page aléatoire.
         static var screenTestDemo: ConversationView {
+            demo(engine: .claude, status: SessionStatus(
+                model: "Opus", effort: "high", engine: "claude",
+                limits: [
+                    "five_hour": .init(percent: 17, resetsAt: .now.addingTimeInterval(14_400))
+                ]
+            ))
+        }
+
+        /// Le même fil, mené par Codex, avec **les deux** fenêtres remplies.
+        ///
+        /// C'est le seul cas où la préférence se voit. Codex est plafonné par
+        /// sa semaine — `account/rateLimits/read` ne lui rend d'ailleurs que
+        /// celle-là sur ce compte — et demander le 5 h en premier affichait
+        /// « 5H » sur une mesure hebdomadaire. Un abonnement qui exposerait
+        /// soudain les deux aurait fait mentir la barre sans prévenir.
+        static var codexQuotaDemo: ConversationView {
+            demo(engine: .codex, status: SessionStatus(
+                model: "GPT-5.6-Sol", effort: "max", engine: "codex",
+                limits: [
+                    "five_hour": .init(percent: 3, resetsAt: .now.addingTimeInterval(9_000)),
+                    "seven_day": .init(percent: 64, resetsAt: .now.addingTimeInterval(172_800)),
+                ]
+            ))
+        }
+
+        private static func demo(engine: Engine, status: SessionStatus) -> ConversationView {
             var rows: [Turn] = []
             for index in 1...10 {
                 rows.append(.user(.init(
@@ -1133,13 +1159,6 @@ struct CommandPalette: View {
                     ]
                 ),
             ]
-            let status = SessionStatus(
-                model: "Opus", effort: "high", engine: "claude",
-                limits: [
-                    "five_hour": .init(percent: 17, resetsAt: .now.addingTimeInterval(14_400))
-                ]
-            )
-
             // La marée de ce fil témoin. La dernière mesure vaut exactement
             // 42 % — le même chiffre que `contextPercent` ci-dessous, sinon
             // l'écran et la barre qui l'ouvre se contrediraient.
@@ -1155,13 +1174,13 @@ struct CommandPalette: View {
             }
 
             return ConversationView(
-                sessionTitle: "Résumer le dernier prompt", engine: .claude,
+                sessionTitle: "Résumer le dernier prompt", engine: engine,
                 turns: rows, onBack: {}, configOptions: options,
                 status: status, contextPercent: 42, contextHistory: history,
                 activity: .init(
                     running: true, phase: .tool,
                     label: "/root/repos/office-chess/scripts/validation-complete.sh",
-                    engine: "claude", elapsed: 134, quiet: 1
+                    engine: status.engine, elapsed: 134, quiet: 1
                 ),
                 activityAt: .now, isWorking: false
             )

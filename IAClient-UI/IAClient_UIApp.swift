@@ -25,6 +25,11 @@ struct IAClient_UIApp: App {
                     // La marée avec sa compaction : le cas qui distingue un
                     // tracé honnête d'une courbe qui ne sait que monter.
                     ContextTideView.demo
+                } else if UserDefaults.standard.bool(forKey: "HublotCodexQuotaDemo") {
+                    // Le même fil sous Codex, avec les deux fenêtres de plafond
+                    // renseignées : c'est le seul état où la barre doit choisir,
+                    // et où se voyait la semaine étiquetée « 5H ».
+                    ConversationView.codexQuotaDemo
                 } else if UserDefaults.standard.bool(forKey: "HublotConversationDemo") {
                     // Fil déterministe et assez long pour exercer le chrome,
                     // le retour au direct, les groupes et la radiographie sans

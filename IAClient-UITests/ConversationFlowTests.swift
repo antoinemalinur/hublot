@@ -395,6 +395,47 @@ struct ConversationFlowTests {
         #expect(status.effort == "max")
     }
 
+    @Test("Codex montre sa semaine même quand il annonce aussi une fenêtre courte")
+    func codexPrefersItsWeeklyWindow() throws {
+        // Ce compte n'expose que l'hebdomadaire, mais rien ne garantit que ça
+        // dure. La barre demandait le 5 h en premier : le jour où les deux
+        // arrivent ensemble, elle affichait une semaine sous « 5H ».
+        let status = try JSONCoding.decoder.decode(
+            SessionStatus.self,
+            from: Data(
+                """
+                {"model":"gpt-5.6-sol","effort":"max","engine":"codex",\
+                 "limits":{"five_hour":{"percent":3,\
+                 "resetsAt":"2026-08-09T02:00:00+00:00"},\
+                 "seven_day":{"percent":64,\
+                 "resetsAt":"2026-08-11T00:13:37+00:00"}}}
+                """.utf8
+            )
+        )
+
+        let bar = try #require(StatusBar.content(status: status, contextPercent: nil))
+        #expect(bar.hasPrefix("7J: 64%"))
+        #expect(!bar.contains("5H"))
+
+        // Claude, lui, est plafonné par sa session : la préférence est inverse,
+        // et une même barre doit savoir dire les deux.
+        let claude = try JSONCoding.decoder.decode(
+            SessionStatus.self,
+            from: Data(
+                """
+                {"model":"opus","effort":"high","engine":"claude",\
+                 "limits":{"five_hour":{"percent":52,\
+                 "resetsAt":"2026-08-09T01:10:00+00:00"},\
+                 "seven_day":{"percent":92,\
+                 "resetsAt":"2026-08-10T17:00:00+00:00"}}}
+                """.utf8
+            )
+        )
+        let claudeBar = try #require(StatusBar.content(status: claude, contextPercent: nil))
+        #expect(claudeBar.hasPrefix("5H: 52%"))
+        #expect(!claudeBar.contains("7J"))
+    }
+
     // MARK: Un tour qui a survécu à la veille
 
     /// Le scénario exact vécu sur Office Chess : une demande longue, le
