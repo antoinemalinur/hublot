@@ -194,4 +194,20 @@ final class HublotScreenTests: XCTestCase {
         ).firstMatch
         XCTAssertTrue(session.waitForExistence(timeout: 5))
     }
+
+    /// Sous Codex, la barre doit montrer la semaine — c'est elle qui plafonne.
+    ///
+    /// Le fil de démonstration porte **les deux** fenêtres, ce qui est le seul
+    /// état où la barre choisit. Elle demandait le 5 h en premier : sur un
+    /// compte qui expose les deux, elle aurait affiché « 5H » devant une mesure
+    /// hebdomadaire, sans que rien ne le signale.
+    @MainActor
+    func testCodexShowsItsWeeklyWindowAndNeverTheFiveHourOne() {
+        launch("HublotCodexQuotaDemo")
+
+        let status = element("status-bar")
+        XCTAssertTrue(status.waitForExistence(timeout: 5))
+        XCTAssertTrue(status.label.contains("7J: 64%"), "vu : \(status.label)")
+        XCTAssertFalse(status.label.contains("5H"), "vu : \(status.label)")
+    }
 }

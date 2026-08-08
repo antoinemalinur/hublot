@@ -196,6 +196,53 @@ Variables d'environnement lues par `acp_server.py` :
 | `ACP_HOST` / `ACP_PORT` | `127.0.0.1` / `8325` | écoute WebSocket (TLS délégué à Caddy) |
 | `ACP_TOKEN` | — | jeton porteur attendu ; sans lui, rien n'est accepté |
 | `ACP_CONTINUITY` | `/opt/tg-claude/state/acp-continuity` | fils communs, outils et mesures |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | **doit rester exporté** dans l'unité du service |
+
+Ce dernier n'est pas lu par `acp_server.py` : il est lu par le `claude` qu'il
+lance. Sans lui, le CLI retombe sur la session OAuth de
+`~/.claude/.credentials.json` — qui expire, ne se renouvelle pas toujours, et
+fait alors mourir **tous** les tours Claude sur « OAuth session expired and
+could not be refreshed », pendant que le relais Telegram, lui, continue de
+répondre. Le serveur annonce au démarrage laquelle des deux sources il aura :
+
+```text
+[acp] authentification Claude : jeton d'environnement
+```
+
+### Les deux identités, et pourquoi il en faut deux
+
+Le VPS porte **deux** identifiants Claude, et chacun sert à une chose :
+
+| | Ce qu'il permet | Ce qu'il ne permet pas |
+|---|---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) | faire tourner les moteurs, indéfiniment | lire `/usage` — il ferme la commande |
+| session `claude.ai` (`claude auth login`) | lire `/usage`, donc la jauge | rien : elle peut expirer sans se renouveler |
+
+Le jeton l'emporte sur la session dès qu'il est présent dans l'environnement.
+`acp_server.py` l'écarte donc **pour le seul appel de quota**, et le garde pour
+tout le reste. C'est délibéré : une session qui meurt ne coûte alors que la
+jauge, jamais le moteur — l'inverse exact du 8 août 2026, où sa mort a fait
+tomber tous les tours.
+
+### D'où viennent les plafonds
+
+Chaque moteur est interrogé directement, sans service intermédiaire :
+
+| Moteur | Source | Réseau |
+|---|---|---|
+| Codex | `codex app-server` → `account/rateLimits/read` | aucun |
+| Claude | `claude -p /usage` | oui, `/api/oauth/usage` |
+
+Claude n'a pas d'autre voie : en mode `--print` le CLI n'appelle jamais la
+statusline — le canal qui alimente la barre d'un terminal — et son flux ne porte
+qu'une alarme au-delà de 75 %, pas un compteur. Cet endpoint bannit pour un quart
+d'heure au moindre excès, d'où le cache de 15 minutes ; Codex, local et gratuit,
+se contente de 5 minutes pour ne pas lancer un processus toutes les 8 secondes.
+
+La sortie de `/usage` est de la prose anglaise, sans forme structurée, et deux
+versions du CLI l'écrivent déjà différemment (« Aug 8 at 9:10pm » et « Aug 8,
+9:10pm »). Le parseur tolère les deux, et un reset illisible ne fait pas perdre
+le pourcentage.
 
 ## Tests
 
