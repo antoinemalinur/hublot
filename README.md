@@ -12,6 +12,7 @@ iPhone ──wss──▶ Caddy ──▶ acp_server.py ──▶ Claude / Codex
                               ├─ bot.py          logique tg-claude
                               ├─ sessions.py     conversations Claude
                               ├─ continuity.py   fil commun et rejeu des outils
+                              ├─ usage.py        contexte relu chez chaque moteur
                               └─ radiography.py  événements Codex localisés
 ```
 
@@ -32,7 +33,7 @@ ACP, le second la logique historique partagée avec Telegram.
 Prérequis : Xcode 26, iOS 26 et Node.js 20 pour les tests de bout en bout.
 
 ```bash
-# 37 tests Swift sur le simulateur iPhone Air
+# 48 tests Swift sur le simulateur iPhone Air
 xcodebuild test \
   -project IAClient-UI.xcodeproj \
   -scheme IAClient-UI \
@@ -49,17 +50,29 @@ HUBLOT_TOKEN=… node Tools/e2e.mjs --fast
 HUBLOT_TOKEN=… node Tools/radiography-e2e.mjs
 ```
 
-`Tools/e2e.mjs` contient 17 scénarios : les 10 rapides vérifient liaison,
-projets, réglages et erreurs ; les 7 lents lancent réellement les moteurs.
+`Tools/e2e.mjs` contient 20 scénarios : les 10 rapides vérifient liaison,
+projets, réglages et erreurs ; les 10 lents lancent réellement les moteurs.
+`--only=<motif>` n'en joue qu'un — vérifier un correctif ne devrait pas coûter
+vingt tours de quota.
 
 ## Fonctionnalités
 
 - connexion WebSocket persistante et reconnexion silencieuse ;
+- **un tour survit à la liaison qui l'a lancé** : le téléphone se met en veille,
+  le moteur continue, et la conversation repart en direct sur la liaison qui
+  revient — texte déjà écrit compris ;
+- **signe de vie** : ce que le moteur fait (réfléchit, écrit, telle commande),
+  depuis quand, et depuis combien de temps il n'a plus rien émis. Sans ce
+  compteur, une commande de trois minutes et un moteur planté donnent le même
+  écran ;
 - projets et conversations du VPS, avec reprise et suppression ;
 - streaming Markdown, coloration syntaxique et outils repliables ;
+- retour automatique à la dernière réponse à l'ouverture, et bouton de retour au
+  direct dès qu'on remonte lire ;
 - sélection Claude/Codex, modèles, effort et permissions décrits par le serveur ;
 - bascule de moteur avec passation du seul contexte manquant ;
-- quotas et contexte du moteur sélectionné ;
+- quotas, et contexte relu chez le moteur qui le mesure — le journal de session
+  pour Claude, celui du fil pour Codex — donc connu dès l'ouverture ;
 - envoi de photos : l’image est réduite sur le téléphone, posée sur le VPS et
   lue par le moteur ;
 - dictée via Whisper, notifications locales et arrêt d’un tour ;
@@ -71,9 +84,10 @@ projets, réglages et erreurs ; les 7 lents lancent réellement les moteurs.
 | Commande | Rôle |
 |---|---|
 | `node Tools/acp-probe.mjs` | Inspecte les capacités réellement annoncées. |
-| `node Tools/e2e.mjs [--fast]` | Batterie de bout en bout contre le VPS. |
+| `node Tools/e2e.mjs [--fast] [--only=…]` | Batterie de bout en bout contre le VPS. |
 | `node Tools/radiography-e2e.mjs` | Vérifie localisation et reconnexion sur Office Chess. |
 | `Tools/ui-check.sh` | Pose une demande par le chemin de l’interface. |
+| `Tools/deploy-iphone.sh` | Construit signé, installe et lance sur l’iPhone. |
 | `swift Tools/make-icon.swift` | Régénère l’icône de l’app. |
 
 ## Sécurité et déploiement
@@ -82,5 +96,9 @@ projets, réglages et erreurs ; les 7 lents lancent réellement les moteurs.
 - Le serveur borne les répertoires pilotés à `/root/repos`.
 - Les commandes dangereuses passent par le garde-fou de `tg-claude`.
 - La clé de transcription reste dans l’environnement du VPS.
-- Le profil Apple gratuit expire après 7 jours : l’app doit alors être
-  reconstruite et réinstallée depuis Xcode.
+- Le téléphone reçoit la version courante par `Tools/deploy-iphone.sh` ; le
+  relais par `scp Server/*.py hetzner:/opt/tg-claude/` puis
+  `systemctl restart acp.service`.
+- Le profil Apple gratuit expire après 7 jours : passé ce délai, le lancement
+  échoue sur une erreur de provisioning et il faut rouvrir Xcode une fois pour
+  le renouveler.

@@ -45,6 +45,7 @@ import continuity  # noqa: E402
 import handoff as handoff_builder  # noqa: E402
 import radiography as radiography_events  # noqa: E402
 import sessions as store  # noqa: E402
+import usage as usage_meter  # noqa: E402
 
 HOST = os.environ.get("ACP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ACP_PORT", "8325"))
@@ -421,6 +422,10 @@ class PromptTurn:
 
     def __init__(self, session: "Session", text: str) -> None:
         self.session = session
+        # Toutes les sessions auxquelles ce tour a été rattaché. Une reprise de
+        # liaison en ajoute une, et la fin du tour doit les libérer toutes :
+        # celle qui reste marquée « occupée » refuse tous les envois suivants.
+        self.bound: list["Session"] = [session]
         self.text = text
         # Franchi quand le tour a vraiment rendu la main. Un `cancel()` envoie
         # un signal ; il ne dit pas que le processus est mort, et repartir avant
@@ -436,10 +441,90 @@ class PromptTurn:
         self.reply = ""
         self.engine: str | None = None
         self.model: str | None = None
+        # Ce que le tour est en train de faire, et depuis quand. C'est la seule
+        # chose qui distingue « il réfléchit » de « il est mort » — sans elle,
+        # une commande de trois minutes et un moteur planté ont exactement le
+        # même aspect à l'écran : rien.
+        self.started_at = time.monotonic()
+        self.last_event_at = self.started_at
+        self.phase = "starting"
+        self.detail: str | None = None
+        # Le contexte réellement porté par la requête en cours. L'entrée arrive
+        # au `message_start`; la sortie cumulative, au `message_delta`.
+        self.context_used = 0
+        self.context_start_usage: dict[str, Any] = {}
+        self.context_pushed_at = 0.0
         # `--output-last-message` ne doit pas être partagé entre deux fils
         # Codex lancés en parallèle. Le flux JSON reste la source principale ;
         # ce fichier propre au tour est le filet si le CLI omet l'événement.
         self.codex_last_message = f"{bot.CODEX_LAST_MESSAGE}.{session.id}"
+
+    # -- Signe de vie -------------------------------------------------------
+    #
+    # Un tour long ressemble à un tour mort. Le serveur, lui, sait faire la
+    # différence : il voit passer les événements du moteur. Il le dit donc,
+    # toutes les quelques secondes, avec ce qu'il fait et depuis combien de
+    # temps il n'a plus rien émis. L'app n'a plus à deviner.
+
+    HEARTBEAT = 4.0
+
+    def mark(self, phase: str, label: str | None = None) -> None:
+        """Ce que le moteur vient de faire. Remet aussi le compteur de silence."""
+        self.phase = phase
+        if label is not None:
+            self.detail = label.strip()[:120] or None
+        self.last_event_at = time.monotonic()
+
+    def activity(self, *, running: bool = True,
+                 stop_reason: str | None = None) -> dict[str, Any]:
+        now = time.monotonic()
+        return {
+            "running": running,
+            "phase": self.phase if running else "done",
+            "label": self.detail,
+            "engine": self.engine,
+            "elapsed": round(now - self.started_at, 1),
+            # Le temps écoulé depuis le dernier événement du moteur. C'est ce
+            # chiffre, et lui seul, qui permet de dire « ça avance » ou
+            # « plus rien ne vient depuis deux minutes ».
+            "quiet": round(now - self.last_event_at, 1),
+            "stopReason": stop_reason,
+        }
+
+    async def _beat(self) -> None:
+        while True:
+            await asyncio.sleep(self.HEARTBEAT)
+            try:
+                await self.session.send_activity(self.activity())
+                # Une vraie cadence, y compris pendant une génération longue
+                # sans outil ni nouveau message_start.
+                await self._push_context()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log(f"battement perdu : {exc!r}")
+
+    # -- Rattachement -------------------------------------------------------
+
+    def rebind(self, session: "Session") -> None:
+        """Change le destinataire d'un tour resté en vol.
+
+        Un tour survit à la liaison qui l'a lancé — le téléphone se met en
+        veille, le réseau change de main — mais il continuait d'écrire vers un
+        socket mort. La conversation se figeait à l'écran sans un mot, et ne
+        repartait qu'au chargement suivant, une fois le tour fini. Elle repart
+        maintenant tout de suite, sur la liaison qui vient de revenir.
+        """
+        if session is self.session:
+            return
+        self.session = session
+        self.bound.append(session)
+
+    def detach(self) -> None:
+        """Libère toutes les sessions que ce tour a occupées."""
+        for bound in self.bound:
+            if bound.turn is self:
+                bound.turn = None
 
     async def run(self) -> str:
         engine = bot.engine_for_next_task()
@@ -472,6 +557,10 @@ class PromptTurn:
                     git=bot.git_state(self.session.cwd), next_engine=engine)
 
         watcher = asyncio.create_task(self._watch_permissions())
+        beat = asyncio.create_task(self._beat())
+        self.mark("starting")
+        await self.session.send_activity(self.activity())
+        stop_reason = "refusal"
         try:
             stop_reason = (
                 await self._run_claude(handoff_path) if engine == "claude"
@@ -479,6 +568,13 @@ class PromptTurn:
             )
         finally:
             watcher.cancel()
+            beat.cancel()
+            # La fin doit se dire même sur une sortie par exception : sans elle
+            # le client qui n'a pas lancé ce tour — celui qui vient de se
+            # rebrancher — l'attendrait indéfiniment.
+            await self.session.send_activity(
+                self.activity(running=False, stop_reason=stop_reason)
+            )
 
         if self.reply.strip():
             continuity.record(
@@ -638,6 +734,8 @@ class PromptTurn:
 
     async def _translate(self, event: dict[str, Any]) -> str | None:
         kind = event.get("type")
+        # Chaque ligne lue est une preuve de vie, quel que soit son contenu.
+        self.last_event_at = time.monotonic()
 
         if kind == "system" and event.get("subtype") == "init":
             # Claude énumère ici ses commandes — les intégrées comme celles
@@ -660,6 +758,7 @@ class PromptTurn:
 
         if kind == "user":
             # Un `tool_result` : l'outil correspondant vient de rendre.
+            self.mark("thinking", "")
             for block in (event.get("message") or {}).get("content") or []:
                 if block.get("type") != "tool_result":
                     continue
@@ -678,23 +777,59 @@ class PromptTurn:
             return None
 
         if kind == "result":
-            usage = event.get("usage") or {}
-            # `cache_creation_input_tokens` manquait, et c'est justement le gros
-            # morceau : sur une session reprise il pèse plus que tout le reste.
-            # Le contexte affiché était donc faux — trop bas d'un facteur deux.
-            used = sum(int(usage.get(key, 0) or 0) for key in (
-                "input_tokens", "cache_creation_input_tokens",
-                "cache_read_input_tokens", "output_tokens",
-            ))
-            await self.session.send_status(used=used)
-            return "refusal" if event.get("is_error") else str(
-                event.get("stop_reason") or "end_turn"
-            )
+            # **Pas** l'`usage` de cet événement. Il totalise les jetons de tout
+            # le tour : à chaque appel d'outil, Claude relit son cache, et la
+            # somme compte ce cache autant de fois qu'il y a d'allers-retours.
+            # Mesuré : sur un tour de trois messages, 46 532 annoncés pour
+            # 17 050 réellement portés. Sur un tour agentique long, le rapport
+            # explose — d'où le « CTX 1540 % » vu à l'écran, qui n'a aucun sens
+            # devant une fenêtre de contexte.
+            #
+            # Le contexte, c'est ce que porte la **dernière requête**, relevé au
+            # `message_start`. Zéro renvoie la mesure au journal de session, qui
+            # est la même source qu'à la réouverture — donc le même chiffre,
+            # qu'on reste dans la conversation ou qu'on y revienne.
+            await self._push_context(force=True)
+            if not event.get("is_error"):
+                return str(event.get("stop_reason") or "end_turn")
+
+            # Un tour refusé sans un mot est le pire des cas : la réponse
+            # s'arrête au milieu d'une phrase et rien ne dit pourquoi. Claude
+            # donne la raison — « Output blocked by content filtering policy »,
+            # un quota, une erreur d'API — et elle doit atterrir dans le fil.
+            detail = str(event.get("result") or event.get("subtype") or "").strip()
+            log(f"tour en erreur : {detail[:200] or 'sans détail'}")
+            if detail:
+                await self.session.send_text(f"\n\n⚠️ {detail[:800]}\n\n", self.message_id)
+            return "refusal"
 
         return None
 
+    # Assez rare pour ne pas inonder la liaison ni interroger le moniteur de
+    # quotas à chaque message, assez fréquent pour qu'une barre suive un tour
+    # de dix minutes.
+    CONTEXT_INTERVAL = 8.0
+
+    async def _set_context(self, measured: int) -> None:
+        """Retient une mesure honnête et la publie si l'intervalle est franchi."""
+        if not measured:
+            return
+        self.context_used = measured
+        await self._push_context()
+
+    async def _push_context(self, *, force: bool = False) -> None:
+        """Publie la dernière mesure au plus toutes les huit secondes."""
+        if not self.context_used and not force:
+            return
+        now = time.monotonic()
+        if not force and now - self.context_pushed_at < self.CONTEXT_INTERVAL:
+            return
+        self.context_pushed_at = now
+        await self.session.send_status(used=self.context_used)
+
     async def _translate_stream(self, inner: dict[str, Any]) -> None:
         kind = inner.get("type")
+        self.last_event_at = time.monotonic()
 
         if kind == "message_start":
             # Un tour de Claude, ce n'est pas *un* message : c'est une suite de
@@ -705,6 +840,25 @@ class PromptTurn:
             # dans le désordre. Un identifiant par message la remet d'aplomb.
             self.message_id = str(uuid.uuid4())
             self.thought_id = str(uuid.uuid4())
+            self.mark("thinking", "")
+            # L'entrée se mesure ici : la requête qu'on vient d'envoyer porte
+            # exactement ce qui tient dans la fenêtre. La sortie définitive
+            # complétera cette base au `message_delta`.
+            usage = (inner.get("message") or {}).get("usage")
+            self.context_start_usage = usage if isinstance(usage, dict) else {}
+            await self._set_context(
+                usage_meter.claude_stream_context(self.context_start_usage)
+            )
+            return
+
+        if kind == "message_delta":
+            # La sortie de `message_start` est provisoire (souvent 1). Le delta
+            # donne son total cumulatif : on la remplace, on ne l'additionne
+            # pas. C'est ce qui aligne la valeur en direct avec la relecture du
+            # journal après avoir rouvert la conversation.
+            await self._set_context(usage_meter.claude_stream_context(
+                self.context_start_usage, inner.get("usage")
+            ))
             return
 
         if kind == "content_block_start":
@@ -712,6 +866,7 @@ class PromptTurn:
             if block.get("type") == "tool_use":
                 tool_id = str(block.get("id") or uuid.uuid4())
                 name = str(block.get("name") or "outil")
+                self.mark("tool", name)
                 self.tools[str(inner.get("index"))] = {"id": tool_id, "name": name}
                 await self.session.update({
                     "sessionUpdate": "tool_call",
@@ -729,8 +884,10 @@ class PromptTurn:
             if delta_kind == "text_delta":
                 chunk = str(delta.get("text") or "")
                 self.reply += chunk
+                self.mark("writing", "")
                 await self.session.send_text(chunk, self.message_id)
             elif delta_kind == "thinking_delta":
+                self.mark("thinking", "")
                 await self.session.send_thought(
                     str(delta.get("thinking") or ""), self.thought_id
                 )
@@ -752,10 +909,14 @@ class PromptTurn:
                     payload = {}
                 if payload:
                     entry["payload"] = payload
+                    title = tool_title(entry["name"], payload)
+                    # Le vrai libellé n'arrive qu'ici : « Bash » devient la
+                    # commande, et c'est elle qu'il faut lire pendant l'attente.
+                    self.mark("tool", title)
                     await self.session.update({
                         "sessionUpdate": "tool_call_update",
                         "toolCallId": entry["id"],
-                        "title": tool_title(entry["name"], payload),
+                        "title": title,
                         "rawInput": payload,
                     })
             return
@@ -827,6 +988,11 @@ class PromptTurn:
         if reason == "refusal" and bot.is_codex_quota_error(self.stderr):
             bot.mark_codex_unavailable("quota atteint")
             await self.session.notify_engine("claude", "quota Codex atteint")
+
+        # Codex n'a pas d'équivalent de l'événement `result` de Claude : sa
+        # consommation de contexte n'existe que dans son propre journal, et
+        # c'est maintenant qu'il vient de le refermer qu'on peut l'y lire.
+        await self.session.send_status()
         return reason
 
     async def _codex_attempt(self, prompt: str, handoff_path: str | None,
@@ -936,6 +1102,7 @@ class PromptTurn:
 
     async def _translate_codex(self, event: dict[str, Any]) -> str | None:
         kind = event.get("type")
+        self.last_event_at = time.monotonic()
 
         if kind == "error":
             self.stderr = self._codex_error(event) or self.stderr
@@ -961,6 +1128,7 @@ class PromptTurn:
 
         if item.get("type") == "agent_message":
             if not done:
+                self.mark("writing", "")
                 return None
             text = str(item.get("text") or "")
             if text:
@@ -968,6 +1136,7 @@ class PromptTurn:
                 # ferait remonter la conclusion au-dessus des commandes qui
                 # l'ont produite.
                 self.reply = text
+                self.mark("writing", "")
                 await self.session.send_text(text, str(uuid.uuid4()))
             return None
 
@@ -975,6 +1144,14 @@ class PromptTurn:
             str(kind), item, self.session.cwd
         )
         if updates:
+            # Codex n'émet pas de jetons : entre deux éléments, l'app n'a que ce
+            # libellé pour savoir sur quoi il est. Sur une commande de trois
+            # minutes, c'est la différence entre patienter et croire à une panne.
+            title = next(
+                (str(update["title"]) for update in updates if update.get("title")),
+                None,
+            )
+            self.mark("tool" if not done else "thinking", title)
             for update in updates:
                 await self.session.update(update)
             return None
@@ -1045,6 +1222,9 @@ class PromptTurn:
 
     async def _ask_permission(self, command: str) -> None:
         tool_call_id = str(uuid.uuid4())
+        # Un tour arrêté sur une question n'est pas un tour lent : le compteur
+        # de silence ne doit pas monter, et l'app doit pouvoir le dire.
+        self.mark("waiting", command)
         await self.session.update({
             "sessionUpdate": "tool_call",
             "toolCallId": tool_call_id,
@@ -1082,6 +1262,7 @@ class PromptTurn:
         except OSError as exc:
             log(f"décision non écrite : {exc}")
 
+        self.mark("tool" if allowed else "thinking", command if allowed else "")
         await self.session.update({
             "sessionUpdate": "tool_call_update",
             "toolCallId": tool_call_id,
@@ -1161,6 +1342,30 @@ def codex_quota_snapshot() -> dict[str, Any]:
     return windows
 
 
+def running_turns() -> list[dict[str, Any]]:
+    """Ce qui travaille en ce moment, toutes conversations confondues.
+
+    Le registre est global au processus : un tour reste visible même si la
+    liaison qui l'a lancé est morte. C'est ce qui permet de voir, dès l'écran
+    d'accueil, qu'un projet est en train de tourner — sans avoir à ouvrir la
+    conversation pour le découvrir.
+    """
+    now = time.monotonic()
+    listed: list[dict[str, Any]] = []
+    for session_id, turn in list(ACTIVE_TURNS.items()):
+        listed.append({
+            "sessionId": session_id,
+            "cwd": turn.session.cwd,
+            "engine": turn.engine,
+            "phase": turn.phase,
+            "label": turn.detail,
+            "elapsed": round(now - turn.started_at, 1),
+            "quiet": round(now - turn.last_event_at, 1),
+        })
+    listed.sort(key=lambda entry: entry["elapsed"], reverse=True)
+    return listed
+
+
 def session_catalog(cwd: str) -> list[dict[str, Any]]:
     """Fusionne les fils natifs Claude et le fil commun utilisé par Codex."""
     merged: dict[str, dict[str, Any]] = {}
@@ -1199,12 +1404,43 @@ class Session:
         self.id = session_id
         self.cwd = cwd
         self.turn: PromptTurn | None = None
+        self._notification_failed = False
+
+    def measure_context(self, engine: str) -> tuple[int, int]:
+        """Le contexte occupé par cette conversation, relu chez son moteur.
+
+        C'est la seule mesure honnête disponible entre deux tours : Claude et
+        Codex l'écrivent chacun dans leur journal, et personne d'autre ne la
+        connaît. `(0, 0)` veut dire « rien de mesuré » — une conversation neuve,
+        ou un fil qui n'a pas encore tourné sur ce moteur.
+        """
+        try:
+            if engine == "codex":
+                thread = store.codex_thread(self.cwd, self.id)
+                return usage_meter.codex_context(str(thread or ""))
+            path = usage_meter.claude_session_path(self.cwd, self.id)
+            return usage_meter.claude_context(path), 0
+        except Exception as exc:  # noqa: BLE001 — une mesure absente n'est pas une panne
+            log(f"contexte illisible sur {self.id} : {exc!r}")
+            return 0, 0
+
+    async def send_activity(self, payload: dict[str, Any]) -> None:
+        """Le signe de vie d'un tour. Hors du fil : il décrit l'instant, pas
+        l'histoire, et le rejouer plus tard n'aurait aucun sens."""
+        await self.update(
+            {"sessionUpdate": "hublot_activity", **payload}, persist=False
+        )
 
     async def send_status(self, used: int = 0, size: int = 0) -> None:
         """L'état complet, sur le même canal que la consommation de contexte.
 
         Les plafonds voyagent dans `_meta` : un client ACP ordinaire les ignore,
         Hublot les affiche. Rien n'est cassé pour personne.
+
+        Sans `used`, la mesure est relue sur le disque plutôt que remise à zéro.
+        Envoyer zéro effaçait la cellule « CTX » de la barre à chaque ouverture
+        de conversation et à chaque changement de réglage — le chiffre ne
+        revenait qu'au tour suivant, et jamais du tout sous Codex.
         """
         # Au repos, la barre suit le choix explicite — même si son quota impose
         # momentanément un relais. Pendant un tour, le moteur qui travaille
@@ -1216,6 +1452,12 @@ class Session:
             self.turn.engine if self.turn and self.turn.engine
             else str(pinned or bot.engine_for_next_task())
         )
+        # Relire le journal du moteur touche le disque : c'est un thread, pas la
+        # boucle. Et seulement quand l'appelant n'a pas déjà la mesure en main.
+        if not used:
+            used, measured = await asyncio.to_thread(self.measure_context, engine)
+            size = size or measured
+
         with bot.state_lock:
             if engine == "codex":
                 model_label = (
@@ -1229,6 +1471,10 @@ class Session:
                 effort = bot.state["claude_effort"]
                 context_size = size or bot.MODELS[model][2]
         limits = await asyncio.to_thread(quota_snapshot, engine)
+        bounded = usage_meter.bounded_context(used, context_size)
+        if bounded != used:
+            log(f"contexte borné sur {self.id} : {used}/{context_size}")
+            used = bounded
         await self.update({
             "sessionUpdate": "usage_update",
             "used": used,
@@ -1244,9 +1490,20 @@ class Session:
     async def update(self, payload: dict[str, Any], *, persist: bool = True) -> None:
         if persist:
             continuity.record_tool(self.cwd, self.id, payload)
-        await self.connection.notify("session/update", {
-            "sessionId": self.id, "update": payload,
-        })
+        try:
+            await self.connection.notify("session/update", {
+                "sessionId": self.id, "update": payload,
+            })
+            self._notification_failed = False
+        except Exception as exc:  # noqa: BLE001 — la liaison ne possède pas le tour
+            # Le moteur doit survivre au socket qui l'a lancé. Les mises à jour
+            # persistantes sont déjà dans le journal ; à la reprise, `rebind`
+            # donne aux suivantes une nouvelle destination et le texte accumulé
+            # est rattrapé. Une coupure réseau n'est donc jamais une raison de
+            # tuer Claude/Codex ni de retirer prématurément ACTIVE_TURNS.
+            if not self._notification_failed:
+                log(f"liaison perdue pendant le tour {self.id} : {exc!r}")
+            self._notification_failed = True
 
     async def send_text(self, text: str, message_id: str) -> None:
         if not text:
@@ -1375,6 +1632,8 @@ class Connection:
             return self._list_sessions(params)
         if method == "hublot/projects":
             return self._list_projects()
+        if method == "hublot/running":
+            return {"turns": running_turns()}
         if method == "hublot/instructions":
             return self._instructions(params)
         if method == "hublot/transcribe":
@@ -1684,6 +1943,26 @@ class Connection:
                 else:
                     await session.send_text(text, str(uuid.uuid4()))
 
+        # Un tour peut être encore en vol : le téléphone s'est mis en veille, le
+        # réseau a changé de main, et le moteur a continué de travailler pour
+        # une liaison morte. Il écrivait alors dans le vide jusqu'à sa fin, et
+        # la conversation paraissait bloquée — elle ne repartait qu'au
+        # chargement suivant. On lui redonne ici le fil qui vient de revenir.
+        live = ACTIVE_TURNS.get(session.id)
+        if live is not None:
+            live.rebind(session)
+            session.turn = live
+            # L'annonce d'abord : elle dit au client que ce qui suit s'écrit
+            # encore, au lieu de le laisser prendre un texte vivant pour un
+            # morceau d'archive.
+            await session.send_activity(live.activity())
+            # Le texte déjà écrit n'est pas dans le fil commun : il n'y est
+            # inscrit qu'à la fin du tour. Sans ce rattrapage, la reprise
+            # affichait une réponse amputée de tout ce qui la précédait.
+            if live.reply.strip():
+                await session.send_text(live.reply, live.message_id)
+            log(f"tour en vol rattaché à la nouvelle liaison sur {session.id}")
+
         await session.send_status()
         return {"sessionId": session.id, "configOptions": self._config_options()}
 
@@ -1924,7 +2203,11 @@ class Connection:
         try:
             stop_reason = await turn.run()
         finally:
-            session.turn = None
+            # `detach` et non `session.turn = None` : une reprise de liaison a
+            # pu rattacher ce tour à une seconde session, et celle qu'on oublie
+            # ici resterait « occupée » pour toujours — tout envoi suivant
+            # refusé au motif qu'un tour tourne encore.
+            turn.detach()
             turn.finished.set()
             if ACTIVE_TURNS.get(session.id) is turn:
                 del ACTIVE_TURNS[session.id]

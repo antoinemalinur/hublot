@@ -26,9 +26,16 @@ enum StatusBar {
     /// pictogramme et qu'il doit s'attraper d'un coup d'œil.
     static let reset = "↻"
 
-    /// Le texte de la barre, ou `nil` s'il n'y a rien à dire.
-    static func content(status: SessionStatus?, contextPercent: Int?) -> String? {
-        var parts: [String] = []
+    /// Une mesure de la barre. `percent` est nul pour ce qui n'est pas une
+    /// jauge — le temps avant remise à zéro n'a pas de seuil d'alerte.
+    struct Cell {
+        var text: String
+        var percent: Int?
+    }
+
+    /// Les mesures, dans l'ordre d'affichage.
+    static func cells(status: SessionStatus?, contextPercent: Int?) -> [Cell] {
+        var parts: [Cell] = []
 
         // Les abonnements n'exposent pas les mêmes fenêtres. Claude fournit
         // normalement 5 h ; Codex, sur ce compte, fournit la semaine. Afficher
@@ -50,26 +57,56 @@ enum StatusBar {
         }
 
         if let quota {
-            parts.append("\(quota.label): \(quota.window.percent)%")
+            parts.append(.init(
+                text: "\(quota.label): \(quota.window.percent)%",
+                percent: quota.window.percent
+            ))
             // La remise à zéro est sa propre cellule : accolée au pourcentage,
             // on lisait « 42 % ↻4:12 » comme une seule quantité.
-            if let remaining = quota.window.remaining { parts.append("\(reset)\(remaining)") }
+            if let remaining = quota.window.remaining {
+                parts.append(.init(text: "\(reset)\(remaining)", percent: nil))
+            }
         }
         if let contextPercent {
-            parts.append("CTX \(contextPercent)%")
+            parts.append(.init(text: "CTX \(contextPercent)%", percent: contextPercent))
         }
 
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        return parts
     }
 
-    /// La même barre, prête à afficher : le glyphe de remise à zéro y est plus
-    /// grand que les chiffres, et redescendu de la moitié de ce qu'il a gagné
-    /// pour rester centré sur la ligne.
+    /// Le texte de la barre, ou `nil` s'il n'y a rien à dire.
+    static func content(status: SessionStatus?, contextPercent: Int?) -> String? {
+        let parts = cells(status: status, contextPercent: contextPercent)
+        return parts.isEmpty ? nil : parts.map(\.text).joined(separator: separator)
+    }
+
+    private static let separator = " · "
+
+    /// La même barre, prête à afficher.
+    ///
+    /// Deux détails de typographie, et un de fond. Le glyphe de remise à zéro
+    /// est plus grand que les chiffres — c'est un pictogramme, pas une lettre —
+    /// et redescendu de la moitié de ce qu'il a gagné pour rester sur la ligne.
+    /// Et **chaque jauge porte sa propre couleur** : une fenêtre de contexte à
+    /// 92 % s'affichait exactement comme une à 6 %, alors que la première dit
+    /// qu'on approche de la compaction et la seconde qu'on a toute la place du
+    /// monde.
     static func label(status: SessionStatus?, contextPercent: Int?) -> AttributedString? {
-        guard let text = content(status: status, contextPercent: contextPercent) else {
-            return nil
+        let parts = cells(status: status, contextPercent: contextPercent)
+        guard !parts.isEmpty else { return nil }
+
+        var label = AttributedString()
+        for (index, cell) in parts.enumerated() {
+            if index > 0 {
+                var gap = AttributedString(separator)
+                gap.foregroundColor = Hublot.meta
+                label.append(gap)
+            }
+            var piece = AttributedString(cell.text)
+            piece.foregroundColor = cell.percent.map(tint) ?? Hublot.meta
+            label.append(piece)
         }
-        var label = AttributedString(text)
+
         label.font = .hublotMeta
         if let range = label.range(of: reset) {
             label[range].font = .system(size: Hublot.metaSize + 4, design: .monospaced)

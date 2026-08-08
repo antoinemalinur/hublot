@@ -98,6 +98,54 @@ final class AppModel {
     private(set) var lastStatus: SessionStatus?
     private var statusWatch: Task<Void, Never>?
 
+    /// Les tours en cours sur le VPS, tous projets confondus.
+    ///
+    /// Sans eux, on n'apprenait qu'une conversation travaillait qu'en l'ouvrant.
+    /// Une demande longue lancée avant de ranger le téléphone devenait
+    /// invisible : rien, sur l'écran d'accueil, ne distinguait un projet au
+    /// repos d'un projet en plein travail.
+    private(set) var running: [RunningResult.Turn] = []
+
+    /// Assez souvent pour que l'écran d'accueil dise la vérité, assez rare pour
+    /// que ça ne pèse rien : la requête ne lit qu'un dictionnaire en mémoire.
+    private static let runningInterval = Duration.seconds(3)
+
+    func runningTurns(in project: ProjectListResult.Project) -> [RunningResult.Turn] {
+        running.filter { $0.cwd == project.path }
+    }
+
+    func isRunning(_ sessionId: String) -> Bool {
+        running.contains { $0.sessionId == sessionId }
+    }
+
+    /// Interroge le relais tant qu'un écran de liste est affiché. Les écrans de
+    /// conversation n'en ont pas besoin : ils reçoivent déjà le battement du
+    /// tour qu'ils portent.
+    func watchRunning() async {
+        // La tâche appartient à `.task` de la vue. Ainsi SwiftUI l'annule en
+        // quittant la liste ; une tâche non structurée attendue ici survivait
+        // au changement d'écran et continuait à interroger le relais derrière
+        // la conversation.
+        while !Task.isCancelled {
+            await refreshRunning()
+            do {
+                try await Task.sleep(for: Self.runningInterval)
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func refreshRunning() async {
+        guard let connection else { return }
+        // Une liste indisponible n'est pas une panne : on garde la précédente
+        // plutôt que de faire clignoter les pastilles à chaque hoquet réseau.
+        guard let result = try? await connection.call(
+            "hublot/running", Empty(), as: RunningResult.self, timeout: .seconds(10)
+        ) else { return }
+        running = result.turns
+    }
+
     private let log = Logger(subsystem: "hublot", category: "app")
 
     init() {
@@ -131,7 +179,35 @@ final class AppModel {
         static func demo(projects: [ProjectListResult.Project]) -> AppModel {
             let model = AppModel()
             model.projects = projects
+            if let active = projects.first(where: { $0.name == "office-chess" }) {
+                model.running = [.init(
+                    sessionId: "screen-running", cwd: active.path, engine: "claude",
+                    phase: .tool, label: "pytest", elapsed: 134, quiet: 1
+                )]
+            }
             model.screen = .projects
+            return model
+        }
+
+        static func demoSessions(project: ProjectListResult.Project) -> AppModel {
+            let model = AppModel()
+            model.sessions = [
+                .init(
+                    sessionId: "screen-running", cwd: project.path,
+                    title: "Valider les corrections d'interface", updatedAt: .now,
+                    exchanges: 6
+                ),
+                .init(
+                    sessionId: "screen-idle", cwd: project.path,
+                    title: "Conversation terminée", updatedAt: .now.addingTimeInterval(-3_600),
+                    exchanges: 2
+                ),
+            ]
+            model.running = [.init(
+                sessionId: "screen-running", cwd: project.path, engine: "claude",
+                phase: .tool, label: "/root/repos/office-chess/pytest", elapsed: 134, quiet: 1
+            )]
+            model.screen = .sessions(project)
             return model
         }
     #endif

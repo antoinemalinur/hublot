@@ -332,6 +332,11 @@ nonisolated enum SessionUpdate: Decodable, Sendable {
     case availableCommands([AvailableCommand])
     case currentMode(String)
     case usage(used: Int, size: Int, status: SessionStatus?)
+    /// Le signe de vie d'un tour, poussé par le relais toutes les quelques
+    /// secondes. Hors protocole, et assumé : ACP ne dit rien de ce qu'un agent
+    /// est en train de faire entre deux messages, et c'est précisément ce qu'on
+    /// regarde quand on attend depuis deux minutes.
+    case activity(Activity)
     /// Une variante qu'on ne connaît pas encore.
     ///
     /// Le protocole bouge ; une variante inconnue doit être ignorée, jamais
@@ -384,9 +389,102 @@ nonisolated enum SessionUpdate: Decodable, Sendable {
                 size: try container.decodeIfPresent(Int.self, forKey: .size) ?? 0,
                 status: try meta?["hublot"]?.decode(SessionStatus.self)
             )
+        case "hublot_activity":
+            self = .activity(try Activity(from: decoder))
         default:
             self = .unrecognised(kind)
         }
+    }
+}
+
+// MARK: - Ce qui tourne, partout
+
+/// `hublot/running` : les tours en cours, toutes conversations confondues.
+///
+/// Le registre vit dans le processus du relais, pas dans une liaison : un tour
+/// lancé hier soir et toujours en vol y figure, même si l'app a redémarré
+/// depuis. C'est ce qui permet de savoir, dès l'écran d'accueil, quels projets
+/// travaillent — sans ouvrir chaque conversation pour le découvrir.
+nonisolated struct RunningResult: Decodable, Sendable {
+    var turns: [Turn]
+
+    nonisolated struct Turn: Decodable, Sendable, Hashable, Identifiable {
+        var sessionId: String
+        var cwd: String
+        var engine: String?
+        var phase: Activity.Phase?
+        var label: String?
+        var elapsed: Double
+        var quiet: Double
+
+        var id: String { sessionId }
+    }
+}
+
+// MARK: - Signe de vie
+
+/// Ce que le moteur fait en ce moment, et depuis combien de temps il n'a plus
+/// rien émis.
+///
+/// Sans ces deux chiffres, un `Bash` de trois minutes et un moteur mort ont
+/// exactement le même aspect : un écran qui ne bouge plus. Le relais, lui, voit
+/// passer les événements et sait faire la différence ; il n'y avait juste aucun
+/// canal pour le dire.
+nonisolated struct Activity: Decodable, Sendable, Hashable {
+
+    /// Le vocabulaire du relais. Une valeur inconnue ne casse rien : elle
+    /// devient `.unknown` et l'app affiche seulement la durée.
+    nonisolated enum Phase: String, Decodable, Sendable {
+        case starting, thinking, writing, tool, waiting, done, unknown
+
+        init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = Phase(rawValue: raw) ?? .unknown
+        }
+    }
+
+    /// Vrai tant que le tour n'a pas rendu la main — y compris quand ce n'est
+    /// pas cette app qui l'a lancé.
+    var running: Bool
+    var phase: Phase
+    /// La commande ou l'outil en cours, tel que le moteur l'a nommé.
+    var label: String?
+    var engine: String?
+    /// Depuis le début du tour, en secondes.
+    var elapsed: Double
+    /// Depuis le dernier événement du moteur. C'est **ce** chiffre qui
+    /// distingue « ça travaille » de « plus rien ne vient ».
+    var quiet: Double
+    var stopReason: StopReason?
+
+    private enum CodingKeys: String, CodingKey {
+        case running, phase, label, engine, elapsed, quiet, stopReason
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        running = try container.decodeIfPresent(Bool.self, forKey: .running) ?? false
+        phase = try container.decodeIfPresent(Phase.self, forKey: .phase) ?? .unknown
+        label = try container.decodeIfPresent(String.self, forKey: .label)
+        engine = try container.decodeIfPresent(String.self, forKey: .engine)
+        elapsed = try container.decodeIfPresent(Double.self, forKey: .elapsed) ?? 0
+        quiet = try container.decodeIfPresent(Double.self, forKey: .quiet) ?? 0
+        // Un motif d'arrêt qu'on ne connaît pas ne doit pas emporter le reste :
+        // la durée et la phase valent d'être affichées même sans lui.
+        stopReason = try? container.decodeIfPresent(StopReason.self, forKey: .stopReason)
+    }
+
+    init(
+        running: Bool, phase: Phase, label: String? = nil, engine: String? = nil,
+        elapsed: Double = 0, quiet: Double = 0, stopReason: StopReason? = nil
+    ) {
+        self.running = running
+        self.phase = phase
+        self.label = label
+        self.engine = engine
+        self.elapsed = elapsed
+        self.quiet = quiet
+        self.stopReason = stopReason
     }
 }
 

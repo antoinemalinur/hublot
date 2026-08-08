@@ -42,17 +42,44 @@ final class ChatSession {
 
     /// Le pourcentage de fenêtre de contexte consommé, ou `nil` avant le
     /// premier échange : afficher 0 % laisserait croire à une mesure.
+    ///
+    /// Au-delà de cent, la barre se tait. Une fenêtre ne peut pas être remplie
+    /// à 1540 % — ce chiffre-là a réellement été affiché, le serveur envoyant
+    /// le total des jetons d'un tour au lieu du contexte porté. Devant un
+    /// plafond, une case vide dit « je ne sais pas » ; un nombre impossible,
+    /// lui, discrédite tout le reste de la barre.
     var contextPercent: Int? {
         guard contextSize > 0, contextUsed > 0 else { return nil }
-        return Int((Double(contextUsed) / Double(contextSize)) * 100)
+        let percent = Int((Double(contextUsed) / Double(contextSize)) * 100)
+        guard percent <= 100 else {
+            log.error("contexte incohérent : \(self.contextUsed)/\(self.contextSize)")
+            return nil
+        }
+        return percent
     }
+
+    /// Le dernier signe de vie du relais, et l'heure de sa réception.
+    ///
+    /// Les deux comptent. Ce que le serveur dit — quelle phase, quel silence —
+    /// et le fait qu'il le dise encore : un battement qui cesse est lui-même une
+    /// information, celle d'une liaison qui ne porte plus rien.
+    private(set) var activity: Activity?
+    private(set) var activityAt: Date?
 
     var machine: MachineState { .derive(from: turns) }
 
     /// Vrai tant que l'agent a la main. L'interface s'en sert pour remplacer le
     /// bouton d'envoi par un bouton d'arrêt — sans ça, un tour parti pour dix
     /// minutes ne se rattrape plus.
-    var isWorking: Bool { isPrompting }
+    ///
+    /// Un tour lancé depuis une liaison précédente compte aussi : c'est le cas
+    /// après une veille du téléphone, et le seul moyen de reprendre la main sur
+    /// un tour qu'on n'a pas soi-même envoyé.
+    var isWorking: Bool { isPrompting || isRemoteTurnRunning }
+
+    /// Vrai quand le relais annonce un tour en cours que cette liaison n'a pas
+    /// lancé — typiquement celui qui tournait encore pendant la veille.
+    private(set) var isRemoteTurnRunning = false
 
     private let connection: ACPConnection
     private let events: AsyncStream<ACPConnection.Event>
@@ -145,6 +172,11 @@ final class ChatSession {
 
         isReplaying = false
         isPrompting = true
+        // Le tour part d'ici : le battement précédent décrivait le tour d'avant,
+        // et l'afficher ferait apparaître une durée déjà longue à la seconde
+        // zéro.
+        activity = .init(running: true, phase: .starting, engine: engine.rawValue)
+        activityAt = .now
         turns.append(
             .user(
                 .init(
@@ -153,9 +185,11 @@ final class ChatSession {
                 )
             )
         )
-        // Le titre reste celui du projet : c'est lui qu'on pilote, et le
-        // remplacer par la première question faisait perdre de vue où l'on
-        // travaille dès le premier message.
+        // Dans la liste, le serveur garde son résumé persistant. Une fois le
+        // fil ouvert, le titre sert plutôt à rappeler la demande à laquelle on
+        // répond maintenant : sur une conversation longue, le nom du projet ou
+        // la toute première question ne donnent plus ce repère.
+        if !trimmed.isEmpty { title = Self.shorten(trimmed) }
 
         do {
             let blocks = attachments.map(\.block) + (trimmed.isEmpty ? [] : [.text(trimmed)])
@@ -220,7 +254,9 @@ final class ChatSession {
     }
 
     func cancel() async {
-        guard let sessionId, isPrompting else { return }
+        // `isWorking` et non `isPrompting` : un tour lancé avant une veille se
+        // rattrape aussi, et c'est même le seul moyen d'en reprendre la main.
+        guard let sessionId, isWorking else { return }
         try? await connection.notify("session/cancel", CancelParams(sessionId: sessionId))
     }
 
@@ -299,7 +335,10 @@ final class ChatSession {
         case .userMessageChunk(_, let content):
             guard let text = content.text, !text.isEmpty else { return }
             turns.append(.user(.init(id: UUID().uuidString, text: text)))
-            if turns.count == 1 { title = Self.shorten(text) }
+            // `session/load` rejoue les demandes dans l'ordre : en adoptant
+            // chacune d'elles, le titre finit naturellement sur la plus
+            // récente, comme lors d'un envoi en direct.
+            title = Self.shorten(text)
 
         case .agentMessageChunk(let messageId, let content):
             guard let text = content.text else { return }
@@ -324,6 +363,9 @@ final class ChatSession {
             contextUsed = used
             contextSize = size
             if let pushed { adopt(pushed) }
+
+        case .activity(let beat):
+            adopt(beat)
 
         case .availableCommands(let list):
             // Annoncées par le moteur, jamais écrites en dur : un plugin
@@ -352,16 +394,49 @@ final class ChatSession {
         if let name = status.engine, let known = Engine(rawValue: name) { engine = known }
     }
 
+    /// Adopte un signe de vie.
+    ///
+    /// Le cas qui justifie tout ce chemin : on rouvre une conversation dont le
+    /// tour n'est pas fini. Le rejeu vient de poser un texte figé ; ce battement
+    /// dit qu'il s'écrit encore. Sans lui, l'app affichait une réponse
+    /// apparemment terminée et un bouton d'envoi — alors que le moteur
+    /// travaillait toujours et qu'aucun envoi ne serait accepté.
+    private func adopt(_ beat: Activity) {
+        activity = beat
+        activityAt = .now
+        if let name = beat.engine, let known = Engine(rawValue: name) { engine = known }
+
+        guard !isPrompting else { return }
+        if beat.running {
+            isRemoteTurnRunning = true
+            // Ce qui arrive après ce point est vivant, pas archivé : les
+            // morceaux suivants doivent donc battre du curseur.
+            isReplaying = false
+        } else if isRemoteTurnRunning {
+            isRemoteTurnRunning = false
+            finishStreaming(reason: beat.stopReason)
+            Notifier.turnFinished(session: title, preview: lastAssistantText)
+        }
+    }
+
     private func appendMessage(_ text: String, messageId: String) {
         if let index = messageIndex[messageId], case .assistant(var turn) = turns[index] {
             turn.append(text)
+            // Le bloc rattrapé à la reprise d'un tour en vol est arrivé figé —
+            // le relais l'avait rejoué avant de reprendre son flux. Dès qu'il
+            // grandit à nouveau, il est vivant et doit le montrer.
+            if isWorking && !turn.isStreaming { turn.isStreaming = true }
             turns[index] = .assistant(turn)
             return
         }
         // Un message rejoué est déjà écrit : le marquer « en cours » faisait
         // clignoter le curseur et respirer la lueur pour du texte figé, comme
         // si la machine travaillait alors qu'elle ne fait rien.
-        var turn = AssistantTurn(id: messageId, isStreaming: isPrompting && !isReplaying)
+        //
+        // `isWorking` et non `isPrompting` : le tour peut avoir été lancé avant
+        // une veille du téléphone. C'est le même texte vivant, et il doit battre
+        // du curseur qu'on l'ait demandé depuis cette liaison ou une autre.
+        var turn = AssistantTurn(id: messageId, isStreaming: isWorking && !isReplaying)
         turn.append(text)
         turns.append(.assistant(turn))
         messageIndex[messageId] = turns.count - 1
@@ -374,7 +449,9 @@ final class ChatSession {
             return
         }
         turns.append(
-            .thought(.init(id: messageId, markdown: text, isStreaming: isPrompting))
+            .thought(.init(
+                id: messageId, markdown: text, isStreaming: isWorking && !isReplaying
+            ))
         )
         thoughtIndex[messageId] = turns.count - 1
     }
@@ -389,7 +466,7 @@ final class ChatSession {
         let content = payload.content?.compactMap(Self.convert) ?? []
 
         if let index = toolIndex[payload.toolCallId], case .toolCall(var turn) = turns[index] {
-            if let title = payload.title { turn.title = Self.title(payload) ?? title }
+            if let title = payload.title { turn.title = self.title(payload) ?? title }
             if let kind = payload.kind { turn.kind = kind }
             if let status = payload.status { turn.status = status }
             if let location = Self.location(payload) { turn.location = location }
@@ -403,7 +480,7 @@ final class ChatSession {
             .toolCall(
                 .init(
                     id: payload.toolCallId,
-                    title: Self.title(payload) ?? payload.title ?? "outil",
+                    title: title(payload) ?? payload.title ?? "outil",
                     kind: payload.kind ?? .other,
                     status: payload.status ?? .pending,
                     location: Self.location(payload),
@@ -418,12 +495,26 @@ final class ChatSession {
     /// Le titre affiché. `_meta.claudeCode.toolName` donne « Read » quand le
     /// titre du protocole dit encore « Read File » ; on préfère le chemin réel
     /// dès qu'il arrive.
-    private static func title(_ payload: ToolCallPayload) -> String? {
-        if let path = payload.locations?.first?.path {
-            return URL(fileURLWithPath: path).lastPathComponent
-        }
+    private func title(_ payload: ToolCallPayload) -> String? {
+        if let path = payload.locations?.first?.path { return shorten(path) }
         if let command = payload.rawInput?["command"]?.stringValue { return command }
-        return payload.title
+        // Le pont de Claude Code ne remplit pas `locations` : pour un `Edit`,
+        // le chemin absolu arrive dans le titre. Sur un fil de cent trente
+        // cartes, le préfixe du dépôt est le même partout et mange la largeur
+        // utile — il ne reste plus la place de lire le nom du fichier.
+        guard let title = payload.title else { return nil }
+        return title.hasPrefix("/") ? shorten(title) : title
+    }
+
+    /// Un chemin ramené à ce qu'il dit d'utile : sa position dans le projet.
+    ///
+    /// Relatif plutôt que réduit au dernier composant — `UI/Blocks.swift` et
+    /// `Domain/Blocks.swift` sont deux fichiers différents, et les confondre
+    /// dans le fil rendrait le regroupement des appels répétés faux.
+    private func shorten(_ path: String) -> String {
+        let root = workingDirectory.hasSuffix("/") ? workingDirectory : workingDirectory + "/"
+        if path.hasPrefix(root) { return String(path.dropFirst(root.count)) }
+        return path
     }
 
     /// L'emplacement factuel de l'appel. Certaines implémentations ACP
@@ -465,6 +556,9 @@ final class ChatSession {
             }
         }
         isPrompting = false
+        isRemoteTurnRunning = false
+        activity = nil
+        activityAt = nil
         if let reason, reason != .endTurn {
             log.notice("tour terminé sur \(reason.rawValue, privacy: .public)")
             if let note = Self.note(for: reason) {

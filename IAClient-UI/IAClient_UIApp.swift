@@ -15,8 +15,20 @@ struct IAClient_UIApp: App {
                 // `-HublotRadiographyDemo 1` rend la carte sans serveur : une
                 // feature visuelle doit pouvoir être photographiée à chaque
                 // changement, pas seulement lorsqu'un tour réel tombe juste.
-                if UserDefaults.standard.bool(forKey: "HublotRadiographyDemo") {
+                if UserDefaults.standard.bool(forKey: "HublotRadiographyDense") {
+                    // La carte chargée : quatorze régions, conversation finie.
+                    // C'est le cas qui se chevauchait et qui s'animait à tort.
+                    RadiographyView.dense
+                } else if UserDefaults.standard.bool(forKey: "HublotRadiographyDemo") {
                     RadiographyView.demo
+                } else if UserDefaults.standard.bool(forKey: "HublotConversationDemo") {
+                    // Fil déterministe et assez long pour exercer le chrome,
+                    // le retour au direct, les groupes et la radiographie sans
+                    // dépendre du VPS pendant les tests d'interface.
+                    ConversationView.screenTestDemo
+                } else if UserDefaults.standard.bool(forKey: "HublotSessionsDemo") {
+                    let project = ProjectListResult.Project.samples[1]
+                    SessionsView(model: .demoSessions(project: project), project: project)
                 } else if UserDefaults.standard.bool(forKey: "HublotProjectsDemo") {
                     // `-HublotProjectsDemo 1` rend la liste des projets sans
                     // serveur. Même raison que ci-dessus : un écran qu'on ne
@@ -69,6 +81,8 @@ struct RootView: View {
                         onChoose: { option, value in
                             Task { await chat.choose(option, value: value) }
                         },
+                        activity: chat.activity,
+                        activityAt: chat.activityAt,
                         isWorking: chat.isWorking,
                         isReconnecting: model.isReconnecting,
                         onStop: { Task { await chat.cancel() } },

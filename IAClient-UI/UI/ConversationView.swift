@@ -30,6 +30,11 @@ struct ConversationView: View {
     var contextPercent: Int?
     var commands: [String] = []
     var onChoose: (ConfigOption, String) -> Void = { _, _ in }
+    /// Le dernier signe de vie du relais, et l'instant où il est arrivé. C'est
+    /// ce qui permet de dire « il exécute une commande depuis deux minutes »
+    /// plutôt que de laisser un écran immobile parler à notre place.
+    var activity: Activity?
+    var activityAt: Date?
     /// Vrai pendant qu'un tour tourne : le bouton d'envoi devient un bouton
     /// d'arrêt, et c'est le seul moyen de reprendre la main avant la fin.
     var isWorking = false
@@ -42,6 +47,32 @@ struct ConversationView: View {
 
     @State private var showingRadiography = false
 
+    /// Vrai quand la dernière ligne est visible. C'est ce qui décide si le fil
+    /// suit la réponse qui s'écrit, ou s'il laisse lire là où on est.
+    @State private var isPinned = true
+
+    /// Vrai pendant la brève fenêtre où le fil se met en place.
+    ///
+    /// L'ancrage bas de `ScrollView` cale la position sur le contenu **mesuré**.
+    /// Or un historique rejoué arrive par morceaux, et les hauteurs réelles —
+    /// Markdown, blocs de code colorés — ne se connaissent qu'après coup : la
+    /// vue se posait donc sur une estimation, et on rouvrait une longue
+    /// conversation au milieu, obligé de faire glisser jusqu'en bas pour lire
+    /// la dernière réponse. On redescend tant que ça bouge, et on s'arrête au
+    /// premier geste.
+    @State private var isSettling = true
+
+    /// La position du fil, pilotable.
+    ///
+    /// Elle remplace un `ScrollViewReader` qui visait une sentinelle par son
+    /// identifiant — et c'est **la** raison pour laquelle le bouton de retour
+    /// au direct ne faisait rien : dans un `LazyVStack`, la vue ciblée n'existe
+    /// plus dès qu'on s'en est éloigné, et `scrollTo(id:)` échoue alors en
+    /// silence. Viser un *bord* ne dépend d'aucune vue.
+    @State private var position = ScrollPosition(edge: .bottom)
+
+    private static let bottomAnchor = "hublot.fil.bas"
+
     private var machine: MachineState { .derive(from: turns) }
 
     var body: some View {
@@ -50,9 +81,22 @@ struct ConversationView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: Hublot.unit * 2) {
-                    ForEach(turns) { turn in
-                        TurnRow(turn: turn)
+                    // Regroupé à l'affichage seulement : le fil, lui, garde
+                    // chaque appel — cf. `threadRows`.
+                    ForEach(turns.threadRows()) { row in
+                        ThreadRowView(row: row)
                     }
+                    // Le témoin qui dit si on est en bas. Un point de hauteur,
+                    // à l'intérieur de la pile : sa visibilité vaut mieux qu'un
+                    // calcul d'offsets, parce qu'un fil plus court que l'écran
+                    // est déjà « en bas » sans qu'aucune arithmétique ne le
+                    // dise — et c'est le cas au début de chaque conversation.
+                    Color.clear
+                        .frame(height: 1)
+                        .id(Self.bottomAnchor)
+                        .onScrollVisibilityChange(threshold: 0.01) { visible in
+                            isPinned = visible
+                        }
                 }
                 .padding(.horizontal, Hublot.unit * 2)
                 .padding(.top, Hublot.unit * 4)
@@ -60,19 +104,30 @@ struct ConversationView: View {
                 .background(alignment: .topLeading) {
                     LightRail(state: machine)
                 }
-                // Le texte doit être sélectionnable et copiable partout : c'est
-                // une demande explicite du périmètre v1.
+                // Le texte doit être sélectionnable et copiable partout :
+                // c'est une demande explicite du périmètre v1.
                 .textSelection(.enabled)
             }
             // On ouvre une conversation pour voir où elle en est, pas comment
             // elle a commencé. L'ancrage bas fait aussi suivre le flux pendant
-            // que la réponse s'écrit, sans code de défilement à la main.
+            // que la réponse s'écrit.
             .defaultScrollAnchor(.bottom)
+            .scrollPosition($position)
             .scrollDismissesKeyboard(.interactively)
+            .onScrollPhaseChange { _, phase in
+                // Un geste vaut décision : on cesse de ramener vers le bas.
+                if phase == .interacting { isSettling = false }
+            }
+            .task { await settle() }
+            .onChange(of: turns.count) { _, _ in
+                guard isPinned else { return }
+                withAnimation(.easeOut(duration: 0.2)) { position.scrollTo(edge: .bottom) }
+            }
             .safeAreaInset(edge: .top, spacing: 0) {
                 SessionChrome(
                     title: sessionTitle, engine: engine, machine: machine, plan: plan,
                     status: status, contextPercent: contextPercent,
+                    activity: activity, activityAt: activityAt,
                     isReconnecting: isReconnecting, onBack: onBack,
                     onRadiography: { showingRadiography = true }
                 )
@@ -88,15 +143,69 @@ struct ConversationView: View {
                     onDictate: onDictate,
                     onSend: onSend
                 )
+                // Dans la marge haute du composer, là où il n'y a que du
+                // fondu : le bouton ne coûte donc aucune hauteur au fil et
+                // n'en déplace pas le contenu en apparaissant.
+                .overlay(alignment: .topTrailing) {
+                    if !isPinned {
+                        JumpToLatest {
+                            isSettling = false
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                position.scrollTo(edge: .bottom)
+                            }
+                        }
+                        .padding(.trailing, Hublot.unit * 2)
+                        .padding(.top, Hublot.unit * 2)
+                        .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                    }
+                }
+                .animation(.snappy(duration: 0.22), value: isPinned)
             }
             // `scrollEdgeEffectStyle` n'est pas utilisé : mesuré sur capture,
             // il ne s'applique qu'aux barres système, pas à un `safeAreaInset`
-            // quelconque. Le fondu est donc fabriqué à la main — cf. `EdgeScrim`.
+            // quelconque. Le fondu est donc fabriqué à la main — cf.
+            // `EdgeScrim`.
         }
         .preferredColorScheme(.dark)
         .fullScreenCover(isPresented: $showingRadiography) {
-            RadiographyView(projectName: sessionTitle, turns: turns)
+            RadiographyView(
+                projectName: sessionTitle, turns: turns, isLive: isWorking
+            )
         }
+    }
+
+    /// Ramène le fil en bas tant que sa hauteur bouge encore.
+    ///
+    /// Deux secondes et demie, ou le premier geste : passé ce délai, un
+    /// historique de deux cents blocs a fini de se mesurer, et insister
+    /// reviendrait à empêcher de remonter lire.
+    private func settle() async {
+        let deadline = ContinuousClock.now + .seconds(2.5)
+        while isSettling, ContinuousClock.now < deadline {
+            position.scrollTo(edge: .bottom)
+            try? await Task.sleep(for: .milliseconds(90))
+        }
+        isSettling = false
+    }
+}
+
+/// Le retour au direct. Il n'apparaît que lorsqu'on a quitté le bas du fil —
+/// sinon il annonce un voyage qu'on a déjà fait.
+struct JumpToLatest: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "arrow.down")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Hublot.ember)
+                .frame(width: 34, height: 34)
+                .contentShape(.circle)
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: .circle)
+        .accessibilityIdentifier("jump-to-latest")
+        .accessibilityLabel("Aller à la dernière réponse")
     }
 }
 
@@ -221,6 +330,8 @@ struct SessionChrome: View {
     let plan: [PlanEntry]
     var status: SessionStatus?
     var contextPercent: Int?
+    var activity: Activity?
+    var activityAt: Date?
     var commands: [String] = []
     var isReconnecting = false
     var onBack: (() -> Void)?
@@ -305,52 +416,192 @@ struct SessionChrome: View {
                 .glassEffect(.regular, in: .capsule)
                 .padding(.leading, Hublot.unit * 2.5)
                 .transition(.opacity.combined(with: .offset(y: -6)))
-            } else if let bar = StatusBar.label(status: status, contextPercent: contextPercent) {
-                Text(bar)
-                    .foregroundStyle(Hublot.meta)
-                    .lineLimit(1)
-                    .padding(.horizontal, Hublot.unit * 1.25)
-                    .padding(.vertical, Hublot.unit * 0.5)
-                    .glassEffect(.regular, in: .capsule)
-                    .padding(.leading, Hublot.unit * 2.5)
+            } else {
+                // Les deux mesures partagent une seule ligne : les plafonds à
+                // gauche, le pouls à droite. Empilées, elles coûtaient une
+                // ligne de chrome de plus — donc autant de moins pour le texte,
+                // qui est ce qu'on vient lire.
+                HStack(alignment: .center, spacing: Hublot.unit) {
+                    if let bar = StatusBar.label(
+                        status: status, contextPercent: contextPercent
+                    ) {
+                        // Pas de `foregroundStyle` ici : chaque cellule porte
+                        // déjà la couleur de son seuil, et un style de vue
+                        // l'écraserait.
+                        Text(bar)
+                            .accessibilityIdentifier("status-bar")
+                            .lineLimit(1)
+                            .fixedSize()
+                            .padding(.horizontal, Hublot.unit * 1.25)
+                            .padding(.vertical, Hublot.unit * 0.5)
+                            .glassEffect(.regular, in: .capsule)
+                    }
+
+                    Spacer(minLength: 0)
+
+                    if let activity, let activityAt, activity.running {
+                        ActivityCapsule(activity: activity, receivedAt: activityAt)
+                            .accessibilityIdentifier("activity-capsule")
+                            .transition(.opacity.combined(with: .offset(y: -6)))
+                    }
+                }
+                .padding(.horizontal, Hublot.unit * 2.5)
             }
         }
         .padding(.bottom, Hublot.unit * 1.5)
         .animation(.snappy(duration: 0.25), value: isReconnecting)
+        .animation(.snappy(duration: 0.25), value: activity?.running)
         .background { EdgeScrim(edge: .top).ignoresSafeArea() }
     }
 }
 
-/// Le point vivant. Il bat quand la machine travaille, et il a un halo — c'est
-/// le même feu que celui du fond, en miniature.
-struct EngineBadge: View {
-    let engine: Engine
-    var machine: MachineState = .idle
+/// Le pouls du tour en cours : ce que le moteur fait, depuis combien de temps,
+/// et — surtout — depuis combien de temps il n'a plus rien dit.
+///
+/// C'est la pièce qui manquait le plus. Une commande de trois minutes et un
+/// moteur mort donnaient exactement le même écran : rien qui bouge. On restait
+/// devant sans savoir s'il fallait attendre ou tout relancer. Le relais, lui,
+/// voit passer chaque événement du moteur ; il envoie donc son compte à rebours
+/// du silence, et cette capsule le lit.
+///
+/// Elle se met à jour toute seule, sans horloge à entretenir : `TimelineView`
+/// bat la seconde, et les chiffres sont recalculés à partir de l'instant de
+/// réception du dernier battement. Un battement qui cesse d'arriver est donc
+/// visible lui aussi — c'est la liaison qui ne porte plus rien.
+struct ActivityCapsule: View {
+    let activity: Activity
+    let receivedAt: Date
+
+    /// Au-delà, le relais lui-même s'est tu : il bat toutes les quatre
+    /// secondes, donc vingt sans un mot ne sont pas une lenteur du moteur.
+    private static let lostAfter: TimeInterval = 20
+    /// Au-delà, le moteur n'a rien émis depuis assez longtemps pour qu'on ait
+    /// le droit de s'inquiéter — sans pour autant affirmer qu'il est mort.
+    private static let quietAfter: TimeInterval = 45
+
+    var body: some View {
+        TimelineView(.periodic(from: receivedAt, by: 1)) { context in
+            let age = max(0, context.date.timeIntervalSince(receivedAt))
+            let elapsed = activity.elapsed + age
+            let quiet = activity.quiet + age
+            let lost = age > Self.lostAfter
+
+            HStack(spacing: Hublot.unit * 0.75) {
+                PulseDot(tint: lost ? Hublot.removed : Hublot.ember, beating: !lost)
+                // Seul le libellé se laisse rogner. Le compteur, lui, doit
+                // rester lisible en entier : c'est ce qu'on regarde quand on se
+                // demande depuis combien de temps on attend.
+                Text(caption(quiet: quiet, lost: lost))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .foregroundStyle(lost ? Hublot.removed : Hublot.prose)
+                Text(Self.clock(elapsed))
+                    .foregroundStyle(Hublot.meta)
+                    .monospacedDigit()
+                    .fixedSize()
+            }
+            .font(.hublotMetaEmphasis)
+            .padding(.horizontal, Hublot.unit * 1.25)
+            .padding(.vertical, Hublot.unit * 0.5)
+            .glassEffect(.regular, in: .capsule)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                "\(caption(quiet: quiet, lost: lost)), depuis \(Self.clock(elapsed))"
+            )
+        }
+    }
+
+    /// Ce qu'on écrit, par ordre de gravité : la liaison muette d'abord, puis le
+    /// moteur muet, puis simplement ce qu'il fait.
+    ///
+    /// Court, parce que la capsule partage sa ligne avec les plafonds. Le
+    /// détail complet de l'outil est dans le fil, juste en dessous.
+    private func caption(quiet: TimeInterval, lost: Bool) -> String {
+        if lost { return "sans signal" }
+        if activity.phase == .waiting { return "autorisation ?" }
+        if quiet > Self.quietAfter { return "silence \(Self.clock(quiet))" }
+        guard let detail else { return verb }
+        return "\(verb) · \(detail)"
+    }
+
+    private var verb: String {
+        switch activity.phase {
+        case .starting: "démarrage"
+        case .thinking: "réfléchit"
+        case .writing: "écrit"
+        case .tool: "exécute"
+        case .waiting: "attend"
+        case .done, .unknown: "en cours"
+        }
+    }
+
+    /// Le libellé du relais, ramené à ce qui tient dans une capsule partagée.
+    /// Une commande entière y déborderait et chasserait le compteur de l'écran.
+    private var detail: String? {
+        guard let label = activity.label?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !label.isEmpty
+        else { return nil }
+        // La fin d'un chemin en dit plus que son début : « app.py » plutôt que
+        // « /root/repos/office-… ».
+        let flat = label.replacingOccurrences(of: "\n", with: " ")
+        let leaf = flat.contains("/") && !flat.contains(" ")
+            ? String(flat.split(separator: "/").last ?? "")
+            : flat
+        return leaf.count > 22 ? String(leaf.prefix(21)) + "…" : leaf
+    }
+
+    /// « 2:14 », « 1:04:09 ». Les secondes comptent : c'est à elles qu'on voit
+    /// que quelque chose avance encore.
+    static func clock(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds))
+        let (hours, minutes, rest) = (total / 3600, (total % 3600) / 60, total % 60)
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, rest)
+            : String(format: "%d:%02d", minutes, rest)
+    }
+}
+
+/// Un point qui bat. Le même feu que le fond, réduit à six points de diamètre.
+struct PulseDot: View {
+    let tint: Color
+    var beating = true
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var pulse = false
 
+    var body: some View {
+        Circle()
+            .fill(tint)
+            .frame(width: 6, height: 6)
+            .shadow(color: tint.opacity(beating ? 0.9 : 0), radius: pulse ? 6 : 2)
+            .opacity(beating && pulse ? 0.5 : 1)
+            .animation(
+                reduceMotion || !beating
+                    ? nil
+                    : .easeInOut(duration: 0.9).repeatForever(autoreverses: true),
+                value: pulse
+            )
+            .onAppear { pulse = true }
+    }
+}
+
+/// Le moteur qui répond, précédé du point vivant.
+struct EngineBadge: View {
+    let engine: Engine
+    var machine: MachineState = .idle
+
     private var isLive: Bool { machine == .thinking || machine == .working }
-    private var tint: Color { machine == .failed ? Hublot.removed : Hublot.ember }
 
     var body: some View {
         HStack(spacing: Hublot.unit * 0.75) {
-            Circle()
-                .fill(tint)
-                .frame(width: 6, height: 6)
-                .shadow(color: tint.opacity(isLive ? 0.9 : 0), radius: pulse ? 6 : 2)
-                .opacity(isLive && pulse ? 0.55 : 1)
-                .animation(
-                    reduceMotion || !isLive
-                        ? nil
-                        : .easeInOut(duration: 0.9).repeatForever(autoreverses: true),
-                    value: pulse
-                )
+            PulseDot(
+                tint: machine == .failed ? Hublot.removed : Hublot.ember,
+                beating: isLive
+            )
             Text(engine.label)
                 .font(.hublotMetaEmphasis)
                 .foregroundStyle(Hublot.meta)
         }
-        .onAppear { pulse = true }
     }
 }
 
@@ -540,7 +791,12 @@ struct Composer: View {
     @FocusState private var isWriting: Bool
 
     var body: some View {
-        GlassEffectContainer(spacing: Hublot.unit * 1.5) {
+        // `PhotosPicker` traite son label comme une closure `Sendable`.
+        // Capturer une couleur déjà résolue évite d'y relire l'état SwiftUI
+        // isolé au MainActor (warning qui n'apparaissait qu'en Release).
+        let pickerTint = attachments.isEmpty ? Hublot.meta : Hublot.ember
+
+        return GlassEffectContainer(spacing: Hublot.unit * 1.5) {
             VStack(alignment: .leading, spacing: Hublot.unit * 1.25) {
                 // Les réglages s'effacent pendant qu'on écrit : au moment de
                 // formuler une demande, le choix du modèle n'est plus la
@@ -558,11 +814,11 @@ struct Composer: View {
                         }
                         .padding(.trailing, Hublot.unit * 2)
                     }
+                    .accessibilityIdentifier("config-options")
                     // La rangée déborde dès que les libellés s'allongent —
                     // « Medium » au lieu de « Low » suffit. Sans ce fondu, la
                     // dernière pilule paraît coupée plutôt que suivie d'autres.
                     .trailingScrollFade()
-                    .scrollClipDisabled()
                     .transition(.opacity.combined(with: .offset(y: 8)))
                 }
 
@@ -633,9 +889,7 @@ struct Composer: View {
                         ) {
                             Image(systemName: "photo.on.rectangle.angled")
                                 .font(.system(size: 15, weight: .medium))
-                                .foregroundStyle(
-                                    attachments.isEmpty ? Hublot.meta : Hublot.ember
-                                )
+                                .foregroundStyle(pickerTint)
                                 .frame(width: 32, height: 34)
                                 .contentShape(.rect)
                         }
@@ -755,6 +1009,7 @@ struct PillMenu: View {
         }
         .buttonStyle(.plain)
         .glassEffect(.regular.interactive(), in: .capsule)
+        .accessibilityIdentifier("config-\(option.id)")
     }
 
     private func capsule(_ text: String) -> some View {
@@ -815,3 +1070,83 @@ struct CommandPalette: View {
         .transition(.opacity.combined(with: .offset(y: 10)))
     }
 }
+
+#if DEBUG
+    extension ConversationView {
+        /// Écran témoin des gestes critiques, lancé par les UI tests.
+        ///
+        /// Il reste entièrement local : une panne réseau ne peut ni le vider,
+        /// ni changer ses libellés, ni rendre un test de mise en page aléatoire.
+        static var screenTestDemo: ConversationView {
+            var rows: [Turn] = []
+            for index in 1...10 {
+                rows.append(.user(.init(
+                    id: "question-\(index)",
+                    text: "Question historique \(index) — vérifier le comportement du fil."
+                )))
+                rows.append(.assistant(.init(
+                    id: "answer-\(index)",
+                    markdown: String(repeating: "Réponse de contrôle \(index). ", count: 8)
+                )))
+            }
+            for index in 1...6 {
+                rows.append(.toolCall(.init(
+                    id: "edit-\(index)", title: index == 6 ? "styles.css" : "app.py",
+                    kind: .edit, status: .completed
+                )))
+            }
+            rows.append(.assistant(.init(
+                id: "latest-answer",
+                markdown: "FIN DU FIL — réponse la plus récente."
+            )))
+
+            let options = [
+                ConfigOption(
+                    id: "model", name: "Modèle", category: "model", type: "select",
+                    currentValue: .string("opus"),
+                    options: [.init(value: "opus", name: "Opus", description: nil)]
+                ),
+                ConfigOption(
+                    id: "effort", name: "Effort", category: "thought_level", type: "select",
+                    currentValue: .string("high"),
+                    options: [.init(value: "high", name: "Élevé", description: nil)]
+                ),
+                ConfigOption(
+                    id: "mode", name: "Mode", category: "mode", type: "select",
+                    currentValue: .string("code"),
+                    options: [.init(value: "code", name: "Code", description: nil)]
+                ),
+                ConfigOption(
+                    id: "detail", name: "Détail", category: "style", type: "select",
+                    currentValue: .string("concise"),
+                    options: [.init(value: "concise", name: "Concis", description: nil)]
+                ),
+                ConfigOption(
+                    id: "permissions", name: "Permissions", category: "mode", type: "select",
+                    currentValue: .string("allow_all"),
+                    options: [
+                        .init(value: "allow_all", name: "Tout autoriser", description: nil)
+                    ]
+                ),
+            ]
+            let status = SessionStatus(
+                model: "Opus", effort: "high", engine: "claude",
+                limits: [
+                    "five_hour": .init(percent: 17, resetsAt: .now.addingTimeInterval(14_400))
+                ]
+            )
+
+            return ConversationView(
+                sessionTitle: "Résumer le dernier prompt", engine: .claude,
+                turns: rows, onBack: {}, configOptions: options,
+                status: status, contextPercent: 42,
+                activity: .init(
+                    running: true, phase: .tool,
+                    label: "/root/repos/office-chess/scripts/validation-complete.sh",
+                    engine: "claude", elapsed: 134, quiet: 1
+                ),
+                activityAt: .now, isWorking: true
+            )
+        }
+    }
+#endif

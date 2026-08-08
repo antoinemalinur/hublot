@@ -227,6 +227,68 @@ struct ACPDecodingTests {
         #expect(size == 200_000)
     }
 
+    @Test("Le signe de vie d'un tour se décode, phase et silence compris")
+    func activite() throws {
+        // La trame que le relais pousse toutes les quatre secondes pendant un
+        // tour. `quiet` est celle qui compte : c'est le temps depuis le dernier
+        // événement du moteur, donc la seule preuve que ça avance encore.
+        let notification = try decode(
+            SessionNotification.self,
+            """
+            {"sessionId":"s","update":{"sessionUpdate":"hublot_activity",
+             "running":true,"phase":"tool","label":"sqlite3 backups/manual.db",
+             "engine":"codex","elapsed":137.4,"quiet":12.3,"stopReason":null}}
+            """)
+
+        guard case .activity(let beat) = notification.update else {
+            Issue.record("attendu hublot_activity"); return
+        }
+        #expect(beat.running)
+        #expect(beat.phase == .tool)
+        #expect(beat.label == "sqlite3 backups/manual.db")
+        #expect(beat.engine == "codex")
+        #expect(beat.elapsed == 137.4)
+        #expect(beat.quiet == 12.3)
+        #expect(beat.stopReason == nil)
+    }
+
+    @Test("La fin d'un tour se dit même à qui ne l'a pas lancé")
+    func activiteTerminee() throws {
+        let notification = try decode(
+            SessionNotification.self,
+            """
+            {"sessionId":"s","update":{"sessionUpdate":"hublot_activity",
+             "running":false,"phase":"done","elapsed":420.0,"quiet":0.2,
+             "stopReason":"end_turn"}}
+            """)
+
+        guard case .activity(let beat) = notification.update else {
+            Issue.record("attendu hublot_activity"); return
+        }
+        #expect(!beat.running)
+        #expect(beat.stopReason == .endTurn)
+    }
+
+    @Test("Une phase ou un motif d'arrêt inconnus n'emportent pas le battement")
+    func activiteInconnue() throws {
+        // Le vocabulaire du relais bougera. La durée, elle, reste lisible —
+        // et c'est déjà l'essentiel de ce qu'on affiche.
+        let notification = try decode(
+            SessionNotification.self,
+            """
+            {"sessionId":"s","update":{"sessionUpdate":"hublot_activity",
+             "running":true,"phase":"compacting","elapsed":9,"quiet":1,
+             "stopReason":"quelque_chose_de_neuf"}}
+            """)
+
+        guard case .activity(let beat) = notification.update else {
+            Issue.record("attendu hublot_activity"); return
+        }
+        #expect(beat.phase == .unknown)
+        #expect(beat.stopReason == nil)
+        #expect(beat.elapsed == 9)
+    }
+
     @Test("Les plafonds voyagent dans _meta sans casser un client ordinaire")
     func plafonds() throws {
         // Le serveur du VPS pousse modèle, effort, moteur et quotas dans

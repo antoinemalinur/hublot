@@ -42,7 +42,8 @@ struct SessionsView: View {
                         // La plus récente est celle qu'on reprend neuf fois
                         // sur dix : elle est marquée pour qu'on la trouve
                         // sans lire.
-                        isLatest: index == 0
+                        isLatest: index == 0,
+                        running: model.running.first { $0.sessionId == session.sessionId }
                     ) {
                         Task { await model.resume(session) }
                     } onDelete: {
@@ -78,6 +79,9 @@ struct SessionsView: View {
             }
         #endif
         .preferredColorScheme(.dark)
+        // Même veille que sur l'écran des projets : elle dit quelles
+        // conversations de ce dépôt travaillent en ce moment.
+        .task { await model.watchRunning() }
         .sheet(isPresented: $showingInstructions) {
             if let document = model.instructions {
                 InstructionsSheet(project: project.name, document: document)
@@ -142,6 +146,8 @@ private extension View {
 struct SessionRow: View {
     let session: SessionListResult.Summary
     var isLatest = false
+    /// Le tour qui travaille dans cette conversation, s'il y en a un.
+    var running: RunningResult.Turn?
     let onOpen: () -> Void
     let onDelete: () -> Void
 
@@ -150,7 +156,7 @@ struct SessionRow: View {
             HStack(spacing: Hublot.unit * 1.5) {
                 Image(systemName: isLatest ? "bubble.left.fill" : "bubble.left")
                     .font(.system(size: 13, weight: .light))
-                    .foregroundStyle(isLatest ? Hublot.ember : Hublot.meta)
+                    .foregroundStyle(isLatest || running != nil ? Hublot.ember : Hublot.meta)
                     .frame(width: 20)
 
                 VStack(alignment: .leading, spacing: 3) {
@@ -161,9 +167,12 @@ struct SessionRow: View {
                         .fixedSize(horizontal: false, vertical: true)
                     Text(subtitle)
                         .font(.hublotMeta)
-                        .foregroundStyle(Hublot.meta)
+                        .foregroundStyle(running == nil ? Hublot.meta : Hublot.ember)
                 }
                 Spacer(minLength: 0)
+                // La conversation qui travaille se voit dans la liste, avant
+                // de l'ouvrir : c'est là qu'on choisit laquelle reprendre.
+                if running != nil { PulseDot(tint: Hublot.ember) }
                 Image(systemName: "chevron.right")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Hublot.meta.opacity(0.6))
@@ -175,12 +184,20 @@ struct SessionRow: View {
         }
         .buttonStyle(.plain)
         .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 16, style: .continuous))
+        .accessibilityLabel("\(session.displayTitle), \(subtitle)")
         .contextMenu {
             Button("Supprimer", systemImage: "trash", role: .destructive, action: onDelete)
         }
     }
 
     private var subtitle: String {
+        // Ce qui se passe maintenant prime sur ce qui s'est passé : devant une
+        // conversation en train de travailler, sa date de dernière modification
+        // n'apprend rien.
+        if let running {
+            let what = running.label.map { " · \($0.split(separator: "/").last ?? "")" } ?? ""
+            return "en cours\(what) · \(ActivityCapsule.clock(running.elapsed))"
+        }
         var parts: [String] = []
         if let exchanges = session.exchanges, exchanges > 0 {
             parts.append("\(exchanges) échange\(exchanges > 1 ? "s" : "")")

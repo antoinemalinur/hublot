@@ -12,12 +12,17 @@
 //
 //   node Tools/e2e.mjs              tout
 //   node Tools/e2e.mjs --fast       sans les tours qui appellent un moteur
+//   node Tools/e2e.mjs --only=vol    les scénarios dont le nom contient « vol »
+//
+// Le filtre existe pour une raison précise : vérifier un correctif ne devrait
+// pas coûter dix-sept tours de quota.
 //
 import WebSocket from "ws";
 
 const URL_ = process.env.HUBLOT_URL ?? "wss://acp.95-216-190-3.sslip.io";
 const TOKEN = process.env.HUBLOT_TOKEN;
 const FAST = process.argv.includes("--fast");
+const ONLY = process.argv.find((arg) => arg.startsWith("--only="))?.slice(7) ?? "";
 const SANDBOX = "/root/repos/hublot-e2e";
 
 if (!TOKEN) {
@@ -99,6 +104,18 @@ class Client {
       .map((u) => u.update.content?.text ?? "").join("");
   }
 
+  /// Attend qu'une condition se réalise, plutôt qu'un délai fixe. Un moteur
+  /// n'écrit pas au même rythme d'un jour à l'autre, et un test calé sur une
+  /// horloge finit toujours par mentir dans un sens ou dans l'autre.
+  async until(condition, timeout = 60000, step = 250) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (condition()) return true;
+      await new Promise((r) => setTimeout(r, step));
+    }
+    return condition();
+  }
+
   clear() { this.updates = []; }
   close() { this.socket.close(); }
 }
@@ -110,6 +127,9 @@ const results = [];
 let current = null;
 
 async function test(name, body, { slow = false } = {}) {
+  if (ONLY && !name.toLowerCase().includes(ONLY.toLowerCase())) {
+    results.push({ name, state: "sauté" }); return;
+  }
   if (slow && FAST) { results.push({ name, state: "sauté" }); return; }
   current = { name, checks: [] };
   const started = Date.now();
@@ -395,6 +415,126 @@ async function main() {
     client.notify("session/cancel", { sessionId: session.sessionId });
     await first;
     await client.call("session/delete", { sessionId: session.sessionId, cwd: SANDBOX });
+  }, { slow: true });
+
+  // -- Signe de vie --------------------------------------------------------
+  await test("Un tour dit ce qu'il fait, et depuis quand", async () => {
+    // Sans ce battement, une commande de trois minutes et un moteur planté
+    // donnent exactement le même écran : rien qui bouge. C'est le serveur, et
+    // lui seul, qui voit passer les événements du moteur.
+    const session = await client.call("session/new", { cwd: SANDBOX, mcpServers: [] });
+    client.clear();
+    const turn = client.call("session/prompt", {
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text:
+        "Compte de 1 à 300 en toutes lettres, une ligne par nombre." }],
+    }, 300000);
+
+    await new Promise((r) => setTimeout(r, 12000));
+    const beats = client.seen("hublot_activity").map((u) => u.update);
+    expect(beats.length >= 2, `${beats.length} battement(s) en 12 s`);
+    expect(beats.every((b) => b.running), "un tour en cours s'annonce en cours");
+    expect(beats.some((b) => b.elapsed > 0), "la durée du tour est comptée");
+    expect(beats.at(-1)?.quiet < 15, `silence annoncé : ${beats.at(-1)?.quiet} s`);
+    expect(["starting", "thinking", "writing", "tool"].includes(beats.at(-1)?.phase),
+      `phase ${beats.at(-1)?.phase}`);
+
+    client.notify("session/cancel", { sessionId: session.sessionId });
+    await turn;
+    const last = client.seen("hublot_activity").at(-1)?.update;
+    expect(last?.running === false, "la fin du tour est annoncée");
+    await client.call("session/delete", { sessionId: session.sessionId, cwd: SANDBOX });
+  }, { slow: true });
+
+  await test("Un tour survit à la liaison, et repart sur celle qui revient", async () => {
+    // Le scénario vécu : le téléphone s'endort au milieu d'un tour. Le moteur
+    // continuait, mais écrivait vers un socket mort — la conversation
+    // paraissait figée, et ne repartait qu'au chargement suivant, une fois le
+    // tour terminé. Elle doit repartir tout de suite.
+    const first = await Client.connect();
+    await first.call("initialize", handshake);
+    const session = await first.call("session/new", { cwd: SANDBOX, mcpServers: [] });
+    first.call("session/prompt", {
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text:
+        "Compte de 1 à 300 en toutes lettres, une ligne par nombre." }],
+    }, 300000).catch(() => {});
+
+    // Assez longtemps pour que le moteur ait vraiment commencé à écrire :
+    // c'est ce texte-là, absent du fil commun tant que le tour n'est pas fini,
+    // que la reprise doit rattraper.
+    await first.until(() => first.text().length > 40, 60000);
+    first.close();  // la veille du téléphone, en une ligne
+
+    const second = await Client.connect();
+    await second.call("initialize", handshake);
+    second.clear();
+    await second.call("session/load",
+      { sessionId: session.sessionId, cwd: SANDBOX, mcpServers: [] });
+
+    const announced = second.seen("hublot_activity").at(-1)?.update;
+    expect(announced?.running === true, "la reprise annonce un tour en vol");
+    expect(announced?.elapsed > 5, `tour déjà vieux de ${announced?.elapsed} s`);
+    // Le texte déjà écrit n'est pas dans le fil commun — il n'y entre qu'à la
+    // fin du tour. Sans rattrapage, la reprise affichait une réponse amputée.
+    expect(second.text().length > 0, "ce qui était déjà écrit est rattrapé");
+
+    const before = second.text().length;
+    expect(await second.until(() => second.text().length > before, 45000),
+      "le flux continue sur la nouvelle liaison");
+    expect(await second.until(
+      () => second.seen("hublot_activity").length >= 2, 20000),
+      "le battement suit la nouvelle liaison");
+
+    second.notify("session/cancel", { sessionId: session.sessionId });
+    await new Promise((r) => setTimeout(r, 4000));
+    expect(second.seen("hublot_activity").at(-1)?.update.running === false,
+      "la fin arrive sur la liaison qui écoute");
+
+    // La session doit être rendue libre : marquée occupée pour toujours, elle
+    // refuserait tout envoi suivant au motif qu'un tour tourne encore.
+    const after = await second.call("session/prompt", {
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "Réponds exactement : REPRIS." }],
+    }, 300000);
+    expect(after.stopReason === "end_turn", `stopReason ${after.stopReason}`);
+
+    await second.call("session/delete", { sessionId: session.sessionId, cwd: SANDBOX });
+    second.close();
+  }, { slow: true });
+
+  await test("Le contexte est connu dès l'ouverture, pas seulement après un tour", async () => {
+    // La cellule « CTX » disparaissait à chaque ouverture de conversation :
+    // le serveur renvoyait zéro, et l'app préfère taire un chiffre plutôt
+    // qu'en inventer un. Il est maintenant relu chez le moteur qui le mesure.
+    const session = await client.call("session/new", { cwd: SANDBOX, mcpServers: [] });
+    await client.call("session/prompt", {
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "Réponds exactement : CTX-E2E." }],
+    }, 300000);
+
+    const fresh = await Client.connect();
+    await fresh.call("initialize", handshake);
+    fresh.clear();
+    await fresh.call("session/load",
+      { sessionId: session.sessionId, cwd: SANDBOX, mcpServers: [] });
+    const usage = fresh.seen("usage_update").at(-1)?.update;
+    expect(usage?.used > 0, `contexte relu à l'ouverture : ${usage?.used}`);
+    expect(usage?.size > 0, `fenêtre annoncée : ${usage?.size}`);
+
+    // Un simple changement de réglage ne doit pas l'effacer non plus.
+    fresh.clear();
+    const engine = usage?._meta?.hublot?.engine ?? "claude";
+    await fresh.call("session/set_config_option", {
+      sessionId: session.sessionId, configId: "engine", value: engine,
+    }).catch(() => {});
+    const afterSetting = fresh.seen("usage_update").at(-1)?.update;
+    if (afterSetting) {
+      expect(afterSetting.used > 0, "le réglage n'efface pas le contexte");
+    }
+
+    await fresh.call("session/delete", { sessionId: session.sessionId, cwd: SANDBOX });
+    fresh.close();
   }, { slow: true });
 
   // -- Conversations -------------------------------------------------------

@@ -45,6 +45,89 @@ struct TurnRow: View {
     }
 }
 
+/// Une ligne du fil rendu : un tour ordinaire, ou une suite d'outils repliée.
+struct ThreadRowView: View {
+    let row: ThreadRow
+
+    var body: some View {
+        switch row {
+        case .single(let turn): TurnRow(turn: turn)
+        case .tools(let group):
+            // Un appel isolé n'a rien à replier : il s'affiche tel quel, sinon
+            // on paierait un pli pour une seule ligne.
+            if group.calls.count == 1 {
+                ToolCallCard(turn: group.calls[0])
+            } else {
+                ToolGroupCard(group: group)
+            }
+        }
+    }
+}
+
+/// Une suite d'appels de même nature, en une ligne.
+///
+/// Repliée par défaut — c'est le sens même du groupe : ne pas noyer la réponse
+/// sous vingt lignes de plomberie. Un toucher rouvre tout, dans l'ordre et
+/// **sans rien fusionner** : si Claude a modifié six fois le même fichier, on
+/// veut voir six lignes, parce que ce sont six modifications différentes.
+struct ToolGroupCard: View {
+    let group: ToolGroup
+
+    @State private var isExpanded = false
+
+    private var summary: String {
+        let targets = group.targets
+        guard !targets.isEmpty else { return "" }
+        return targets.joined(separator: ", ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Hublot.unit) {
+            Gutter {
+                StatusGlyph(status: group.status)
+            } content: {
+                Button {
+                    withAnimation(.snappy(duration: 0.2)) { isExpanded.toggle() }
+                } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: Hublot.unit) {
+                        Text(group.kind.rawValue.capitalized)
+                            .font(.hublotMetaEmphasis)
+                            .foregroundStyle(Hublot.meta)
+                        Text("×\(group.calls.count)")
+                            .font(.hublotMetaEmphasis)
+                            .foregroundStyle(Hublot.ember)
+                        Text(summary)
+                            .font(.hublotMono)
+                            .foregroundStyle(Hublot.prose)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: Hublot.unit)
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(Hublot.meta)
+                    }
+                    .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    "\(group.kind.rawValue), \(group.calls.count) appels, \(summary)"
+                )
+                .accessibilityHint(isExpanded ? "Replier le détail" : "Voir chaque appel")
+                .accessibilityIdentifier("tool-group-\(group.kind.rawValue)")
+            }
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: Hublot.unit * 1.5) {
+                    ForEach(group.calls) { call in
+                        ToolCallCard(turn: call)
+                    }
+                }
+                .transition(.opacity.combined(with: .offset(y: -6)))
+            }
+        }
+    }
+}
+
 // MARK: - Note de marge
 
 /// Discrète par construction : c'est un fait de service, pas une réponse. Même
@@ -302,6 +385,7 @@ struct ToolCallCard: View {
                     .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("tool-call-\(turn.id)")
 
                 if isExpanded {
                     ForEach(turn.content) { item in

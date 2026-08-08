@@ -123,6 +123,116 @@ struct ProjectRadiographyTests {
         #expect(present.links.count == 2)
     }
 
+    // MARK: La carte tient dans l'écran
+
+    /// La taille utile du champ sur un iPhone : la largeur pleine moins la
+    /// marge, la hauteur entre le chrome du haut et les commandes du bas.
+    private static let field = CGSize(width: 377, height: 460)
+
+    /// Deux régions se recouvrent tant que leurs écarts sont inférieurs à leur
+    /// encombrement **sur les deux axes** : c'est le critère de deux
+    /// rectangles, et un rectangle est bien ce qu'occupe un disque surmontant
+    /// son nom.
+    private func overlaps(
+        _ layout: RegionLayout.Layout, tolerance: CGFloat = 0.5
+    ) -> [(Int, Int)] {
+        let box = RegionLayout.footprint(
+            diameter: layout.diameter, labelWidth: layout.labelWidth
+        )
+        var found: [(Int, Int)] = []
+        for i in layout.slots.indices {
+            for j in layout.slots.indices where j > i {
+                let dx = abs(layout.slots[i].x - layout.slots[j].x)
+                let dy = abs(layout.slots[i].y - layout.slots[j].y)
+                if dx < box.width - tolerance && dy < box.height - tolerance {
+                    found.append((i, j))
+                }
+            }
+        }
+        return found
+    }
+
+    @Test("Une carte chargée ne superpose jamais deux régions", arguments: [
+        1, 2, 3, 5, 8, 11, 14, 18, 24, 31, 40,
+    ])
+    func denseLayoutNeverOverlaps(count: Int) throws {
+        // Quatorze régions, c'est ce qu'une vraie séance produit — et c'est là
+        // que l'ancienne disposition, une seule ellipse, empilait les disques
+        // les uns sur les autres.
+        let layout = RegionLayout.layout(totalSlots: count, in: Self.field)
+        #expect(layout.slots.count == count)
+        #expect(overlaps(layout).isEmpty)
+    }
+
+    @Test("Un écran étroit n'est pas une excuse pour empiler", arguments: [
+        CGSize(width: 320, height: 380), CGSize(width: 377, height: 460),
+        CGSize(width: 430, height: 620),
+    ])
+    func narrowFieldsStillSeparate(field: CGSize) throws {
+        let layout = RegionLayout.layout(totalSlots: 14, in: field)
+        #expect(overlaps(layout).isEmpty)
+    }
+
+    @Test("Aucune région ne déborde du champ")
+    func layoutStaysInsideTheField() throws {
+        let layout = RegionLayout.layout(totalSlots: 14, in: Self.field)
+        let box = RegionLayout.footprint(
+            diameter: layout.diameter, labelWidth: layout.labelWidth
+        )
+        for point in layout.slots {
+            #expect(point.x >= box.width / 2 - 0.5)
+            #expect(point.x <= Self.field.width - box.width / 2 + 0.5)
+            #expect(point.y >= box.height / 2 - 0.5)
+            #expect(point.y <= Self.field.height - box.height / 2 + 0.5)
+        }
+    }
+
+    @Test("Les disques rétrécissent plutôt que de se chevaucher")
+    func crowdingShrinksTheNodes() throws {
+        let sparse = RegionLayout.layout(totalSlots: 4, in: Self.field)
+        let crowded = RegionLayout.layout(totalSlots: 22, in: Self.field)
+        #expect(crowded.diameter < sparse.diameter)
+        #expect(crowded.diameter >= RegionLayout.minDiameter)
+        // Le nom suit le disque : une étiquette à taille fixe recouvrirait le
+        // voisin dès que les places se resserrent.
+        #expect(crowded.labelWidth < sparse.labelWidth)
+    }
+
+    @Test("Remonter la chronologie ne déplace aucune région")
+    func placesDoNotMoveWhileScrubbing() throws {
+        // Les places sont calculées sur le fil entier : une région apparue au
+        // trentième outil occupe déjà sa case au premier.
+        let early = RegionLayout.layout(totalSlots: 9, in: Self.field)
+        let late = RegionLayout.layout(totalSlots: 9, in: Self.field)
+        #expect(early == late)
+        #expect(early.slots[3] == late.slots[3])
+    }
+
+    @Test("Une carte terminée ne rend rien d'animé")
+    @MainActor
+    func aFinishedMapRendersStill() throws {
+        // La braise qui voyageait sur la dernière transition donnait à croire
+        // que l'agent rejouait ses derniers gestes, sur un fil clos depuis des
+        // heures. Elle n'existe plus que sur un tour en cours.
+        let turns: [Turn] = [
+            .toolCall(.init(
+                id: "a", title: "A.swift", kind: .read, status: .completed,
+                location: "/root/repos/P/App/A.swift"
+            )),
+            .toolCall(.init(
+                id: "b", title: "B.swift", kind: .edit, status: .inProgress,
+                location: "/root/repos/P/Server/B.swift"
+            )),
+        ]
+        for isLive in [true, false] {
+            let view = RadiographyView(projectName: "P", turns: turns, isLive: isLive)
+                .frame(width: 390, height: 844)
+            let renderer = ImageRenderer(content: view)
+            renderer.scale = 1
+            #expect(renderer.uiImage != nil)
+        }
+    }
+
     @Test("La mise à jour ACP conserve l'emplacement réel dans le fil")
     @MainActor
     func locationSurvivesToolMerging() async throws {

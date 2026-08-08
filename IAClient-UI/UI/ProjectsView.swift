@@ -43,7 +43,10 @@ struct ProjectsView: View {
                     }
 
                     ForEach(visible) { project in
-                        ProjectRow(project: project) {
+                        ProjectRow(
+                            project: project,
+                            running: model.runningTurns(in: project)
+                        ) {
                             Task { await model.open(project) }
                         }
                     }
@@ -64,6 +67,10 @@ struct ProjectsView: View {
             .refreshable { await model.loadProjects() }
         }
         .preferredColorScheme(.dark)
+        // Ce qui travaille pendant qu'on regarde ailleurs. La boucle s'arrête
+        // avec l'écran : une conversation ouverte reçoit déjà son propre
+        // battement, elle n'a rien à demander en plus.
+        .task { await model.watchRunning() }
     }
 
     private var header: some View {
@@ -123,7 +130,11 @@ struct ProjectsView: View {
 
 struct ProjectRow: View {
     let project: ProjectListResult.Project
+    /// Les tours qui travaillent en ce moment sur ce dépôt.
+    var running: [RunningResult.Turn] = []
     let action: () -> Void
+
+    private var isWorking: Bool { !running.isEmpty }
 
     var body: some View {
         Button(action: action) {
@@ -139,9 +150,13 @@ struct ProjectRow: View {
                         .foregroundStyle(Hublot.prose)
                     Text(subtitle)
                         .font(.hublotMeta)
-                        .foregroundStyle(Hublot.meta)
+                        .foregroundStyle(isWorking ? Hublot.ember : Hublot.meta)
                 }
                 Spacer(minLength: 0)
+                // Le point vivant, à même la liste : c'est la seule chose qui
+                // distingue un dépôt au repos d'un dépôt en plein travail, et
+                // elle manquait — on ne l'apprenait qu'en ouvrant.
+                if isWorking { PulseDot(tint: Hublot.ember) }
                 Image(systemName: "chevron.right")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Hublot.meta.opacity(0.6))
@@ -153,11 +168,19 @@ struct ProjectRow: View {
         }
         .buttonStyle(.plain)
         .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 16, style: .continuous))
+        .accessibilityLabel("\(project.name), \(subtitle)")
     }
 
-    /// Ce qu'on veut savoir avant d'ouvrir : y a-t-il quelque chose à reprendre,
-    /// et de quand.
+    /// Ce qu'on veut savoir avant d'ouvrir : ce qui tourne s'il y a quelque
+    /// chose qui tourne, et sinon ce qu'il y a à reprendre.
     private var subtitle: String {
+        if isWorking {
+            let count = running.count
+            let longest = running.map(\.elapsed).max() ?? 0
+            return count > 1
+                ? "\(count) conversations en cours · \(ActivityCapsule.clock(longest))"
+                : "en cours · \(ActivityCapsule.clock(longest))"
+        }
         let count = project.sessionCount
         let conversations = count == 0
             ? "aucune conversation"

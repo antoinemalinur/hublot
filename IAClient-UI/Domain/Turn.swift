@@ -163,6 +163,99 @@ struct ToolCallTurn: Identifiable {
     var isExpanded: Bool = false
 }
 
+// MARK: - Ce que la vue affiche
+
+/// Une suite d'appels **consécutifs de même nature**, présentée comme une seule
+/// ligne qu'on déplie.
+///
+/// Sur une vraie séance, Claude enchaîne six `Edit` sur le même fichier et
+/// quatre `Read` autour. Six blocs `old_string`/`new_string` différents, donc
+/// six appels parfaitement réels — mais le pont ACP n'envoie ni le diff ni la
+/// ligne visée, et les six cartes portaient à l'écran rigoureusement le même
+/// texte. Mesuré sur Office Chess : 129 cartes, dont 22 identiques à celle du
+/// dessus.
+///
+/// La réponse n'est pas de cacher des appels, c'est de les ranger : une ligne
+/// par nature d'action, et le détail complet — doublons compris — au toucher.
+struct ToolGroup: Identifiable {
+    /// Celui du premier appel : stable tant que le groupe existe.
+    let id: String
+    var kind: ToolKind
+    var calls: [ToolCallTurn]
+
+    /// L'état du groupe. Ce qui tourne encore l'emporte, puis ce qui a échoué :
+    /// une réussite ultérieure ne doit pas effacer un échec du lot.
+    var status: ToolStatus {
+        if calls.contains(where: { $0.status == .inProgress }) { return .inProgress }
+        if calls.contains(where: { $0.status == .pending }) { return .pending }
+        if calls.contains(where: { $0.status == .failed }) { return .failed }
+        return .completed
+    }
+
+    /// Les endroits touchés, sans répétition et dans l'ordre. C'est ce qui tient
+    /// lieu de résumé : « app.py, styles.css » en dit plus que « 6 appels ».
+    var targets: [String] {
+        var seen: Set<String> = []
+        return calls.compactMap { call in
+            let name = call.title
+            return seen.insert(name).inserted ? name : nil
+        }
+    }
+}
+
+/// Une ligne du fil rendu : soit un tour ordinaire, soit un groupe d'outils.
+enum ThreadRow: Identifiable {
+    case single(Turn)
+    case tools(ToolGroup)
+
+    var id: String {
+        switch self {
+        case .single(let turn): turn.id
+        case .tools(let group): "tools-\(group.id)"
+        }
+    }
+}
+
+extension Array where Element == Turn {
+
+    /// Le fil tel qu'on le lit : les suites d'outils rassemblées par nature.
+    ///
+    /// Le regroupement appartient à **l'affichage**, jamais au modèle. Le fil
+    /// garde ses appels un par un, et la radiographie continue de les compter
+    /// tous — six modifications d'un fichier, ce sont six actions, pas une.
+    func threadRows() -> [ThreadRow] {
+        var rows: [ThreadRow] = []
+        rows.reserveCapacity(count)
+        var batch: [ToolKind: ToolGroup] = [:]
+        var order: [ToolKind] = []
+
+        func flushTools() {
+            for kind in order {
+                if let group = batch[kind] { rows.append(.tools(group)) }
+            }
+            batch.removeAll(keepingCapacity: true)
+            order.removeAll(keepingCapacity: true)
+        }
+
+        for turn in self {
+            guard case .toolCall(let tool) = turn else {
+                flushTools()
+                rows.append(.single(turn))
+                continue
+            }
+            if var group = batch[tool.kind] {
+                group.calls.append(tool)
+                batch[tool.kind] = group
+            } else {
+                order.append(tool.kind)
+                batch[tool.kind] = .init(id: tool.id, kind: tool.kind, calls: [tool])
+            }
+        }
+        flushTools()
+        return rows
+    }
+}
+
 // MARK: - Permission
 
 /// Une option renvoyée par `session/request_permission`. Le libellé vient de

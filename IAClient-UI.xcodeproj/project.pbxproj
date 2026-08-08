@@ -19,11 +19,19 @@
 			remoteGlobalIDString = B579B08D3024089200B27C68;
 			remoteInfo = "IAClient-UI";
 		};
+		CC0008000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B579B0863024089200B27C68 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B579B08D3024089200B27C68;
+			remoteInfo = "IAClient-UI";
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		B579B08E3024089200B27C68 /* IAClient-UI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "IAClient-UI.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		BB0001000000000000000001 /* IAClient-UITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "IAClient-UITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		CC0001000000000000000001 /* IAClient-UIScreenTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "IAClient-UIScreenTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -35,6 +43,11 @@
 		BB0002000000000000000001 /* IAClient-UITests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = "IAClient-UITests";
+			sourceTree = "<group>";
+		};
+		CC0002000000000000000001 /* IAClient-UIScreenTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "IAClient-UIScreenTests";
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -56,6 +69,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CC0004000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -64,6 +84,7 @@
 			children = (
 				B579B0903024089200B27C68 /* IAClient-UI */,
 				BB0002000000000000000001 /* IAClient-UITests */,
+				CC0002000000000000000001 /* IAClient-UIScreenTests */,
 				B579B08F3024089200B27C68 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -73,6 +94,7 @@
 			children = (
 				B579B08E3024089200B27C68 /* IAClient-UI.app */,
 				BB0001000000000000000001 /* IAClient-UITests.xctest */,
+				CC0001000000000000000001 /* IAClient-UIScreenTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -127,6 +149,29 @@
 			productReference = BB0001000000000000000001 /* IAClient-UITests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		CC0003000000000000000001 /* IAClient-UIScreenTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CC0005000000000000000001 /* Build configuration list for PBXNativeTarget "IAClient-UIScreenTests" */;
+			buildPhases = (
+				CC0004000000000000000001 /* Sources */,
+				CC0004000000000000000002 /* Frameworks */,
+				CC0004000000000000000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				CC0007000000000000000001 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				CC0002000000000000000001 /* IAClient-UIScreenTests */,
+			);
+			name = "IAClient-UIScreenTests";
+			packageProductDependencies = (
+			);
+			productName = "IAClient-UIScreenTests";
+			productReference = CC0001000000000000000001 /* IAClient-UIScreenTests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -162,6 +207,7 @@
 			targets = (
 				B579B08D3024089200B27C68 /* IAClient-UI */,
 				BB0003000000000000000001 /* IAClient-UITests */,
+				CC0003000000000000000001 /* IAClient-UIScreenTests */,
 			);
 		};
 /* End PBXProject section */
@@ -175,6 +221,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		BB0004000000000000000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CC0004000000000000000003 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -198,6 +251,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CC0004000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -205,6 +265,11 @@
 			isa = PBXTargetDependency;
 			target = B579B08D3024089200B27C68 /* IAClient-UI */;
 			targetProxy = BB0008000000000000000001 /* PBXContainerItemProxy */;
+		};
+		CC0007000000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B579B08D3024089200B27C68 /* IAClient-UI */;
+			targetProxy = CC0008000000000000000001 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -434,6 +499,40 @@
 			};
 			name = Release;
 		};
+		CC0006000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "antoinemalinur.IAClient-UIScreenTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = "IAClient-UI";
+			};
+			name = Debug;
+		};
+		CC0006000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "antoinemalinur.IAClient-UIScreenTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = "IAClient-UI";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -460,6 +559,15 @@
 			buildConfigurations = (
 				BB0006000000000000000001 /* Debug */,
 				BB0006000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		CC0005000000000000000001 /* Build configuration list for PBXNativeTarget "IAClient-UIScreenTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CC0006000000000000000001 /* Debug */,
+				CC0006000000000000000002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

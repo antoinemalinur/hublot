@@ -118,6 +118,60 @@ struct ConversationFlowTests {
         #expect(answer.last?.contains("4 joueurs") == true)
     }
 
+    @Test("Le titre du fil suit le dernier prompt envoyé")
+    func titleFollowsLatestLivePrompt() async throws {
+        let harness = try await Harness()
+        let chat = await harness.session(id: harness.recordedSession)
+
+        await chat.send("Vérifie le premier état")
+        #expect(await chat.title == "Vérifie le premier état")
+
+        let latest = "Résume la dernière modification et les tests associés"
+        await chat.send(latest)
+        #expect(await chat.title == latest)
+    }
+
+    @Test("La reprise d'un fil finit sur le dernier prompt rejoué")
+    @MainActor
+    func titleFollowsLatestReplayedPrompt() async throws {
+        let harness = try await Harness()
+        let chat = await harness.session(id: harness.recordedSession)
+
+        await harness.transport.emit(Self.userMessage(
+            harness.recordedSession, id: "question-1", text: "Ancienne demande"
+        ))
+        await harness.transport.emit(Self.userMessage(
+            harness.recordedSession, id: "question-2", text: "Dernière demande rejouée"
+        ))
+
+        #expect(await harness.until { chat.title == "Dernière demande rejouée" })
+    }
+
+    @Test("Un lot d'outils se replie une fois par type d'action")
+    func toolRowsGroupByKindWithinAContiguousBatch() throws {
+        let turns: [Turn] = [
+            .toolCall(.init(id: "edit-1", title: "app.py", kind: .edit, status: .completed)),
+            .toolCall(.init(id: "read-1", title: "README.md", kind: .read, status: .completed)),
+            .toolCall(.init(id: "edit-2", title: "styles.css", kind: .edit, status: .completed)),
+            .assistant(.init(id: "answer", markdown: "Terminé.")),
+            .toolCall(.init(id: "read-2", title: "Tests.swift", kind: .read, status: .completed)),
+        ]
+
+        let rows = turns.threadRows()
+        #expect(rows.count == 4)
+        guard case .tools(let edits) = rows[0], case .tools(let reads) = rows[1],
+            case .single = rows[2], case .tools(let finalRead) = rows[3]
+        else {
+            Issue.record("la frontière de prose ou l'ordre des types n'est pas conservé")
+            return
+        }
+        #expect(edits.kind == .edit)
+        #expect(edits.calls.map(\.id) == ["edit-1", "edit-2"])
+        #expect(reads.kind == .read)
+        #expect(reads.calls.map(\.id) == ["read-1"])
+        #expect(finalRead.calls.map(\.id) == ["read-2"])
+    }
+
     // MARK: L'état de la machine
 
     @Test("Un échec rattrapé n'alarme plus l'écran une fois la réponse rendue")
@@ -234,6 +288,24 @@ struct ConversationFlowTests {
         #expect(await chat.metrics?.fiveHour?.percent == 17)
     }
 
+    @Test("Une mesure de contexte impossible n'affiche jamais plus de cent pour cent")
+    @MainActor
+    func impossibleContextIsHidden() async throws {
+        let harness = try await Harness()
+        let chat = await harness.session(id: harness.recordedSession)
+
+        await harness.transport.emit(Self.usage(
+            harness.recordedSession, used: 100, size: 100
+        ))
+        #expect(await harness.until { chat.contextPercent == 100 })
+
+        await harness.transport.emit(Self.usage(
+            harness.recordedSession, used: 1_540, size: 100
+        ))
+        #expect(await harness.until { chat.contextUsed == 1_540 })
+        #expect(chat.contextPercent == nil)
+    }
+
     @Test("Une session Codex affiche son quota, jamais le cinq heures Claude")
     func codexStatusUsesCodexWindow() throws {
         let status = try JSONCoding.decoder.decode(
@@ -250,8 +322,119 @@ struct ConversationFlowTests {
         let bar = try #require(StatusBar.content(status: status, contextPercent: nil))
         #expect(bar.hasPrefix("7J: 20% · \(StatusBar.reset)"))
         #expect(!bar.contains("5H"))
+
+        // Chaque jauge porte son seuil : à 20 % le quota reste discret, une
+        // fenêtre de contexte à 92 % doit alarmer.
+        let cells = StatusBar.cells(status: status, contextPercent: 92)
+        #expect(cells.map(\.percent) == [20, nil, 92])
+        #expect(StatusBar.tint(20) == Hublot.meta)
+        #expect(StatusBar.tint(92) == Hublot.removed)
         #expect(status.model == "gpt-5.6-sol")
         #expect(status.effort == "max")
+    }
+
+    // MARK: Un tour qui a survécu à la veille
+
+    /// Le scénario exact vécu sur Office Chess : une demande longue, le
+    /// téléphone qui s'endort, la liaison qui tombe, et l'app qui revient.
+    ///
+    /// Avant, elle revenait sur un fil muet : le tour continuait côté serveur
+    /// mais écrivait vers un socket mort, et rien à l'écran ne disait s'il
+    /// travaillait encore ou s'il était planté. On attendait devant une réponse
+    /// qui n'arrivait plus, sans moyen de trancher.
+    @Test("Un tour resté en vol se voit dès la reprise, et sa fin se dit")
+    @MainActor
+    func liveTurnSurvivesReconnection() async throws {
+        let harness = try await Harness()
+        let chat = await harness.session(id: harness.recordedSession)
+        #expect(chat.isWorking == false)
+
+        await harness.transport.emit(Self.activity(
+            harness.recordedSession,
+            #""running":true,"phase":"tool","label":"sqlite3 manual.db","#
+                + #""engine":"codex","elapsed":137.4,"quiet":12.3"#
+        ))
+
+        #expect(await harness.until { chat.isWorking })
+        #expect(chat.activity?.phase == .tool)
+        #expect(chat.activity?.label == "sqlite3 manual.db")
+        #expect(chat.activityAt != nil)
+        // Le moteur annoncé par le battement fait autorité : la pastille
+        // affichait Claude pendant que Codex répondait.
+        #expect(chat.engine == .codex)
+
+        // Ce qui arrive ensuite est vivant, pas de l'archive : le curseur doit
+        // battre, sinon on relit une réponse en la croyant finie.
+        await harness.transport.emit(
+            """
+            {"jsonrpc":"2.0","method":"session/update","params":{
+              "sessionId":"\(harness.recordedSession)","update":{
+                "sessionUpdate":"agent_message_chunk","messageId":"en-vol",
+                "content":{"type":"text","text":"La sauvegarde est saine."}}}}
+            """
+        )
+        #expect(await harness.until {
+            chat.turns.contains {
+                if case .assistant(let turn) = $0 { return turn.isStreaming }
+                return false
+            }
+        })
+
+        await harness.transport.emit(Self.activity(
+            harness.recordedSession,
+            #""running":false,"phase":"done","elapsed":420,"quiet":0.2,"#
+                + #""stopReason":"end_turn""#
+        ))
+
+        #expect(await harness.until { !chat.isWorking })
+        #expect(await harness.until {
+            chat.turns.allSatisfy {
+                if case .assistant(let turn) = $0 { return !turn.isStreaming }
+                return true
+            }
+        })
+        // Le battement s'efface avec le tour : une durée figée à l'écran
+        // laisserait croire à un travail en cours.
+        #expect(chat.activity == nil)
+    }
+
+    @Test("Le battement d'un autre fil ne fait pas travailler celui-ci")
+    @MainActor
+    func activityIsFilteredBySession() async throws {
+        let harness = try await Harness()
+        let mine = await harness.session(id: harness.recordedSession)
+        let other = await harness.session(id: "une-autre-session")
+
+        await harness.transport.emit(Self.activity(
+            "une-autre-session", #""running":true,"phase":"writing","elapsed":3,"quiet":0.1"#
+        ))
+
+        #expect(await harness.until { other.isWorking })
+        #expect(mine.isWorking == false)
+        #expect(mine.activity == nil)
+    }
+
+    private static func activity(_ session: String, _ body: String) -> String {
+        """
+        {"jsonrpc":"2.0","method":"session/update","params":{
+          "sessionId":"\(session)","update":{"sessionUpdate":"hublot_activity",\(body)}}}
+        """
+    }
+
+    private static func userMessage(_ session: String, id: String, text: String) -> String {
+        """
+        {"jsonrpc":"2.0","method":"session/update","params":{
+          "sessionId":"\(session)","update":{"sessionUpdate":"user_message_chunk",
+          "messageId":"\(id)","content":{"type":"text","text":"\(text)"}}}}
+        """
+    }
+
+    private static func usage(_ session: String, used: Int, size: Int) -> String {
+        """
+        {"jsonrpc":"2.0","method":"session/update","params":{
+          "sessionId":"\(session)","update":{"sessionUpdate":"usage_update",
+          "used":\(used),"size":\(size)}}}
+        """
     }
 
     /// L'enveloppe d'une notification, pour lire la charge d'une trame de test.

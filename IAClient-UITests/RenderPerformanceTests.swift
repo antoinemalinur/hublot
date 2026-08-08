@@ -96,7 +96,12 @@ struct RenderPerformanceTests {
 
         var worstRatio = 0.0
 
-        for characters in [200, 2_000, 20_000] {
+        // 20 000 caractères faisait dépasser une minute sur certains runners
+        // de simulateur et bloquait le MainActor assez longtemps pour faire
+        // expirer des tests fonctionnels sans rapport. 8 000 garde largement
+        // le signal quadratique tout en restant un test, pas un benchmark de
+        // plusieurs minutes.
+        for characters in [200, 2_000, 8_000] {
             let chunks = max(4, characters / 100)
             let whole = measureStreaming(characters: characters, chunks: chunks, split: false)
             let split = measureStreaming(characters: characters, chunks: chunks, split: true)
@@ -118,7 +123,7 @@ struct RenderPerformanceTests {
         // Le seuil est volontairement bas : le test existe pour produire des
         // chiffres et pour attraper une régression franche, pas pour figer une
         // performance qui dépend de la machine.
-        #expect(worstRatio > 1.5, "la découpe devrait être nettement plus rapide sur 20 000 caractères")
+        #expect(worstRatio > 1.5, "la découpe devrait être nettement plus rapide sur un long flux")
     }
 
     @Test("La découpe elle-même est négligeable")
