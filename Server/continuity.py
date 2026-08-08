@@ -99,6 +99,35 @@ def record_tool(cwd: str, session_id: str, update: dict[str, Any]) -> None:
         pass
 
 
+def record_usage(cwd: str, session_id: str, update: dict[str, Any]) -> None:
+    """Conserve un échantillon de contexte, tel quel.
+
+    Contrairement à `record_tool`, il n'y a rien à élaguer : la charge tient en
+    trois nombres et les plafonds du moment. Rien n'est filtré **par valeur**
+    non plus — un `used` nul est une mesure comme une autre, et c'est à la vue
+    de décider ce qu'elle sait tracer. Un enregistreur qui trie invente une
+    histoire ; celui-ci se contente de la noter.
+
+    Écrit dans le même fil que les demandes, les réponses et les outils : la
+    chronologie est donc celle du fichier, sans aucune règle de tri à tenir.
+
+    Persistance *best effort*, comme pour les outils : un disque indisponible
+    ne doit jamais couper le flux vivant.
+    """
+    if update.get("sessionUpdate") != "usage_update":
+        return
+
+    transcript, _ = _paths(cwd, session_id)
+    try:
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(
+                {"role": "usage", "update": update}, ensure_ascii=False
+            ) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 def _transcript(cwd: str, session_id: str) -> list[dict[str, Any]]:
     path, _ = _paths(cwd, session_id)
     entries: list[dict[str, Any]] = []
@@ -124,6 +153,17 @@ def replay(cwd: str, session_id: str) -> list[dict[str, Any]]:
 
 def _iso(timestamp: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(timestamp))
+
+
+def now_iso() -> str:
+    """L'instant présent, dans la forme que le client sait relire.
+
+    Publique parce qu'`acp_server` horodate ses mesures de contexte avec :
+    une marée n'a de sens que si chaque échantillon dit **quand** il a été
+    pris. Même format que `updatedAt` — un seul dialecte de date sur la
+    liaison.
+    """
+    return _iso(time.time())
 
 
 def list_sessions(cwd: str) -> list[dict[str, Any]]:

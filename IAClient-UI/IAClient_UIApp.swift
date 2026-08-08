@@ -21,6 +21,10 @@ struct IAClient_UIApp: App {
                     RadiographyView.dense
                 } else if UserDefaults.standard.bool(forKey: "HublotRadiographyDemo") {
                     RadiographyView.demo
+                } else if UserDefaults.standard.bool(forKey: "HublotContextTideDemo") {
+                    // La marée avec sa compaction : le cas qui distingue un
+                    // tracé honnête d'une courbe qui ne sait que monter.
+                    ContextTideView.demo
                 } else if UserDefaults.standard.bool(forKey: "HublotConversationDemo") {
                     // Fil déterministe et assez long pour exercer le chrome,
                     // le retour au direct, les groupes et la radiographie sans
@@ -78,6 +82,7 @@ struct RootView: View {
                         configOptions: chat.configOptions,
                         status: chat.metrics,
                         contextPercent: chat.contextPercent,
+                        contextHistory: chat.contextHistory,
                         onChoose: { option, value in
                             Task { await chat.choose(option, value: value) }
                         },

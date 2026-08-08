@@ -1479,6 +1479,10 @@ class Session:
             "sessionUpdate": "usage_update",
             "used": used,
             "size": context_size,
+            # L'instant de la mesure. Sans lui, un échantillon relu dans le
+            # journal ne dit plus que « ça a valu tant » — jamais quand, ni
+            # combien de temps a passé depuis le précédent.
+            "ts": continuity.now_iso(),
             "_meta": {"hublot": {
                 "model": model_label,
                 "effort": effort,
@@ -1490,6 +1494,11 @@ class Session:
     async def update(self, payload: dict[str, Any], *, persist: bool = True) -> None:
         if persist:
             continuity.record_tool(self.cwd, self.id, payload)
+            # Deux appels plutôt qu'un aiguillage : chacun connaît la variante
+            # qu'il retient et ignore le reste. La marée de contexte a besoin
+            # du même passé que la radiographie — sans ça, rouvrir un fil
+            # montrait une jauge vide jusqu'au prochain message.
+            continuity.record_usage(self.cwd, self.id, payload)
         try:
             await self.connection.notify("session/update", {
                 "sessionId": self.id, "update": payload,
@@ -1928,7 +1937,10 @@ class Connection:
                     await session.send_text(
                         str(entry.get("text") or ""), str(uuid.uuid4())
                     )
-                elif role == "tool" and isinstance(entry.get("update"), dict):
+                elif role in {"tool", "usage"} and isinstance(entry.get("update"), dict):
+                    # Outils et mesures de contexte se rejouent pareil : la
+                    # notification est déjà écrite dans le journal, il n'y a
+                    # qu'à la remettre sur la liaison, à sa place exacte.
                     await session.update(entry["update"], persist=False)
         else:
             # Compatibilité avec les fils plus anciens, qui ne vivaient que

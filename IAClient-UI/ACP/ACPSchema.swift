@@ -331,7 +331,12 @@ nonisolated enum SessionUpdate: Decodable, Sendable {
     case plan([PlanEntryPayload])
     case availableCommands([AvailableCommand])
     case currentMode(String)
-    case usage(used: Int, size: Int, status: SessionStatus?)
+    /// La consommation de la fenêtre de contexte, telle que le relais la mesure.
+    ///
+    /// `at` est l'instant de la mesure, ajouté par le serveur (`ts`). Il est
+    /// facultatif : les fils enregistrés avant son introduction n'en portent
+    /// pas, et une mesure sans horodatage vaut mieux qu'une mesure refusée.
+    case usage(used: Int, size: Int, status: SessionStatus?, at: Date?)
     /// Le signe de vie d'un tour, poussé par le relais toutes les quelques
     /// secondes. Hors protocole, et assumé : ACP ne dit rien de ce qu'un agent
     /// est en train de faire entre deux messages, et c'est précisément ce qu'on
@@ -347,6 +352,7 @@ nonisolated enum SessionUpdate: Decodable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case sessionUpdate, content, messageId, entries, availableCommands
         case currentModeId, used, size
+        case at = "ts"
         case meta = "_meta"
     }
 
@@ -387,7 +393,8 @@ nonisolated enum SessionUpdate: Decodable, Sendable {
             self = .usage(
                 used: try container.decodeIfPresent(Int.self, forKey: .used) ?? 0,
                 size: try container.decodeIfPresent(Int.self, forKey: .size) ?? 0,
-                status: try meta?["hublot"]?.decode(SessionStatus.self)
+                status: try meta?["hublot"]?.decode(SessionStatus.self),
+                at: try container.decodeIfPresent(Date.self, forKey: .at)
             )
         case "hublot_activity":
             self = .activity(try Activity(from: decoder))

@@ -133,6 +133,53 @@ final class HublotScreenTests: XCTestCase {
     }
 
     @MainActor
+    func testContextTideOpensFromTheStatusBarAndClosesOnTheFirstTap() {
+        launch("HublotConversationDemo")
+
+        let bar = element("status-bar")
+        XCTAssertTrue(bar.waitForExistence(timeout: 5))
+        // La barre reste lisible : ouvrir la marée ne doit pas coûter les
+        // chiffres qu'on venait consulter.
+        XCTAssertTrue(bar.label.contains("CTX 42%"))
+        bar.tap()
+
+        let close = element("close-context-tide")
+        XCTAssertTrue(close.waitForExistence(timeout: 5))
+
+        // La marée montre bien la mesure de la barre, pas un écran vide.
+        XCTAssertTrue(app.staticTexts["42"].waitForExistence(timeout: 5))
+
+        close.tap()
+        XCTAssertTrue(close.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Résumer le dernier prompt"].exists)
+    }
+
+    @MainActor
+    func testContextTideScrubberReturnsToThePast() {
+        launch("HublotContextTideDemo")
+
+        let slider = app.sliders["Chronologie de la marée de contexte"]
+        XCTAssertTrue(slider.waitForExistence(timeout: 5))
+
+        // Le fil témoin finit après une compaction, donc bas. Remonter la
+        // chronologie doit faire réapparaître le sommet — c'est tout l'intérêt
+        // du curseur, et ça ne marche que si la carte se fige vraiment.
+        let live = app.staticTexts["MESURE 12 / 12"]
+        XCTAssertTrue(live.waitForExistence(timeout: 5))
+
+        slider.adjust(toNormalizedSliderPosition: 0.6)
+
+        let frozen = app.staticTexts["MESURE 12 / 12"]
+        XCTAssertTrue(frozen.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["passé"].exists)
+
+        let back = app.buttons["Revenir au direct"]
+        XCTAssertTrue(back.exists)
+        back.tap()
+        XCTAssertTrue(app.staticTexts["MESURE 12 / 12"].waitForExistence(timeout: 5))
+    }
+
+    @MainActor
     func testRunningTurnsAreVisibleBeforeOpeningAConversation() {
         launch("HublotProjectsDemo")
         let project = app.buttons.matching(

@@ -32,6 +32,17 @@ final class ChatSession {
     /// l'agent, jamais estimé ici.
     private(set) var contextUsed = 0
     private(set) var contextSize = 0
+    /// Toutes les mesures reçues, dans l'ordre. C'est la matière de la marée
+    /// de contexte.
+    ///
+    /// On retient **tout**, y compris ce qui ne se trace pas : c'est
+    /// `ContextTide` qui décide de ce qu'il sait dessiner. Un enregistreur qui
+    /// filtre à l'entrée perd la trace de ce qu'il a jeté, et le fil n'a alors
+    /// plus aucun moyen de dire qu'une mesure est arrivée incohérente.
+    ///
+    /// Le rejeu de `session/load` la remplit comme le direct : `apply` ne
+    /// distingue pas les deux, exactement comme pour `turns` et `plan`.
+    private(set) var contextHistory: [ContextTide.Sample] = []
     /// Modèle, effort, moteur et plafonds, poussés par le serveur. Distinct de
     /// `status`, qui décrit l'état de la liaison.
     private(set) var metrics: SessionStatus?
@@ -381,10 +392,18 @@ final class ChatSession {
                 PlanEntry(id: "plan-\(index)", content: entry.content, status: entry.status)
             }
 
-        case .usage(let used, let size, let pushed):
+        case .usage(let used, let size, let pushed, let at):
             contextUsed = used
             contextSize = size
             if let pushed { adopt(pushed) }
+            contextHistory.append(
+                .init(
+                    id: "ctx-\(contextHistory.count)",
+                    sequence: contextHistory.count,
+                    used: used, size: size, at: at,
+                    model: pushed?.model, engine: pushed?.engine
+                )
+            )
 
         case .activity(let beat):
             adopt(beat)

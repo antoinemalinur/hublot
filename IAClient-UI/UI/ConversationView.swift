@@ -28,6 +28,9 @@ struct ConversationView: View {
     var configOptions: [ConfigOption] = []
     var status: SessionStatus?
     var contextPercent: Int?
+    /// Toutes les mesures de contexte du fil, pour la marée. Vide sur un écran
+    /// témoin, et vide tant que le relais n'a rien mesuré.
+    var contextHistory: [ContextTide.Sample] = []
     var commands: [String] = []
     var onChoose: (ConfigOption, String) -> Void = { _, _ in }
     /// Le dernier signe de vie du relais, et l'instant où il est arrivé. C'est
@@ -46,6 +49,7 @@ struct ConversationView: View {
     var onDictate: ((Data) async -> String?)?
 
     @State private var showingRadiography = false
+    @State private var showingContextTide = false
 
     /// Vrai quand la dernière ligne est visible. C'est ce qui décide si le fil
     /// suit la réponse qui s'écrit, ou s'il laisse lire là où on est.
@@ -113,7 +117,8 @@ struct ConversationView: View {
                     status: status, contextPercent: contextPercent,
                     activity: activity, activityAt: activityAt,
                     isReconnecting: isReconnecting, onBack: onBack,
-                    onRadiography: { showingRadiography = true }
+                    onRadiography: { showingRadiography = true },
+                    onContextTide: { showingContextTide = true }
                 )
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -153,6 +158,11 @@ struct ConversationView: View {
         .fullScreenCover(isPresented: $showingRadiography) {
             RadiographyView(
                 projectName: sessionTitle, turns: turns, isLive: isWorking
+            )
+        }
+        .fullScreenCover(isPresented: $showingContextTide) {
+            ContextTideView(
+                projectName: sessionTitle, history: contextHistory, isLive: isWorking
             )
         }
     }
@@ -306,6 +316,9 @@ struct SessionChrome: View {
     var isReconnecting = false
     var onBack: (() -> Void)?
     var onRadiography: (() -> Void)?
+    /// Ouvre la marée de contexte. `nil` laisse la barre inerte — écrans
+    /// témoins et aperçus, où il n'y a nulle part où aller.
+    var onContextTide: (() -> Void)?
 
     @Namespace private var glass
 
@@ -395,16 +408,31 @@ struct SessionChrome: View {
                     if let bar = StatusBar.label(
                         status: status, contextPercent: contextPercent
                     ) {
-                        // Pas de `foregroundStyle` ici : chaque cellule porte
-                        // déjà la couleur de son seuil, et un style de vue
-                        // l'écraserait.
-                        Text(bar)
-                            .accessibilityIdentifier("status-bar")
-                            .lineLimit(1)
-                            .fixedSize()
-                            .padding(.horizontal, Hublot.unit * 1.25)
-                            .padding(.vertical, Hublot.unit * 0.5)
-                            .glassEffect(.regular, in: .capsule)
+                        // Toute la barre ouvre la marée, pas seulement la
+                        // cellule « CTX » : les mesures sont fondues dans une
+                        // seule chaîne — c'est ce qui permet au glyphe de
+                        // remise à zéro d'avoir sa propre taille — et découper
+                        // une zone sensible à l'intérieur d'un `AttributedString`
+                        // demanderait de renoncer à cette typographie.
+                        Button { onContextTide?() } label: {
+                            // Pas de `foregroundStyle` ici : chaque cellule
+                            // porte déjà la couleur de son seuil, et un style
+                            // de vue l'écraserait.
+                            Text(bar)
+                                .lineLimit(1)
+                                .fixedSize()
+                                .padding(.horizontal, Hublot.unit * 1.25)
+                                .padding(.vertical, Hublot.unit * 0.5)
+                                .contentShape(.capsule)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(onContextTide == nil)
+                        // Aucun libellé d'accessibilité ici : celui que SwiftUI
+                        // dérive du texte porte les chiffres eux-mêmes, et
+                        // c'est ce qu'un lecteur d'écran doit entendre.
+                        .accessibilityIdentifier("status-bar")
+                        .accessibilityHint("Ouvre la marée de contexte")
+                        .glassEffect(.regular, in: .capsule)
                     }
 
                     Spacer(minLength: 0)
@@ -1112,10 +1140,24 @@ struct CommandPalette: View {
                 ]
             )
 
+            // La marée de ce fil témoin. La dernière mesure vaut exactement
+            // 42 % — le même chiffre que `contextPercent` ci-dessous, sinon
+            // l'écran et la barre qui l'ouvre se contrediraient.
+            let readings = [6_800, 19_400, 33_100, 51_700, 68_200, 84_000]
+            let history = readings.enumerated().map { index, used in
+                ContextTide.Sample(
+                    id: "demo-ctx-\(index)", sequence: index,
+                    used: used, size: 200_000,
+                    at: Date(timeIntervalSinceReferenceDate: 800_000_000)
+                        .addingTimeInterval(Double(index) * 120),
+                    model: "Opus", engine: "claude"
+                )
+            }
+
             return ConversationView(
                 sessionTitle: "Résumer le dernier prompt", engine: .claude,
                 turns: rows, onBack: {}, configOptions: options,
-                status: status, contextPercent: 42,
+                status: status, contextPercent: 42, contextHistory: history,
                 activity: .init(
                     running: true, phase: .tool,
                     label: "/root/repos/office-chess/scripts/validation-complete.sh",

@@ -97,5 +97,45 @@ class ConnectionSurvivalTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session._notification_failed)
 
 
+class ContextPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    """Ce qui donne son passé à la marée de contexte.
+
+    Sans ces deux garanties, rouvrir une conversation affichait une jauge vide
+    jusqu'au message suivant — alors que la radiographie, elle, retrouvait tout
+    son historique.
+    """
+
+    async def test_a_context_measurement_is_written_to_the_thread(self) -> None:
+        session = acp_server.Session(BrokenConnection(), "session-test", "/tmp/repos/projet")
+        recorded: list[dict] = []
+
+        with mock.patch.object(
+            acp_server.continuity, "record_usage",
+            side_effect=lambda _cwd, _session, payload: recorded.append(payload),
+        ):
+            await session.update({
+                "sessionUpdate": "usage_update", "used": 84_000, "size": 200_000,
+            })
+
+        self.assertEqual(recorded[0]["used"], 84_000)
+
+    async def test_a_replayed_measurement_is_not_written_back(self) -> None:
+        # `_load_session` rejoue le journal avec `persist=False`. Sans ce
+        # garde-fou, chaque réouverture doublerait les mesures du fil et la
+        # marée montrerait des paliers qui n'ont jamais existé.
+        session = acp_server.Session(BrokenConnection(), "session-test", "/tmp/repos/projet")
+        recorded: list[dict] = []
+
+        with mock.patch.object(
+            acp_server.continuity, "record_usage",
+            side_effect=lambda _cwd, _session, payload: recorded.append(payload),
+        ):
+            await session.update(
+                {"sessionUpdate": "usage_update", "used": 1, "size": 2}, persist=False
+            )
+
+        self.assertEqual(recorded, [])
+
+
 if __name__ == "__main__":
     unittest.main()

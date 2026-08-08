@@ -283,7 +283,7 @@ struct ConversationFlowTests {
         var received: SessionStatus?
         for await event in observed {
             if case .update(let notification) = event,
-                case .usage(_, _, let pushed) = notification.update
+                case .usage(_, _, let pushed, _) = notification.update
             {
                 received = pushed
                 break
@@ -306,7 +306,7 @@ struct ConversationFlowTests {
         let notification = try JSONCoding.decoder.decode(
             RelayedUpdate.self, from: Data(Harness.usageFrame.utf8)
         ).params
-        guard case .usage(_, _, let pushed) = notification.update else {
+        guard case .usage(_, _, let pushed, _) = notification.update else {
             Issue.record("la trame de plafonds n'est pas un usage_update")
             return
         }
@@ -331,6 +331,41 @@ struct ConversationFlowTests {
         ))
         #expect(await harness.until { chat.contextUsed == 1_540 })
         #expect(chat.contextPercent == nil)
+    }
+
+    @Test("Chaque mesure de contexte reste dans le fil, y compris l'incohérente")
+    @MainActor
+    func everyMeasurementIsKept() async throws {
+        let harness = try await Harness()
+        let chat = await harness.session(id: harness.recordedSession)
+
+        await harness.transport.emit(Self.usage(
+            harness.recordedSession, used: 12_000, size: 200_000,
+            at: "2026-08-08T10:00:00.000Z"
+        ))
+        await harness.transport.emit(Self.usage(
+            harness.recordedSession, used: 84_000, size: 200_000,
+            at: "2026-08-08T10:02:00.000Z"
+        ))
+        // Celle-ci est impossible — c'est le bug réel où le serveur envoyait le
+        // total des jetons d'un tour. Le fil la garde quand même : c'est la
+        // marée qui décide de ce qu'elle sait tracer, pas l'enregistreur.
+        await harness.transport.emit(Self.usage(
+            harness.recordedSession, used: 900_000, size: 200_000
+        ))
+
+        #expect(await harness.until { chat.contextHistory.count == 3 })
+
+        let history = chat.contextHistory
+        #expect(history.map(\.used) == [12_000, 84_000, 900_000])
+        #expect(history[0].at != nil)
+        // Sans horodatage sur la liaison, l'échantillon existe quand même.
+        #expect(history[2].at == nil)
+
+        // Le tracé, lui, écarte l'incohérente sans la ramener de force à cent.
+        let tide = ContextTide(samples: history)
+        #expect(tide.plottable.map(\.used) == [12_000, 84_000])
+        #expect(tide.snapshot().current?.percent == 42)
     }
 
     @Test("Une session Codex affiche son quota, jamais le cinq heures Claude")
@@ -456,12 +491,18 @@ struct ConversationFlowTests {
         """
     }
 
-    private static func usage(_ session: String, used: Int, size: Int) -> String {
-        """
-        {"jsonrpc":"2.0","method":"session/update","params":{
-          "sessionId":"\(session)","update":{"sessionUpdate":"usage_update",
-          "used":\(used),"size":\(size)}}}
-        """
+    private static func usage(
+        _ session: String, used: Int, size: Int, at: String? = nil
+    ) -> String {
+        // L'horodatage est facultatif dans le protocole : les fils enregistrés
+        // avant son introduction n'en portent pas, et la trame doit rester
+        // décodable sans lui.
+        let stamp = at.map { #","ts":"\#($0)""# } ?? ""
+        return """
+            {"jsonrpc":"2.0","method":"session/update","params":{
+              "sessionId":"\(session)","update":{"sessionUpdate":"usage_update",
+              "used":\(used),"size":\(size)\(stamp)}}}
+            """
     }
 
     /// L'enveloppe d'une notification, pour lire la charge d'une trame de test.

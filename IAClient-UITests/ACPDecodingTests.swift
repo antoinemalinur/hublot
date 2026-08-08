@@ -220,11 +220,45 @@ struct ACPDecodingTests {
             SessionNotification.self,
             #"{"sessionId":"s","update":{"sessionUpdate":"usage_update","used":12695,"size":200000}}"#)
 
-        guard case .usage(let used, let size, _) = notification.update else {
+        guard case .usage(let used, let size, _, _) = notification.update else {
             Issue.record("attendu usage_update"); return
         }
         #expect(used == 12695)
         #expect(size == 200_000)
+    }
+
+    @Test("Une mesure de contexte porte l'instant où elle a été prise")
+    func usageCarriesItsTimestamp() throws {
+        let notification = try decode(
+            SessionNotification.self,
+            #"""
+            {"sessionId":"s","update":{"sessionUpdate":"usage_update",
+             "used":84000,"size":200000,"ts":"2026-08-06T12:59:59.676430Z"}}
+            """#)
+
+        guard case .usage(_, _, _, let at) = notification.update else {
+            Issue.record("attendu usage_update"); return
+        }
+        let stamp = try #require(at)
+        // Six décimales de seconde, comme Python les écrit : c'est le cas qui
+        // faisait échouer tout le bloc avant que `JSONCoding` ne normalise la
+        // fraction.
+        #expect(abs(stamp.timeIntervalSince1970 - 1_786_021_199.676) < 0.01)
+    }
+
+    @Test("Une mesure sans horodatage reste décodable")
+    func usageWithoutTimestampStillDecodes() throws {
+        // Les fils enregistrés avant l'ajout de `ts` n'en portent pas. Les
+        // refuser reviendrait à perdre tout leur passé de contexte.
+        let notification = try decode(
+            SessionNotification.self,
+            #"{"sessionId":"s","update":{"sessionUpdate":"usage_update","used":10,"size":100}}"#)
+
+        guard case .usage(let used, _, _, let at) = notification.update else {
+            Issue.record("attendu usage_update"); return
+        }
+        #expect(used == 10)
+        #expect(at == nil)
     }
 
     @Test("Le signe de vie d'un tour se décode, phase et silence compris")
@@ -304,7 +338,7 @@ struct ACPDecodingTests {
                          "seven_day":{"percent":44,"resetsAt":"2026-08-10T16:59:59.676450+00:00"}}}}}}
             """)
 
-        guard case .usage(_, _, let status) = notification.update else {
+        guard case .usage(_, _, let status, _) = notification.update else {
             Issue.record("attendu usage_update"); return
         }
         #expect(status?.model == "Opus 4.8")

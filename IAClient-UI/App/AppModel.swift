@@ -287,7 +287,7 @@ final class AppModel {
                 guard !Task.isCancelled else { return }
                 switch event {
                 case .update(let notification):
-                    guard case .usage(_, _, let pushed) = notification.update, let pushed
+                    guard case .usage(_, _, let pushed, _) = notification.update, let pushed
                     else { continue }
                     self?.lastStatus = pushed
                 case .disconnected(let error):
