@@ -27,6 +27,7 @@ import binascii
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 import urllib.error
@@ -71,6 +72,51 @@ if not TOKEN:
 
 def log(message: str) -> None:
     bot.log(f"[acp] {message}")
+
+
+# ---------------------------------------------------------------------------
+# Authentification du moteur Claude
+#
+# Le CLI ne meurt pas bruyamment quand ses identifiants sont morts : stderr
+# reste vide, et il émet un `result` ordinaire portant `is_error` et une phrase
+# anglaise. Elle atterrissait telle quelle dans le fil, sous l'étiquette
+# « refusé par le moteur » — deux mensonges en une ligne, puisque le moteur n'a
+# rien refusé et n'a même jamais été joint, et rien qui dise quoi faire.
+#
+# Le cas s'est produit en vrai : l'unité `acp.service` retirait
+# `CLAUDE_CODE_OAUTH_TOKEN` de son environnement, le CLI retombait donc sur la
+# session OAuth de `~/.claude/.credentials.json`, expirée sans pouvoir se
+# renouveler, et **tous** les tours Claude de Hublot mouraient ainsi — pendant
+# que le bot Telegram, qui gardait le jeton, continuait de répondre. Rien dans
+# le fil ne pouvait mettre sur cette piste.
+# ---------------------------------------------------------------------------
+AUTH_ERROR = re.compile(
+    r"(oauth session (?:has )?expired|could not be refreshed|"
+    r"failed to authenticate|invalid api key|authentication[_ ]error|"
+    r"please run [`'\"]?/login)",
+    re.IGNORECASE,
+)
+
+
+def is_auth_error(message: str) -> bool:
+    """Le moteur n'a rien refusé : il n'a pas pu s'authentifier."""
+    return bool(AUTH_ERROR.search(message))
+
+
+def claude_auth_source() -> str:
+    """D'où le CLI tirera ses identifiants — la question qui a coûté la panne.
+
+    Le jeton d'environnement est stable ; la session du trousseau, elle, doit
+    se renouveler toute seule et ne le fait pas toujours. Savoir laquelle des
+    deux sert **avant** le premier tour transforme une panne muette en une
+    ligne de journal.
+    """
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
+        return "jeton d'environnement"
+    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    if (home / ".credentials.json").exists():
+        return "session OAuth de ~/.claude, à renouveler d'elle-même"
+    return "aucune — les tours Claude échoueront"
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +767,11 @@ class PromptTurn:
                 # Le rattrapage s'en charge : afficher l'erreur ici ferait
                 # clignoter un échec que l'utilisateur ne verra jamais aboutir.
                 return "refusal"
+            # Le chemin habituel de la panne d'identifiants passe par le
+            # `result` ci-dessous ; celui-ci reste pour le CLI qui échoue avant
+            # d'avoir émis la moindre ligne de JSON.
+            if is_auth_error(failure):
+                return await self._claude_unauthenticated(failure)
             # Une erreur de quota n'est pas un échec de tâche : elle bascule le
             # moteur, comme sur Telegram, et la prochaine demande partira chez
             # l'autre.
@@ -731,6 +782,28 @@ class PromptTurn:
                 await self.session.send_text(f"\n\n⚠️ {failure[:800]}", self.message_id)
                 return "refusal"
         return stop_reason
+
+    async def _claude_unauthenticated(self, detail: str) -> str:
+        """Dit la panne d'identifiants en clair, et passe la main à Codex.
+
+        Une authentification morte ne dépend pas de la demande et ne se répare
+        pas d'elle-même : sans bascule, chaque envoi suivant se cognait au même
+        mur, alors que l'autre moteur, lui, répondait. C'est exactement le
+        traitement réservé au quota — mêmes conséquences, même remède.
+        """
+        log(f"claude non authentifié ({claude_auth_source()}) : "
+            f"{detail[:200] or 'sans détail'}")
+        bot.mark_claude_unavailable("authentification expirée")
+        await self.session.send_text(
+            "\n\n⚠️ **Claude n'est plus authentifié sur le relais.** Ses "
+            "identifiants ont expiré sans pouvoir se renouveler ; il faut "
+            "refaire le jeton sur le VPS — `claude setup-token`, le poser dans "
+            "`CLAUDE_CODE_OAUTH_TOKEN` (`/etc/scripts.env`), puis "
+            "`systemctl restart acp.service`.\n\n",
+            self.message_id,
+        )
+        await self.session.notify_engine("codex", "Claude n'est plus authentifié")
+        return "refusal"
 
     async def _translate(self, event: dict[str, Any]) -> str | None:
         kind = event.get("type")
@@ -799,6 +872,8 @@ class PromptTurn:
             # un quota, une erreur d'API — et elle doit atterrir dans le fil.
             detail = str(event.get("result") or event.get("subtype") or "").strip()
             log(f"tour en erreur : {detail[:200] or 'sans détail'}")
+            if is_auth_error(detail):
+                return await self._claude_unauthenticated(detail)
             if detail:
                 await self.session.send_text(f"\n\n⚠️ {detail[:800]}\n\n", self.message_id)
             return "refusal"
@@ -2268,6 +2343,11 @@ async def main() -> None:
     import threading
     threading.Thread(target=bot.usage_monitor, daemon=True,
                      name="claude-usage-monitor").start()
+
+    # Dit dès le démarrage d'où viendront les identifiants de Claude. Une
+    # panne d'authentification est indiscernable d'un refus dans le fil ; cette
+    # ligne-là, elle, désigne la cause du premier coup d'œil.
+    log(f"authentification Claude : {claude_auth_source()}")
 
     server = await asyncio.start_server(handle_client, HOST, PORT)
     log(f"serveur ACP en écoute sur ws://{HOST}:{PORT}")

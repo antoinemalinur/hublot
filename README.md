@@ -196,6 +196,18 @@ Variables d'environnement lues par `acp_server.py` :
 | `ACP_HOST` / `ACP_PORT` | `127.0.0.1` / `8325` | écoute WebSocket (TLS délégué à Caddy) |
 | `ACP_TOKEN` | — | jeton porteur attendu ; sans lui, rien n'est accepté |
 | `ACP_CONTINUITY` | `/opt/tg-claude/state/acp-continuity` | fils communs, outils et mesures |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | **doit rester exporté** dans l'unité du service |
+
+Ce dernier n'est pas lu par `acp_server.py` : il est lu par le `claude` qu'il
+lance. Sans lui, le CLI retombe sur la session OAuth de
+`~/.claude/.credentials.json` — qui expire, ne se renouvelle pas toujours, et
+fait alors mourir **tous** les tours Claude sur « OAuth session expired and
+could not be refreshed », pendant que le relais Telegram, lui, continue de
+répondre. Le serveur annonce au démarrage laquelle des deux sources il aura :
+
+```text
+[acp] authentification Claude : jeton d'environnement
+```
 
 ## Tests
 

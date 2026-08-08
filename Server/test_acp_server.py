@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 
@@ -24,6 +28,11 @@ sys.modules.setdefault("bot", types.SimpleNamespace(
     state={"codex_effort": "low"},
     save_effort=lambda _path, _effort: None,
     log=lambda _message: None,
+    # Les trois verdicts que le relais rend sur une sortie de moteur. Les
+    # doublures répondent « non » : chaque test arme celui qu'il exerce.
+    is_stale_session=lambda _error: False,
+    is_quota_error=lambda _error: False,
+    mark_claude_unavailable=lambda _reason, **_kwargs: None,
 ))
 sys.modules.setdefault("handoff", types.SimpleNamespace())
 sys.modules.setdefault("sessions", types.SimpleNamespace())
@@ -135,6 +144,137 @@ class ContextPersistenceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(recorded, [])
+
+
+class AuthSession:
+    """Ce que la conversation reçoit vraiment : du texte et des bascules."""
+
+    id = "session-test"
+    cwd = "/tmp/repos/projet"
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.engines: list[tuple[str, str]] = []
+
+    async def send_text(self, text: str, _message_id: str) -> None:
+        self.texts.append(text)
+
+    async def notify_engine(self, engine: str, reason: str) -> None:
+        self.engines.append((engine, reason))
+
+    async def send_status(self, used: int = 0, size: int = 0) -> None:
+        pass
+
+    async def update(self, _payload: dict, persist: bool = True) -> None:
+        pass
+
+
+class FakeProcess:
+    """Un `claude -p` déjà terminé : ses lignes, son stderr, son code."""
+
+    def __init__(self, lines: list[bytes], stderr: bytes = b"",
+                 returncode: int = 1) -> None:
+        self.stdout = asyncio.StreamReader()
+        for line in lines:
+            self.stdout.feed_data(line)
+        self.stdout.feed_eof()
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_data(stderr)
+        self.stderr.feed_eof()
+        self.returncode = returncode
+
+    async def wait(self) -> int:
+        return self.returncode
+
+
+# La ligne exacte relevée sur le VPS le jour de la panne. Tout est dans le
+# piège qu'elle tend : `subtype` dit « success », stderr est vide, et l'échec
+# tient dans un `result` qui ressemble à n'importe quelle fin de tour.
+OAUTH_FAILURE = (
+    "Failed to authenticate: OAuth session expired and could not be refreshed"
+)
+OAUTH_RESULT_LINE = json.dumps({
+    "type": "result", "subtype": "success", "is_error": True,
+    "result": OAUTH_FAILURE, "stop_reason": "stop_sequence",
+}).encode() + b"\n"
+
+
+class ClaudeAuthenticationTests(unittest.IsolatedAsyncioTestCase):
+    """La panne d'identifiants doit se dire, et ne pas bloquer la conversation.
+
+    Vu à l'écran : « ⚠️ Failed to authenticate: OAuth session expired and could
+    not be refreshed », en anglais, sous l'étiquette « refusé par le moteur ».
+    Le moteur n'avait rien refusé — il n'avait jamais été joint — et chaque
+    envoi suivant se cognait au même mur pendant que Codex, lui, répondait.
+    """
+
+    def test_the_failure_line_is_told_apart_from_a_real_refusal(self) -> None:
+        self.assertTrue(acp_server.is_auth_error(OAUTH_FAILURE))
+        self.assertTrue(acp_server.is_auth_error("Invalid API key · Please run /login"))
+        # Confondre les deux couperait Claude pour une simple phrase filtrée.
+        self.assertFalse(acp_server.is_auth_error(
+            "Output blocked by content filtering policy"
+        ))
+        self.assertFalse(acp_server.is_auth_error(""))
+
+    async def test_an_expired_session_hands_over_instead_of_looking_like_a_refusal(
+        self,
+    ) -> None:
+        session = AuthSession()
+        turn = acp_server.PromptTurn(session, "question")
+        marks: list[str] = []
+
+        with mock.patch.object(
+            acp_server.bot, "mark_claude_unavailable",
+            side_effect=lambda reason, **_kwargs: marks.append(reason),
+        ), mock.patch(
+            "asyncio.create_subprocess_exec",
+            mock.AsyncMock(return_value=FakeProcess([OAUTH_RESULT_LINE])),
+        ):
+            reason = await turn._stream(["claude"])
+
+        self.assertEqual(reason, "refusal")
+        self.assertEqual(len(marks), 1, "Claude doit être marqué indisponible")
+        self.assertEqual(session.engines, [("codex", "Claude n'est plus authentifié")])
+        message = "".join(session.texts)
+        self.assertIn("authentifié", message)
+        self.assertIn("setup-token", message)
+        # L'anglais du CLI était tout ce que la conversation montrait.
+        self.assertNotIn("Failed to authenticate", message)
+
+    async def test_a_cli_that_dies_before_any_json_is_treated_the_same(self) -> None:
+        # Même panne, autre canal : le CLI peut aussi échouer avant d'avoir émis
+        # la moindre ligne, et l'erreur arrive alors par stderr.
+        session = AuthSession()
+        turn = acp_server.PromptTurn(session, "question")
+
+        with mock.patch.object(
+            acp_server.bot, "mark_claude_unavailable", side_effect=lambda *_a, **_k: None,
+        ), mock.patch(
+            "asyncio.create_subprocess_exec",
+            mock.AsyncMock(return_value=FakeProcess([], OAUTH_FAILURE.encode())),
+        ):
+            reason = await turn._stream(["claude"])
+
+        self.assertEqual(reason, "refusal")
+        self.assertEqual(session.engines, [("codex", "Claude n'est plus authentifié")])
+        self.assertNotIn("Failed to authenticate", "".join(session.texts))
+
+    def test_the_startup_line_names_the_credential_that_will_serve(self) -> None:
+        # C'est cette ligne qui manquait : rien ne disait que le service avait
+        # perdu son jeton et retombait sur le trousseau.
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "jeton"}):
+            self.assertEqual(acp_server.claude_auth_source(), "jeton d'environnement")
+        with tempfile.TemporaryDirectory() as empty:
+            with mock.patch.dict(os.environ, {
+                "CLAUDE_CODE_OAUTH_TOKEN": "", "CLAUDE_CONFIG_DIR": empty,
+            }):
+                self.assertIn("aucune", acp_server.claude_auth_source())
+            with mock.patch.dict(os.environ, {
+                "CLAUDE_CODE_OAUTH_TOKEN": "", "CLAUDE_CONFIG_DIR": empty,
+            }):
+                (Path(empty) / ".credentials.json").write_text("{}", encoding="utf-8")
+                self.assertIn("OAuth", acp_server.claude_auth_source())
 
 
 if __name__ == "__main__":
