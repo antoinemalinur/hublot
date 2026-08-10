@@ -138,14 +138,20 @@ CODEX_MODEL_FILE = Path(
 # La fenêtre publiée dans les événements du CLI est celle que sa surface locale
 # emploie avant compaction (258 400 aujourd'hui), pas la capacité globale du
 # modèle que la marée promet d'afficher. Les fiches API OpenAI donnent 1 050 000
-# jetons pour les trois modèles GPT-5.6 :
+# jetons pour GPT-5.6, GPT-5.5 et GPT-5.4, mais 400 000 pour GPT-5.4 mini :
 # https://developers.openai.com/api/docs/models/gpt-5.6-sol
+# https://developers.openai.com/api/docs/models/gpt-5.5
+# https://developers.openai.com/api/docs/models/gpt-5.4
+# https://developers.openai.com/api/docs/models/gpt-5.4-mini
 CODEX_MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-5.6": 1_050_000,
     "gpt-5.6-sol": 1_050_000,
     "gpt-5.6-sol-wm": 1_050_000,
     "gpt-5.6-terra": 1_050_000,
     "gpt-5.6-luna": 1_050_000,
+    "gpt-5.5": 1_050_000,
+    "gpt-5.4": 1_050_000,
+    "gpt-5.4-mini": 400_000,
 }
 FALLBACK_CODEX_MODELS: tuple[dict[str, Any], ...] = (
     {

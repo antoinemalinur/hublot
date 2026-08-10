@@ -148,14 +148,24 @@ class ContextPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CodexContextWindowTests(unittest.TestCase):
-    def test_gpt_5_6_uses_the_models_global_window_not_the_cli_compaction_limit(
+    def test_every_selectable_model_uses_its_documented_global_window(
         self,
     ) -> None:
+        expected = {
+            "gpt-5.6-sol": 1_050_000,
+            "gpt-5.6-terra": 1_050_000,
+            "gpt-5.6-luna": 1_050_000,
+            "gpt-5.5": 1_050_000,
+            "gpt-5.4": 1_050_000,
+            "gpt-5.4-mini": 400_000,
+        }
         # Valeur exacte du journal qui produisait la capture « 258 400 ».
-        self.assertEqual(
-            acp_server.codex_model_context_window("gpt-5.6-sol", 258_400),
-            1_050_000,
-        )
+        for model, window in expected.items():
+            with self.subTest(model=model):
+                self.assertEqual(
+                    acp_server.codex_model_context_window(model, 258_400),
+                    window,
+                )
 
     def test_an_unknown_model_keeps_the_window_measured_by_codex(self) -> None:
         self.assertEqual(
