@@ -473,6 +473,12 @@ class PromptTurn:
         # celle qui reste marquée « occupée » refuse tous les envois suivants.
         self.bound: list["Session"] = [session]
         self.text = text
+        # La liste doit pouvoir nommer un tour dès sa soumission, avant même
+        # que les pièces jointes aient fini d'être écrites ou que le moteur ait
+        # reçu la demande. Sinon un retour rapide à la liste prend un instantané
+        # où cette conversation n'existe pas encore, et elle y reste invisible.
+        self.submitted_at = continuity.now_iso()
+        self.prompt_recorded = False
         # Franchi quand le tour a vraiment rendu la main. Un `cancel()` envoie
         # un signal ; il ne dit pas que le processus est mort, et repartir avant
         # remettrait deux moteurs sur le même fichier.
@@ -580,6 +586,7 @@ class PromptTurn:
         # Le fil d'abord : la demande fait partie de ce que le moteur entrant
         # doit voir, même si c'est lui qui va y répondre.
         continuity.record(self.session.cwd, self.session.id, "user", self.text)
+        self.prompt_recorded = True
 
         # La passation ne contient que ce que ce moteur-là n'a pas vu **dans
         # cette conversation**. Rester sur le même moteur n'en produit aucune ;
@@ -1669,7 +1676,12 @@ def running_turns() -> list[dict[str, Any]]:
 
 
 def session_catalog(cwd: str) -> list[dict[str, Any]]:
-    """Fusionne les fils natifs Claude et le fil commun utilisé par Codex."""
+    """Fusionne les fils natifs, le fil commun et les demandes en vol.
+
+    Un prompt avec image doit écrire sa pièce jointe avant d'entrer dans le
+    journal persistant. Pendant cette courte fenêtre, le registre des tours est
+    la seule source qui sache que la conversation existe déjà.
+    """
     merged: dict[str, dict[str, Any]] = {}
     for session in store.list_sessions(cwd):
         session_id = str(session.get("sessionId") or "")
@@ -1692,6 +1704,27 @@ def session_catalog(cwd: str) -> list[dict[str, Any]]:
             int(current.get("exchanges") or 0),
             int(session.get("exchanges") or 0),
         )
+
+    for session_id, turn in list(ACTIVE_TURNS.items()):
+        if turn.session.cwd != cwd:
+            continue
+        flat = " ".join(turn.text.split())
+        title = flat[:79] + "…" if len(flat) > 80 else flat
+        current = merged.get(session_id)
+        if current is None:
+            merged[session_id] = {
+                "sessionId": session_id,
+                "cwd": cwd,
+                "title": title or "Conversation avec image",
+                "updatedAt": turn.submitted_at,
+                "exchanges": 1,
+            }
+            continue
+        current["updatedAt"] = max(
+            str(current.get("updatedAt") or ""), turn.submitted_at
+        )
+        if not turn.prompt_recorded:
+            current["exchanges"] = int(current.get("exchanges") or 0) + 1
 
     sessions = list(merged.values())
     sessions.sort(key=lambda session: str(session.get("updatedAt") or ""), reverse=True)
@@ -2470,22 +2503,11 @@ class Connection:
             for block in blocks
             if block.get("type") == "text"
         ).strip()
-
-        # Les images d'abord : elles peuvent constituer à elles seules la
-        # demande — « regarde ça » se dit très bien sans un mot.
-        paths = await asyncio.to_thread(self._store_images, session.cwd, blocks)
-        if paths:
-            listing = "\n".join(f"- {path}" for path in paths)
-            preamble = (
-                "Image jointe à cette demande, lis-la avec l'outil Read avant de répondre :"
-                if len(paths) == 1
-                else "Images jointes à cette demande, lis-les avec l'outil Read "
-                     "avant de répondre :"
-            )
-            joined = f"{preamble}\n{listing}"
-            text = f"{text}\n\n{joined}" if text else joined
-
-        if not text:
+        has_images = any(
+            isinstance(block, dict) and block.get("type") == "image"
+            for block in blocks
+        )
+        if not text and not has_images:
             return {"stopReason": "end_turn"}
 
         # Deux tours sur une même conversation, c'est deux processus qui se
@@ -2511,11 +2533,38 @@ class Connection:
             except asyncio.TimeoutError:
                 log(f"tour orphelin toujours vivant sur {session.id}, on continue")
 
+        # Inscrire le tour avant la première opération suspendue. `session/list`
+        # et `hublot/running` peuvent arriver sur la même liaison pendant le
+        # rangement d'une image ; ils doivent déjà voir ce second fil.
         turn = PromptTurn(session, text)
         session.turn = turn
         ACTIVE_TURNS[session.id] = turn
         try:
+            # Les images peuvent constituer à elles seules la demande —
+            # « regarde ça » se dit très bien sans un mot.
+            paths = await asyncio.to_thread(self._store_images, session.cwd, blocks) \
+                if has_images else []
+            if paths:
+                listing = "\n".join(f"- {path}" for path in paths)
+                preamble = (
+                    "Image jointe à cette demande, lis-la avec l'outil Read avant de répondre :"
+                    if len(paths) == 1
+                    else "Images jointes à cette demande, lis-les avec l'outil Read "
+                         "avant de répondre :"
+                )
+                joined = f"{preamble}\n{listing}"
+                text = f"{text}\n\n{joined}" if text else joined
+
+            if not text:
+                return {"stopReason": "end_turn"}
+            turn.text = text
+            # Le bouton d'arrêt peut maintenant atteindre le tour pendant le
+            # rangement de sa pièce jointe. S'il a été touché dans ce créneau,
+            # ne pas lancer le moteur une fois l'écriture terminée.
+            if turn.cancelled:
+                return {"stopReason": "cancelled"}
             stop_reason = await turn.run()
+            return {"stopReason": stop_reason}
         finally:
             # `detach` et non `session.turn = None` : une reprise de liaison a
             # pu rattacher ce tour à une seconde session, et celle qu'on oublie
@@ -2525,7 +2574,6 @@ class Connection:
             turn.finished.set()
             if ACTIVE_TURNS.get(session.id) is turn:
                 del ACTIVE_TURNS[session.id]
-        return {"stopReason": stop_reason}
 
     async def _cancel(self, params: dict[str, Any]) -> None:
         session = self.sessions.get(str(params.get("sessionId") or ""))

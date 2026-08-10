@@ -218,6 +218,43 @@ final class SessionsScreenTests: HublotUITestCase {
         XCTAssertTrue(app.staticTexts["Historique indisponible."].waitForExistence(timeout: 3))
         XCTAssertTrue(app.staticTexts["Aucune conversation"].exists)
     }
+
+    func testTwoPromptsStayVisibleWhileBothConversationsAreRunning() {
+        launch("concurrent-conversations")
+
+        func start(_ prompt: String) {
+            let newConversation = app.buttons["Nouvelle conversation"]
+            XCTAssertTrue(newConversation.waitForExistence(timeout: 5))
+            let enabled = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "enabled == true"), object: newConversation
+            )
+            XCTAssertEqual(XCTWaiter.wait(for: [enabled], timeout: 5), .completed)
+            newConversation.tap()
+
+            let input = element("composer-input")
+            XCTAssertTrue(input.waitForExistence(timeout: 5))
+            input.tap()
+            input.typeText(prompt)
+            element("composer-action").tap()
+
+            // Cette ligne vient du relais témoin, après l'inscription du tour.
+            // Revenir avant elle ne reproduirait pas « le chat était en cours ».
+            XCTAssertTrue(app.staticTexts["Tour enregistré sur le serveur"]
+                .waitForExistence(timeout: 5))
+            element("conversation-back").tap()
+        }
+
+        start("Premiere demande active")
+        start("Deuxieme demande active")
+
+        for title in ["Premiere demande active", "Deuxieme demande active"] {
+            let row = app.buttons.matching(
+                NSPredicate(format: "label CONTAINS %@", title)
+            ).firstMatch
+            XCTAssertTrue(row.waitForExistence(timeout: 5), "Conversation absente : \(title)")
+            XCTAssertTrue(row.label.contains("en cours"), row.label)
+        }
+    }
 }
 
 final class ConversationNavigationScreenTests: HublotUITestCase {

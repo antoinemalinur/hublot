@@ -347,6 +347,7 @@ struct SessionChrome: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(onBack == nil)
+                .accessibilityIdentifier("conversation-back")
                 .glassEffect(.regular.interactive(), in: .capsule)
                 .glassEffectID("session", in: glass)
 
