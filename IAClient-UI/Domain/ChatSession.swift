@@ -124,6 +124,7 @@ final class ChatSession {
     private var historySettlement: CheckedContinuation<Void, Never>?
 
     private let log = Logger(subsystem: "hublot", category: "session")
+    private let environment: HublotEnvironment
 
     /// Une session déjà ouverte par `AppModel` : la poignée de main et le choix
     /// de la session lui appartiennent, pas au fil de conversation.
@@ -135,8 +136,11 @@ final class ChatSession {
     init(
         connection: ACPConnection, events: AsyncStream<ACPConnection.Event>,
         workingDirectory: String, sessionId: String,
-        title: String, isResuming: Bool = false, status: SessionStatus? = nil
+        title: String, isResuming: Bool = false, status: SessionStatus? = nil,
+        environment providedEnvironment: HublotEnvironment? = nil
     ) {
+        let environment = providedEnvironment ?? .live
+        self.environment = environment
         // Déterminé par l'appelant, pas déduit de l'ordre d'arrivée : une
         // conversation qui commence par une réponse — cela arrive — laissait
         // tous les messages rejoués marqués « en cours d'écriture », curseur
@@ -201,7 +205,7 @@ final class ChatSession {
         // et l'afficher ferait apparaître une durée déjà longue à la seconde
         // zéro.
         activity = .init(running: true, phase: .starting, engine: engine.rawValue)
-        activityAt = .now
+        activityAt = environment.now()
         turns.append(
             .user(
                 .init(
@@ -228,7 +232,7 @@ final class ChatSession {
             // l'aperçu de la notification partait vide, et le curseur s'éteignait
             // sur une réponse encore en train de s'écrire à l'écran.
             await settle(reason: result.stopReason)
-            Notifier.turnFinished(session: title, preview: lastAssistantText)
+            environment.notifyTurnFinished(title, lastAssistantText)
         } catch {
             finishStreaming(reason: nil)
             status = .failed(error.localizedDescription)
@@ -251,7 +255,7 @@ final class ChatSession {
             // pour toujours et le curseur battrait sur un tour déjà fini — mieux
             // vaut conclure en retard que jamais.
             Task { [weak self] in
-                try? await Task.sleep(for: .seconds(5))
+                try? await self?.environment.sleep(.seconds(5))
                 guard let self, self.settlement != nil else { return }
                 self.log.error("jalon de fin de tour perdu")
                 self.finishStreaming(reason: reason)
@@ -444,7 +448,7 @@ final class ChatSession {
     /// travaillait toujours et qu'aucun envoi ne serait accepté.
     private func adopt(_ beat: Activity) {
         activity = beat
-        activityAt = .now
+        activityAt = environment.now()
         if let name = beat.engine, let known = Engine(rawValue: name) { engine = known }
 
         guard !isPrompting else { return }
@@ -456,7 +460,7 @@ final class ChatSession {
         } else if isRemoteTurnRunning {
             isRemoteTurnRunning = false
             finishStreaming(reason: beat.stopReason)
-            Notifier.turnFinished(session: title, preview: lastAssistantText)
+            environment.notifyTurnFinished(title, lastAssistantText)
         }
     }
 
@@ -640,7 +644,7 @@ final class ChatSession {
             }
         )
         turns.append(.permission(turn))
-        Notifier.permissionNeeded(tool: turn.toolTitle, detail: turn.detail)
+        environment.notifyPermissionNeeded(turn.toolTitle, turn.detail)
     }
 
     /// Le début de la dernière réponse, pour le corps de la notification.
