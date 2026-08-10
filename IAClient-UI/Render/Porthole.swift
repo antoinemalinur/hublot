@@ -32,6 +32,7 @@ struct Porthole: View {
     var intensity: Double = 1
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private var motionReduced: Bool { HublotMotion.isReduced(reduceMotion) }
 
     // Le laiton du cerclage. Trois valeurs suffisent à faire un métal : l'ombre,
     // la matière, l'arête éclairée.
@@ -40,14 +41,14 @@ struct Porthole: View {
     private static let brassLit = Color(hex: 0xF3C87A)
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 60, paused: reduceMotion)) { context in
+        TimelineView(.animation(minimumInterval: 1 / 60, paused: motionReduced)) { context in
             let time = context.date.timeIntervalSinceReferenceDate
             // Deux périodes premières entre elles : le mouvement ne se répète
             // jamais à l'identique, et l'œil ne trouve pas la boucle.
-            let yaw = reduceMotion ? -6.0 : sin(time * 0.41) * 17
-            let pitch = reduceMotion ? 4.0 : cos(time * 0.29) * 12
-            let breath = reduceMotion ? 0.8 : 0.72 + 0.28 * sin(time * 0.85)
-            let spin = reduceMotion ? 0.0 : time * 26
+            let yaw = motionReduced ? -6.0 : sin(time * 0.41) * 17
+            let pitch = motionReduced ? 4.0 : cos(time * 0.29) * 12
+            let breath = motionReduced ? 0.8 : 0.72 + 0.28 * sin(time * 0.85)
+            let spin = motionReduced ? 0.0 : time * 26
 
             assembly(yaw: yaw, pitch: pitch, breath: breath, spin: spin)
                 .rotation3DEffect(

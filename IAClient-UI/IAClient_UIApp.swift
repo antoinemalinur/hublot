@@ -12,39 +12,46 @@ struct IAClient_UIApp: App {
     var body: some Scene {
         WindowGroup {
             #if DEBUG
-                // `-HublotRadiographyDemo 1` rend la carte sans serveur : une
-                // feature visuelle doit pouvoir être photographiée à chaque
-                // changement, pas seulement lorsqu'un tour réel tombe juste.
-                if UserDefaults.standard.bool(forKey: "HublotRadiographyDense") {
-                    // La carte chargée : quatorze régions, conversation finie.
-                    // C'est le cas qui se chevauchait et qui s'animait à tort.
+                switch HublotUITestScenario.current {
+                case .radiographyDense:
                     RadiographyView.dense
-                } else if UserDefaults.standard.bool(forKey: "HublotRadiographyDemo") {
+                case .radiography:
                     RadiographyView.demo
-                } else if UserDefaults.standard.bool(forKey: "HublotContextTideDemo") {
-                    // La marée avec sa compaction : le cas qui distingue un
-                    // tracé honnête d'une courbe qui ne sait que monter.
-                    ContextTideView.demo
-                } else if UserDefaults.standard.bool(forKey: "HublotCodexQuotaDemo") {
-                    // Le même fil sous Codex, avec les deux fenêtres de plafond
-                    // renseignées : c'est le seul état où la barre doit choisir,
-                    // et où se voyait la semaine étiquetée « 5H ».
+                case .contextTide:
+                    if ProcessInfo.processInfo.arguments.contains("-HublotSnapshotMode") {
+                        ContextTideView.snapshotDemo
+                    } else {
+                        ContextTideView.demo
+                    }
+                case .codexQuota:
                     ConversationView.codexQuotaDemo
-                } else if UserDefaults.standard.bool(forKey: "HublotConversationDemo") {
-                    // Fil déterministe et assez long pour exercer le chrome,
-                    // le retour au direct, les groupes et la radiographie sans
-                    // dépendre du VPS pendant les tests d'interface.
+                case .conversation:
                     ConversationView.screenTestDemo
-                } else if UserDefaults.standard.bool(forKey: "HublotSessionsDemo") {
+                case .sessions, .sessionsInstructions:
                     let project = ProjectListResult.Project.samples[1]
-                    SessionsView(model: .demoSessions(project: project), project: project)
-                } else if UserDefaults.standard.bool(forKey: "HublotProjectsDemo") {
-                    // `-HublotProjectsDemo 1` rend la liste des projets sans
-                    // serveur. Même raison que ci-dessus : un écran qu'on ne
-                    // peut photographier qu'en étant connecté au VPS n'est
-                    // vérifié que lorsqu'on y pense.
-                    ProjectsView(model: .demo(projects: ProjectListResult.Project.samples))
-                } else {
+                    SessionsScreenFixture(
+                        project: project,
+                        initiallyShowsInstructions: HublotUITestScenario.current == .sessionsInstructions
+                    )
+                case .sessionsEmpty:
+                    let project = ProjectListResult.Project.samples[1]
+                    SessionsScreenFixture(project: project, sessions: [])
+                case .sessionsError:
+                    let project = ProjectListResult.Project.samples[1]
+                    SessionsScreenFixture(
+                        project: project, sessions: [], failure: "Historique indisponible."
+                    )
+                case .projects:
+                    ProjectsScreenFixture(projects: ProjectListResult.Project.samples)
+                case .projectsEmpty:
+                    ProjectsScreenFixture(projects: [])
+                case .projectsError:
+                    ProjectsScreenFixture(
+                        projects: [], failure: "Serveur temporairement indisponible."
+                    )
+                case .connection:
+                    ConnectionScreenFixture()
+                case nil:
                     RootView()
                 }
             #else
@@ -53,6 +60,53 @@ struct IAClient_UIApp: App {
         }
     }
 }
+
+#if DEBUG
+    /// Les ecrans temoins doivent posseder leur modele comme `RootView` le fait.
+    /// Construire le modele dans `body` effacait une moitie du formulaire des
+    /// que la premiere saisie invalidait la vue.
+    private struct ConnectionScreenFixture: View {
+        @State private var model = AppModel(environment: .ephemeral())
+
+        var body: some View { ConnectionView(model: model) }
+    }
+
+    private struct ProjectsScreenFixture: View {
+        @State private var model: AppModel
+
+        init(projects: [ProjectListResult.Project], failure: String? = nil) {
+            _model = State(initialValue: .demo(projects: projects, failure: failure))
+        }
+
+        var body: some View { ProjectsView(model: model) }
+    }
+
+    private struct SessionsScreenFixture: View {
+        let project: ProjectListResult.Project
+        let initiallyShowsInstructions: Bool
+        @State private var model: AppModel
+
+        init(
+            project: ProjectListResult.Project,
+            sessions: [SessionListResult.Summary]? = nil,
+            failure: String? = nil,
+            initiallyShowsInstructions: Bool = false
+        ) {
+            self.project = project
+            self.initiallyShowsInstructions = initiallyShowsInstructions
+            _model = State(initialValue: .demoSessions(
+                project: project, sessions: sessions, failure: failure
+            ))
+        }
+
+        var body: some View {
+            SessionsView(
+                model: model, project: project,
+                initiallyShowsInstructions: initiallyShowsInstructions
+            )
+        }
+    }
+#endif
 
 /// La racine : connexion → projets → conversations → fil.
 ///

@@ -43,16 +43,18 @@ final class AppModel {
     // le VPS et ne vit que dans le trousseau.
 
     var serverURL: String {
-        didSet { UserDefaults.standard.set(serverURL, forKey: Self.urlKey) }
+        didSet { environment.writeServerURL(serverURL) }
     }
 
     var token: String {
-        didSet { Keychain.save(token, for: Self.tokenAccount) }
+        didSet { environment.writeToken(token) }
     }
 
-    private static let urlKey = "hublot.serverURL"
-    private static let tokenAccount = "acp-token"
     private static let repositoriesRoot = "/root/repos"
+    private let environment: HublotEnvironment
+    #if DEBUG
+        private var isDemo = false
+    #endif
 
     // MARK: État
 
@@ -129,7 +131,7 @@ final class AppModel {
         while !Task.isCancelled {
             await refreshRunning()
             do {
-                try await Task.sleep(for: Self.runningInterval)
+                try await environment.sleep(Self.runningInterval)
             } catch {
                 return
             }
@@ -148,9 +150,11 @@ final class AppModel {
 
     private let log = Logger(subsystem: "hublot", category: "app")
 
-    init() {
-        serverURL = UserDefaults.standard.string(forKey: Self.urlKey) ?? ""
-        token = Keychain.read(Self.tokenAccount) ?? ""
+    init(environment providedEnvironment: HublotEnvironment? = nil) {
+        let environment = providedEnvironment ?? .live
+        self.environment = environment
+        serverURL = environment.readServerURL() ?? ""
+        token = environment.readToken() ?? ""
 
         #if DEBUG
             if let seeded = UserDefaults.standard.string(forKey: "HublotToken"), !seeded.isEmpty {
@@ -169,16 +173,20 @@ final class AppModel {
     }
 
     private func persist() {
-        if !serverURL.isEmpty { UserDefaults.standard.set(serverURL, forKey: Self.urlKey) }
-        if !token.isEmpty { Keychain.save(token, for: Self.tokenAccount) }
+        if !serverURL.isEmpty { environment.writeServerURL(serverURL) }
+        if !token.isEmpty { environment.writeToken(token) }
     }
 
     var isConfigured: Bool { !serverURL.isEmpty && !token.isEmpty }
 
     #if DEBUG
-        static func demo(projects: [ProjectListResult.Project]) -> AppModel {
-            let model = AppModel()
+        static func demo(
+            projects: [ProjectListResult.Project], failure: String? = nil
+        ) -> AppModel {
+            let model = AppModel(environment: .ephemeral())
+            model.isDemo = true
             model.projects = projects
+            model.failure = failure
             if let active = projects.first(where: { $0.name == "office-chess" }) {
                 model.running = [.init(
                     sessionId: "screen-running", cwd: active.path, engine: "claude",
@@ -189,9 +197,14 @@ final class AppModel {
             return model
         }
 
-        static func demoSessions(project: ProjectListResult.Project) -> AppModel {
-            let model = AppModel()
-            model.sessions = [
+        static func demoSessions(
+            project: ProjectListResult.Project,
+            sessions: [SessionListResult.Summary]? = nil,
+            failure: String? = nil
+        ) -> AppModel {
+            let model = AppModel(environment: .ephemeral())
+            model.isDemo = true
+            model.sessions = sessions ?? [
                 .init(
                     sessionId: "screen-running", cwd: project.path,
                     title: "Valider les corrections d'interface", updatedAt: .now,
@@ -203,10 +216,16 @@ final class AppModel {
                     exchanges: 2
                 ),
             ]
+            model.failure = failure
             model.running = [.init(
                 sessionId: "screen-running", cwd: project.path, engine: "claude",
                 phase: .tool, label: "/root/repos/office-chess/pytest", elapsed: 134, quiet: 1
             )]
+            model.instructions = .init(
+                path: "/root/repos/office-chess/CLAUDE.md",
+                content: "# Instructions\n\nValider chaque changement avant livraison.",
+                bytes: 58, updatedAt: model.environment.now()
+            )
             model.screen = .sessions(project)
             return model
         }
@@ -227,7 +246,7 @@ final class AppModel {
         defer { isBusy = false }
         await teardown()
 
-        let connection = ACPConnection(transport: WebSocketTransport(url: url, token: token))
+        let connection = environment.makeConnection(url, token)
         self.connection = connection
 
         do {
@@ -240,7 +259,7 @@ final class AppModel {
             reconnectAttempt = 0
             failure = nil
             isReconnecting = false
-            Task { await Notifier.requestAuthorization() }
+            Task { await environment.requestNotificationAuthorization() }
 
             await loadProjects()
             if screen.isEntry { screen = .projects }
@@ -381,8 +400,9 @@ final class AppModel {
         isReconnecting = true
         let delay = min(pow(2, Double(reconnectAttempt)), 30)
         reconnectAttempt += 1
+        let sleep = environment.sleep
         reconnectTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
+            try? await sleep(.seconds(delay))
             guard let self, !Task.isCancelled else { return }
             self.reconnectTask = nil
             await self.connect()
@@ -445,7 +465,7 @@ final class AppModel {
         // Le dossier naît avec la première conversation : c'est `session/new`
         // qui le crée côté serveur, borné à `/root/repos`.
         let project = ProjectListResult.Project(
-            name: safe, path: "/root/repos/\(safe)", sessionCount: 0, updatedAt: .now
+            name: safe, path: "/root/repos/\(safe)", sessionCount: 0, updatedAt: environment.now()
         )
         openProject = project
         await startSession(in: project)
@@ -524,6 +544,14 @@ final class AppModel {
 
     /// Supprime la conversation *et* son historique, sans corbeille.
     func delete(_ summary: SessionListResult.Summary) async {
+        #if DEBUG
+            if connection == nil, isDemo {
+                withAnimation(.snappy(duration: 0.25)) {
+                    sessions.removeAll { $0.sessionId == summary.sessionId }
+                }
+                return
+            }
+        #endif
         guard let connection, let cwd = summary.cwd else { return }
         do {
             try await connection.call(
@@ -563,7 +591,7 @@ final class AppModel {
         let session = ChatSession(
             connection: connection, events: events, workingDirectory: cwd,
             sessionId: sessionId, title: title, isResuming: isResuming,
-            status: lastStatus
+            status: lastStatus, environment: environment
         )
         session.apply(setup)
         return session

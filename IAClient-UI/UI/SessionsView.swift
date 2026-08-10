@@ -13,6 +13,7 @@ import SwiftUI
 struct SessionsView: View {
     @Bindable var model: AppModel
     let project: ProjectListResult.Project
+    var initiallyShowsInstructions = false
 
     @State private var showingInstructions = false
 
@@ -73,7 +74,9 @@ struct SessionsView: View {
             // `-HublotShowInstructions 1` : ouvre la feuille au lancement, pour
             // qu'elle soit vérifiable en capture comme les autres écrans.
             .task {
-                guard UserDefaults.standard.bool(forKey: "HublotShowInstructions") else { return }
+                guard initiallyShowsInstructions
+                    || UserDefaults.standard.bool(forKey: "HublotShowInstructions")
+                else { return }
                 try? await Task.sleep(for: .seconds(1))
                 showingInstructions = model.instructions != nil
             }
