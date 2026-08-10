@@ -2076,6 +2076,15 @@ class Connection:
         config_id = str(params.get("configId") or "")
         value = str(params.get("value") or "")
         switched = False
+        session = self.sessions.get(str(params.get("sessionId") or ""))
+
+        # Le moteur d'un processus déjà lancé ne peut pas être remplacé. Avant,
+        # le choix était tout de même persisté : le menu disait alors « Claude »
+        # tandis que le tour et sa barre continuaient honnêtement sous Codex.
+        # `permission` est le seul réglage qui puisse encore servir au tour en
+        # cours, notamment à son prochain appel de commande.
+        if session is not None and session.turn is not None and config_id != "permission":
+            raise ValueError("arrêtez le tour en cours avant de changer ce réglage")
 
         if config_id == "permission":
             if value not in {"ask", "auto"}:
@@ -2120,7 +2129,6 @@ class Connection:
         else:
             raise ValueError(f"réglage inconnu ou valeur refusée : {config_id}={value}")
 
-        session = self.sessions.get(str(params.get("sessionId") or ""))
         if session is not None:
             # Le client ne peut pas deviner ce que « Auto » a résolu : on le lui
             # dit, sinon la pastille du moteur reste sur sa valeur d'ouverture.
@@ -2525,6 +2533,11 @@ class Connection:
             turn.finished.set()
             if ACTIVE_TURNS.get(session.id) is turn:
                 del ACTIVE_TURNS[session.id]
+            # `send_status` donnait la priorité au moteur réellement en vol.
+            # Une fois le tour détaché, republier fait reprendre la main au
+            # choix configuré ; sinon la dernière jauge Codex restait affichée
+            # sous Claude jusqu'à la prochaine ouverture de la conversation.
+            await turn.session.send_status()
         return {"stopReason": stop_reason}
 
     async def _cancel(self, params: dict[str, Any]) -> None:

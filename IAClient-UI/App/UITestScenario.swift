@@ -15,6 +15,7 @@
         case sessionsInstructions = "sessions-instructions"
         case conversation
         case codexQuota = "codex-quota"
+        case activeEngineLock = "active-engine-lock"
         case contextTide = "context-tide"
         case radiography
         case radiographyDense = "radiography-dense"

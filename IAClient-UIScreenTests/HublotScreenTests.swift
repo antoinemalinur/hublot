@@ -386,4 +386,23 @@ final class AccessibilityAndLayoutScreenTests: HublotUITestCase {
         XCTAssertTrue(status.label.contains("7J: 64%"), "vu : \(status.label)")
         XCTAssertFalse(status.label.contains("5H"), "vu : \(status.label)")
     }
+
+    func testEngineCannotChangeWhileCodexIsStillRunning() {
+        launch("active-engine-lock")
+
+        let status = element("status-bar")
+        let engine = element("config-engine")
+        XCTAssertTrue(status.waitForExistence(timeout: 5))
+        XCTAssertTrue(status.label.contains("7J: 36%"), "vu : \(status.label)")
+        XCTAssertTrue(engine.waitForExistence(timeout: 5))
+        XCTAssertFalse(engine.isEnabled)
+        XCTAssertTrue(engine.label.contains("Codex"), "vu : \(engine.label)")
+        XCTAssertFalse(engine.label.contains("Claude"), "vu : \(engine.label)")
+
+        // Le geste de la capture ne doit plus ouvrir un choix qui ne pourrait
+        // agir qu'au prochain tour, ni faire mentir la barre du tour courant.
+        engine.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        XCTAssertFalse(app.buttons["Claude"].waitForExistence(timeout: 1))
+        XCTAssertTrue(status.label.contains("7J: 36%"), "vu : \(status.label)")
+    }
 }

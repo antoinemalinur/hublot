@@ -317,6 +317,12 @@ final class ChatSession {
     /// n'a pas obtenu.
     func choose(_ option: ConfigOption, value: String) async {
         guard let sessionId, option.currentValueString != value else { return }
+        // Un moteur ne se remplace pas au milieu de sa réponse. Laisser partir
+        // le réglage faisait pourtant afficher « Claude » dans le composeur
+        // pendant que la barre — justement — décrivait encore le tour Codex.
+        // Les permissions restent modifiables : elles peuvent être nécessaires
+        // à la prochaine commande du tour en cours.
+        guard !isWorking || option.id == "permission" else { return }
         do {
             let result = try await connection.call(
                 "session/set_config_option",
