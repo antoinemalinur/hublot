@@ -135,6 +135,18 @@ CODEX_MODELS_CACHE = Path(
 CODEX_MODEL_FILE = Path(
     os.environ.get("ACP_CODEX_MODEL_FILE") or (Path(BASE) / "state" / "codex-model")
 )
+# La fenêtre publiée dans les événements du CLI est celle que sa surface locale
+# emploie avant compaction (258 400 aujourd'hui), pas la capacité globale du
+# modèle que la marée promet d'afficher. Les fiches API OpenAI donnent 1 050 000
+# jetons pour les trois modèles GPT-5.6 :
+# https://developers.openai.com/api/docs/models/gpt-5.6-sol
+CODEX_MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "gpt-5.6": 1_050_000,
+    "gpt-5.6-sol": 1_050_000,
+    "gpt-5.6-sol-wm": 1_050_000,
+    "gpt-5.6-terra": 1_050_000,
+    "gpt-5.6-luna": 1_050_000,
+}
 FALLBACK_CODEX_MODELS: tuple[dict[str, Any], ...] = (
     {
         "model": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol",
@@ -155,6 +167,15 @@ FALLBACK_CODEX_MODELS: tuple[dict[str, Any], ...] = (
         "defaultEffort": "medium",
     },
 )
+
+
+def codex_model_context_window(model: str, measured: int) -> int:
+    """Capacité globale du modèle, ou mesure du CLI si elle est inconnue.
+
+    Le repli est volontaire : une future famille ne doit pas hériter par
+    supposition de la fenêtre GPT-5.6.
+    """
+    return CODEX_MODEL_CONTEXT_WINDOWS.get(model, measured)
 
 
 def codex_model_catalog() -> dict[str, dict[str, Any]]:
@@ -1766,7 +1787,7 @@ class Session:
                     self.turn.model if self.turn and self.turn.model else str(bot.CODEX_MODEL)
                 )
                 effort = bot.state["codex_effort"]
-                context_size = size
+                context_size = codex_model_context_window(model_label, size)
             else:
                 model = bot.state["model"]
                 model_label = bot.MODELS[model][1]

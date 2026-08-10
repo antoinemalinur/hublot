@@ -147,6 +147,23 @@ class ContextPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recorded, [])
 
 
+class CodexContextWindowTests(unittest.TestCase):
+    def test_gpt_5_6_uses_the_models_global_window_not_the_cli_compaction_limit(
+        self,
+    ) -> None:
+        # Valeur exacte du journal qui produisait la capture « 258 400 ».
+        self.assertEqual(
+            acp_server.codex_model_context_window("gpt-5.6-sol", 258_400),
+            1_050_000,
+        )
+
+    def test_an_unknown_model_keeps_the_window_measured_by_codex(self) -> None:
+        self.assertEqual(
+            acp_server.codex_model_context_window("future-model", 384_000),
+            384_000,
+        )
+
+
 class AuthSession:
     """Ce que la conversation reçoit vraiment : du texte et des bascules."""
 

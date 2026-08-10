@@ -375,5 +375,10 @@ final class AccessibilityAndLayoutScreenTests: HublotUITestCase {
         XCTAssertTrue(status.waitForExistence(timeout: 5))
         XCTAssertTrue(status.label.contains("7J: 64%"), "vu : \(status.label)")
         XCTAssertFalse(status.label.contains("5H"), "vu : \(status.label)")
+
+        status.tap()
+        let tokens = element("context-token-count")
+        XCTAssertTrue(tokens.waitForExistence(timeout: 5))
+        XCTAssertEqual(tokens.label.filter(\.isNumber), "4410001050000")
     }
 }

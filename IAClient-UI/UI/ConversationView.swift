@@ -1161,15 +1161,20 @@ struct CommandPalette: View {
             ]
             // La marée de ce fil témoin. La dernière mesure vaut exactement
             // 42 % — le même chiffre que `contextPercent` ci-dessous, sinon
-            // l'écran et la barre qui l'ouvre se contrediraient.
-            let readings = [6_800, 19_400, 33_100, 51_700, 68_200, 84_000]
+            // l'écran et la barre qui l'ouvre se contrediraient. Le témoin
+            // Codex porte la fenêtre globale publiée pour GPT-5.6 ; c'est le
+            // parcours tactile de régression du dénominateur affiché.
+            let contextSize = engine == .codex ? 1_050_000 : 200_000
+            let readings = engine == .codex
+                ? [35_700, 101_850, 173_775, 271_425, 358_050, 441_000]
+                : [6_800, 19_400, 33_100, 51_700, 68_200, 84_000]
             let history = readings.enumerated().map { index, used in
                 ContextTide.Sample(
                     id: "demo-ctx-\(index)", sequence: index,
-                    used: used, size: 200_000,
+                    used: used, size: contextSize,
                     at: Date(timeIntervalSinceReferenceDate: 800_000_000)
                         .addingTimeInterval(Double(index) * 120),
-                    model: "Opus", engine: "claude"
+                    model: status.model, engine: status.engine
                 )
             }
 
