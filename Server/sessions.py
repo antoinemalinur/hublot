@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -82,7 +83,7 @@ def list_sessions(cwd: str) -> list[dict[str, Any]]:
             modified = path.stat().st_mtime
         except OSError:
             continue
-        title, exchanges = _summarise(path)
+        title, exchanges, last_prompt_at = _summarise(path)
         if not exchanges:
             # Une session sans un seul échange est un vestige : la montrer
             # promettrait un historique qui n'existe pas.
@@ -91,15 +92,18 @@ def list_sessions(cwd: str) -> list[dict[str, Any]]:
             "sessionId": path.stem,
             "cwd": cwd,
             "title": title,
-            "updatedAt": _iso(modified),
+            # Ouvrir ou reprendre une session peut réécrire son fichier. La
+            # date montrée dans les listes est celle de la dernière demande
+            # humaine, pas celle de cette activité technique.
+            "updatedAt": last_prompt_at or _iso(modified),
             "exchanges": exchanges,
         })
     sessions.sort(key=lambda s: s["updatedAt"], reverse=True)
     return sessions
 
 
-def _summarise(path: Path) -> tuple[str, int]:
-    """Titre et nombre d'échanges, sans charger tout le fichier en mémoire.
+def _summarise(path: Path) -> tuple[str, int, str | None]:
+    """Titre, nombre d'échanges et dernière demande, en lecture continue.
 
     Claude écrit lui-même un `ai-title` quand il en a produit un ; à défaut on
     prend la première demande. Un titre inventé ici serait moins bon que le
@@ -107,6 +111,7 @@ def _summarise(path: Path) -> tuple[str, int]:
     """
     ai_title: str | None = None
     first_prompt: str | None = None
+    last_prompt_at: str | None = None
     exchanges = 0
 
     for event in _events(path):
@@ -119,10 +124,25 @@ def _summarise(path: Path) -> tuple[str, int]:
                 exchanges += 1
                 if first_prompt is None:
                     first_prompt = text
+                last_prompt_at = _timestamp_of(event) or last_prompt_at
 
     title = ai_title or first_prompt or "Conversation"
     flat = " ".join(title.split())
-    return (flat[:79] + "…" if len(flat) > 80 else flat), exchanges
+    return (flat[:79] + "…" if len(flat) > 80 else flat), exchanges, last_prompt_at
+
+
+def _timestamp_of(event: dict[str, Any]) -> str | None:
+    """Normalise l'horodatage ISO écrit par Claude, ou l'écarte s'il est faux."""
+    value = event.get("timestamp")
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return _iso(parsed.timestamp())
 
 
 def replay(cwd: str, session_id: str) -> Iterator[tuple[str, str]]:

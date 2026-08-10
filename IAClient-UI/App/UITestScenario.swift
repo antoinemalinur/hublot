@@ -6,6 +6,7 @@
     enum HublotUITestScenario: String {
         case connection
         case projects
+        case projectsPromptAge = "projects-prompt-age"
         case projectsEmpty = "projects-empty"
         case projectsError = "projects-error"
         case sessions
