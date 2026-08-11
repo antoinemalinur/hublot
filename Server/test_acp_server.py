@@ -13,10 +13,20 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+# Les charger avant `acp_server` est essentiel : en production celui-ci place
+# `/opt/tg-claude` en tête du chemin pour trouver `bot.py`. Sur le VPS de test,
+# cela ferait sinon importer les copies déployées (potentiellement plus
+# anciennes) au lieu des fichiers de cette branche.
+import continuity  # noqa: F401, E402
+import radiography  # noqa: F401, E402
+import sessions  # noqa: F401, E402
+import usage  # noqa: F401, E402
 
-# Le dépôt iOS ne contient pas les modules d'exploitation du VPS. Le relais ne
-# les exerce pas dans ces tests : de petits substituts suffisent pour importer
-# ses classes et tester le contrat de streaming lui-même.
+
+# Le dépôt ne contient pas `bot.py` ni le constructeur de passation du VPS.
+# Les modules de sessions, continuité et radiographie sont en revanche bien
+# présents ici : les remplacer polluerait `sys.modules` et ferait tester leurs
+# propres suites contre une coquille vide lors d'une découverte globale.
 os.environ.setdefault("ACP_TOKEN", "test-token")
 # `acp_server` donne normalement priorité à `/opt/tg-claude`. En test, cela
 # chargeait les anciennes copies de `continuity.py` et `sessions.py` installées
@@ -109,6 +119,124 @@ class ConnectionSurvivalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(recorded, [{"sessionUpdate": "agent_message_chunk"}])
         self.assertTrue(session._notification_failed)
+
+
+class ConcurrentConversationCatalogTests(unittest.IsolatedAsyncioTestCase):
+    """Une seconde demande doit exister avant son premier travail lent.
+
+    Le cas vu dans l'app : quitter un premier fil encore actif, en ouvrir un
+    second, envoyer puis revenir aussitôt à la liste. Le rangement des images
+    passait par un thread avant l'inscription du second tour. Pendant cette
+    fenêtre, `session/list` et `hublot/running` ne voyaient que le premier fil,
+    et la liste ne se rechargeait plus ensuite.
+    """
+
+    async def asyncSetUp(self) -> None:
+        acp_server.ACTIVE_TURNS.clear()
+
+    async def asyncTearDown(self) -> None:
+        acp_server.ACTIVE_TURNS.clear()
+
+    async def test_second_prompt_is_listed_while_its_attachment_is_stored(self) -> None:
+        cwd = "/tmp/repos/projet"
+        first_session = types.SimpleNamespace(id="premier", cwd=cwd)
+        first_turn = acp_server.PromptTurn(first_session, "Première demande")
+        acp_server.ACTIVE_TURNS[first_session.id] = first_turn
+
+        connection = acp_server.Connection(types.SimpleNamespace())
+        second = acp_server.Session(connection, "second", cwd)
+        connection.sessions[second.id] = second
+
+        storage_started = asyncio.Event()
+        release_storage = asyncio.Event()
+
+        async def blocked_storage(_function, *_args, **_kwargs):
+            storage_started.set()
+            await release_storage.wait()
+            return ["/tmp/repos/projet/.hublot/images/deuxieme.jpg"]
+
+        async def completed_turn(_turn) -> str:
+            return "end_turn"
+
+        blocks = [
+            {"type": "text", "text": "Deuxième demande"},
+            {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/jpeg"},
+        ]
+        with mock.patch("asyncio.to_thread", side_effect=blocked_storage), \
+             mock.patch.object(acp_server.PromptTurn, "run", completed_turn), \
+             mock.patch.object(acp_server.store, "list_sessions", create=True, return_value=[{
+                 "sessionId": "premier", "cwd": cwd, "title": "Première demande",
+                 "updatedAt": "2026-08-10T19:00:00.000Z", "exchanges": 1,
+             }]), \
+             mock.patch.object(acp_server.continuity, "list_sessions", return_value=[]):
+            prompt = asyncio.create_task(connection._prompt({
+                "sessionId": second.id, "prompt": blocks,
+            }))
+            await asyncio.wait_for(storage_started.wait(), timeout=1)
+
+            self.assertEqual(
+                {turn["sessionId"] for turn in acp_server.running_turns()},
+                {"premier", "second"},
+            )
+            self.assertEqual(
+                {session["sessionId"] for session in acp_server.session_catalog(cwd)},
+                {"premier", "second"},
+            )
+
+            release_storage.set()
+            self.assertEqual((await prompt)["stopReason"], "end_turn")
+
+    async def test_text_only_prompt_never_waits_for_attachment_storage(self) -> None:
+        connection = acp_server.Connection(types.SimpleNamespace())
+        session = acp_server.Session(connection, "texte-seul", "/tmp/repos/projet")
+        connection.sessions[session.id] = session
+        turn_started = asyncio.Event()
+        release_turn = asyncio.Event()
+
+        async def running_turn(_turn) -> str:
+            turn_started.set()
+            await release_turn.wait()
+            return "end_turn"
+
+        with mock.patch("asyncio.to_thread", new_callable=mock.AsyncMock) as storage, \
+             mock.patch.object(acp_server.PromptTurn, "run", running_turn):
+            prompt = asyncio.create_task(connection._prompt({
+                "sessionId": session.id,
+                "prompt": [{"type": "text", "text": "Demande sans image"}],
+            }))
+            await asyncio.wait_for(turn_started.wait(), timeout=1)
+
+            storage.assert_not_awaited()
+            self.assertIn(session.id, acp_server.ACTIVE_TURNS)
+            release_turn.set()
+            self.assertEqual((await prompt)["stopReason"], "end_turn")
+
+    async def test_cancel_during_attachment_storage_never_starts_the_engine(self) -> None:
+        connection = acp_server.Connection(types.SimpleNamespace())
+        session = acp_server.Session(connection, "annule", "/tmp/repos/projet")
+        connection.sessions[session.id] = session
+        storage_started = asyncio.Event()
+        release_storage = asyncio.Event()
+
+        async def blocked_storage(_function, *_args, **_kwargs):
+            storage_started.set()
+            await release_storage.wait()
+            return ["/tmp/repos/projet/.hublot/images/annule.jpg"]
+
+        with mock.patch("asyncio.to_thread", side_effect=blocked_storage), \
+             mock.patch.object(acp_server.PromptTurn, "run", new_callable=mock.AsyncMock) as run:
+            prompt = asyncio.create_task(connection._prompt({
+                "sessionId": session.id,
+                "prompt": [{"type": "image", "data": "aW1hZ2U=",
+                            "mimeType": "image/jpeg"}],
+            }))
+            await asyncio.wait_for(storage_started.wait(), timeout=1)
+
+            await connection._cancel({"sessionId": session.id})
+            release_storage.set()
+
+            self.assertEqual((await prompt)["stopReason"], "cancelled")
+            run.assert_not_awaited()
 
 
 class ContextPersistenceTests(unittest.IsolatedAsyncioTestCase):

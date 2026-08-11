@@ -29,6 +29,8 @@ struct IAClient_UIApp: App {
                     ConversationView.activeEngineLockDemo
                 case .conversation:
                     ConversationView.screenTestDemo
+                case .concurrentConversations:
+                    ConcurrentConversationsFixture()
                 case .sessions, .sessionsInstructions:
                     let project = ProjectListResult.Project.samples[1]
                     SessionsScreenFixture(
@@ -113,6 +115,175 @@ struct IAClient_UIApp: App {
                 model: model, project: project,
                 initiallyShowsInstructions: initiallyShowsInstructions
             )
+        }
+    }
+
+    /// Le vrai parcours à deux fils, alimenté par un relais déterministe.
+    /// Les deux `session/prompt` restent volontairement sans réponse : revenir
+    /// à la liste pendant qu'ils travaillent est précisément le geste qui a
+    /// fait disparaître la seconde conversation sur l'iPhone.
+    private struct ConcurrentConversationsFixture: View {
+        @State private var model: AppModel
+
+        init() {
+            let transport = ConcurrentConversationsTransport()
+            var environment = HublotEnvironment.ephemeral(
+                serverURL: "ws://127.0.0.1:8325", token: "ui-test",
+                makeConnection: { _, _ in ACPConnection(transport: transport) }
+            )
+            environment.sleep = { duration in try await Task.sleep(for: duration) }
+            _model = State(initialValue: AppModel(environment: environment))
+        }
+
+        var body: some View {
+            Group {
+                switch model.screen {
+                case .sessions(let project):
+                    SessionsView(model: model, project: project)
+                case .conversation:
+                    if let chat = model.chat {
+                        ConversationView(
+                            sessionTitle: chat.title,
+                            engine: chat.engine,
+                            plan: chat.plan,
+                            turns: chat.turns,
+                            onSend: { text, images in
+                                Task { await chat.send(text, attachments: images) }
+                            },
+                            onBack: { model.closeConversation() },
+                            configOptions: chat.configOptions,
+                            status: chat.metrics,
+                            contextPercent: chat.contextPercent,
+                            contextHistory: chat.contextHistory,
+                            onChoose: { option, value in
+                                Task { await chat.choose(option, value: value) }
+                            },
+                            activity: chat.activity,
+                            activityAt: chat.activityAt,
+                            isWorking: chat.isWorking,
+                            isReconnecting: false,
+                            onStop: { Task { await chat.cancel() } },
+                            onDictate: { _ in nil }
+                        )
+                    }
+                default:
+                    HoldingView(purpose: .launching) {}
+                }
+            }
+            .task {
+                await model.connect()
+                guard let project = model.projects.first(where: { $0.name == "hublot" })
+                else { return }
+                await model.open(project)
+            }
+        }
+    }
+
+    private actor ConcurrentConversationsTransport: ACPTransport {
+        private let stream: AsyncThrowingStream<Data, Error>
+        private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+        private var nextSession = 0
+        private var prompts: [String: String] = [:]
+
+        init() {
+            let pair = AsyncThrowingStream<Data, Error>.makeStream()
+            stream = pair.stream
+            continuation = pair.continuation
+        }
+
+        var frames: AsyncThrowingStream<Data, Error> { stream }
+        func connect() async throws {}
+        func disconnect() async { continuation.finish() }
+
+        func send(_ frame: Data) async throws {
+            guard let request = try JSONSerialization.jsonObject(with: frame) as? [String: Any],
+                let method = request["method"] as? String,
+                let id = request["id"] as? Int
+            else { return }
+            let params = request["params"] as? [String: Any] ?? [:]
+
+            switch method {
+            case "session/new":
+                nextSession += 1
+                reply(id, [
+                    "sessionId": "ui-conversation-\(nextSession)",
+                    "configOptions": [],
+                ])
+            case "session/prompt":
+                guard let sessionId = params["sessionId"] as? String else { return }
+                let blocks = params["prompt"] as? [[String: Any]] ?? []
+                let text = blocks.compactMap { $0["text"] as? String }
+                    .joined(separator: "\n")
+                prompts[sessionId] = text
+                notify(sessionId, [
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "registered-\(sessionId)",
+                    "title": "Tour enregistré sur le serveur",
+                    "kind": "think",
+                    "status": "in_progress",
+                ])
+                // Pas de réponse RPC : le tour reste en cours.
+            case "session/list":
+                let sessions = prompts.sorted { $0.key < $1.key }.map { sessionId, text in
+                    [
+                        "sessionId": sessionId,
+                        "cwd": "/root/repos/hublot",
+                        "title": text,
+                        "updatedAt": "2026-08-10T19:23:00.000Z",
+                        "exchanges": 1,
+                    ] as [String: Any]
+                }
+                reply(id, ["sessions": sessions])
+            case "hublot/running":
+                let turns = prompts.keys.sorted().map { sessionId in
+                    [
+                        "sessionId": sessionId,
+                        "cwd": "/root/repos/hublot",
+                        "engine": "codex",
+                        "phase": "thinking",
+                        "label": "validation",
+                        "elapsed": 12,
+                        "quiet": 1,
+                    ] as [String: Any]
+                }
+                reply(id, ["turns": turns])
+            case "initialize":
+                reply(id, [
+                    "protocolVersion": 1,
+                    "agentCapabilities": [
+                        "loadSession": true,
+                        "sessionCapabilities": ["list": [:]],
+                    ],
+                ])
+            case "hublot/projects":
+                reply(id, ["projects": [[
+                    "name": "hublot",
+                    "path": "/root/repos/hublot",
+                    "sessionCount": prompts.count,
+                    "updatedAt": "2026-08-10T19:23:00.000Z",
+                ]]])
+            case "hublot/instructions":
+                reply(id, ["instructions": NSNull()])
+            default:
+                reply(id, [:])
+            }
+        }
+
+        private func reply(_ id: Int, _ result: [String: Any]) {
+            emit(["jsonrpc": "2.0", "id": id, "result": result])
+        }
+
+        private func notify(_ sessionId: String, _ update: [String: Any]) {
+            emit([
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": ["sessionId": sessionId, "update": update],
+            ])
+        }
+
+        private func emit(_ object: [String: Any]) {
+            guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+            continuation.yield(data)
         }
     }
 #endif

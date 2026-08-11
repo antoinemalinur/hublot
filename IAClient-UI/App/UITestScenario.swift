@@ -13,6 +13,7 @@
         case sessionsEmpty = "sessions-empty"
         case sessionsError = "sessions-error"
         case sessionsInstructions = "sessions-instructions"
+        case concurrentConversations = "concurrent-conversations"
         case conversation
         case codexQuota = "codex-quota"
         case activeEngineLock = "active-engine-lock"
