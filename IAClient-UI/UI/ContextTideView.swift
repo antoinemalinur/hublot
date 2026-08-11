@@ -425,6 +425,7 @@ private struct SampleInspector: View {
             Text("\(sample.used.formatted()) / \(sample.size.formatted()) jetons")
                 .font(.hublotMono)
                 .foregroundStyle(Hublot.prose)
+                .accessibilityIdentifier("context-token-count")
 
             // Le sommet n'apparaît que s'il est derrière nous : une compaction
             // fait retomber le contexte, et c'est justement ce qu'on veut voir.
