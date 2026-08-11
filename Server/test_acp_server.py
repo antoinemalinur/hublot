@@ -610,6 +610,10 @@ class ActiveTurnConfigurationTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, session, _text) -> None:
                 self.session = session
                 self.finished = asyncio.Event()
+                # Le rangement des pièces jointes a déplacé le départ du moteur
+                # dans le `try` : le tour y est consulté avant de courir.
+                self.cancelled = False
+                self.text = _text
 
             async def run(self) -> str:
                 return "end_turn"
@@ -627,6 +631,52 @@ class ActiveTurnConfigurationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"stopReason": "end_turn"})
         self.assertEqual(session.statuses, 1)
+        self.assertIsNone(session.turn)
+
+    async def test_a_failed_status_republication_never_hides_the_turn_verdict(
+        self,
+    ) -> None:
+        """Le tour a répondu ; la jauge est un confort, pas son verdict.
+
+        La republication vit dans un `finally` : sans garde-fou, une lecture de
+        quota en panne y lèverait après coup et le client recevrait une erreur
+        JSON-RPC pour une réponse qu'il a pourtant reçue en entier.
+        """
+        connection = acp_server.Connection(types.SimpleNamespace())
+
+        class Session:
+            id = "session-test"
+            cwd = "/tmp/repos/projet"
+            turn = None
+
+            async def send_status(self) -> None:
+                raise RuntimeError("quota illisible")
+
+        class Turn:
+            def __init__(self, session, text) -> None:
+                self.session = session
+                self.finished = asyncio.Event()
+                self.cancelled = False
+                self.text = text
+
+            async def run(self) -> str:
+                return "end_turn"
+
+            def detach(self) -> None:
+                self.session.turn = None
+
+        session = Session()
+        connection.sessions[session.id] = session
+        with mock.patch.object(acp_server, "PromptTurn", Turn):
+            result = await connection._prompt({
+                "sessionId": session.id,
+                "prompt": [{"type": "text", "text": "question"}],
+            })
+
+        self.assertEqual(result, {"stopReason": "end_turn"})
+        # Et le tour est bien sorti du registre : une panne de statut ne doit
+        # pas non plus laisser la conversation « occupée » pour toujours.
+        self.assertNotIn(session.id, acp_server.ACTIVE_TURNS)
         self.assertIsNone(session.turn)
 
 

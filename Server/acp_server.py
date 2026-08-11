@@ -2613,7 +2613,15 @@ class Connection:
             # Une fois le tour détaché, republier fait reprendre la main au
             # choix configuré ; sinon la dernière jauge Codex restait affichée
             # sous Claude jusqu'à la prochaine ouverture de la conversation.
-            await turn.session.send_status()
+            #
+            # Cette republication est un confort d'affichage, jamais le verdict
+            # du tour : levée depuis un `finally`, son exception remplacerait
+            # celle du moteur — ou ferait échouer un tour qui a réussi. Le
+            # client verrait « erreur » pour une réponse qu'il a déjà reçue.
+            try:
+                await turn.session.send_status()
+            except Exception as error:  # noqa: BLE001
+                log(f"statut non republié sur {session.id} : {error}")
 
     async def _cancel(self, params: dict[str, Any]) -> None:
         session = self.sessions.get(str(params.get("sessionId") or ""))
