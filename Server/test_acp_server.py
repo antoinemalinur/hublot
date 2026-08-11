@@ -9,6 +9,7 @@ import threading
 import time
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -597,6 +598,136 @@ class CancelledTurnTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ClaudeUsageEndpointTests(unittest.TestCase):
+    """La source qui rend vraiment les plafonds de Claude.
+
+    Le 10 août 2026, la barre perdait sa cellule dès qu'on passait sur Claude.
+    `claude -p /usage` avait cessé de répondre ce qu'on croyait : hors session
+    interactive, le CLI traite `/usage` comme une demande ordinaire et rend un
+    récapitulatif de coût. Aucune fenêtre à en tirer, donc aucune jauge.
+    """
+
+    #: La charge exacte rendue par `/api/oauth/usage`, relevée sur le VPS.
+    PAYLOAD = {
+        "five_hour": {
+            "utilization": 82.0, "resets_at": "2026-08-11T07:00:00.299210+00:00",
+            "limit_dollars": None,
+        },
+        "seven_day": {
+            "utilization": 12.0, "resets_at": "2026-08-17T17:00:00.299237+00:00",
+        },
+    }
+
+    def test_both_windows_are_read_from_the_oauth_payload(self) -> None:
+        windows = acp_server.claude_usage_windows(self.PAYLOAD)
+
+        self.assertEqual(windows["five_hour"]["percent"], 82)
+        self.assertEqual(
+            windows["five_hour"]["resetsAt"], "2026-08-11T07:00:00.299210+00:00"
+        )
+        self.assertEqual(windows["seven_day"]["percent"], 12)
+
+    def test_what_the_cli_now_returns_yields_no_window(self) -> None:
+        """La sortie réelle de `claude -p /usage` en 2.1.220.
+
+        Elle ne doit surtout pas être lue comme une jauge : c'est un
+        récapitulatif de coût, pas un relevé de plafond.
+        """
+        result = (
+            "Total cost:            $0.0000\n"
+            "Total duration (API):  0s\n"
+            "Usage:                 0 input, 0 output, 0 cache read, 0 cache write"
+        )
+        self.assertEqual(acp_server.parse_claude_usage(result), {})
+
+    def test_a_missing_or_broken_window_is_left_out(self) -> None:
+        windows = acp_server.claude_usage_windows({
+            "five_hour": {"utilization": None},
+            "seven_day": {"utilization": 7.0},
+        })
+
+        self.assertNotIn("five_hour", windows)
+        self.assertEqual(windows["seven_day"]["percent"], 7)
+        self.assertIsNone(windows["seven_day"]["resetsAt"])
+
+    def test_the_call_carries_the_headers_the_cli_uses(self) -> None:
+        """Les identifiants viennent du CLI, et l'appel se présente comme lui.
+
+        Sans l'en-tête `anthropic-beta`, l'endpoint refuse la requête : ce sont
+        ces quatre lignes qui font la différence entre une jauge et un 401.
+        """
+        seen: dict[str, Any] = {}
+
+        class Response:
+            def read(self) -> bytes:
+                return json.dumps(ClaudeUsageEndpointTests.PAYLOAD).encode()
+
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+
+        def fake_open(request, timeout=0):
+            seen["url"] = request.full_url
+            seen["headers"] = {k.lower(): v for k, v in request.headers.items()}
+            return Response()
+
+        credentials = json.dumps({"claudeAiOauth": {"accessToken": "jeton-local"}})
+        with tempfile.TemporaryDirectory() as home:
+            claude = Path(home) / ".claude"
+            claude.mkdir()
+            (claude / ".credentials.json").write_text(credentials, encoding="utf-8")
+            with mock.patch.object(acp_server.Path, "home", return_value=Path(home)), \
+                 mock.patch.object(acp_server.urllib.request, "urlopen", fake_open):
+                windows = acp_server.claude_quota_windows()
+
+        self.assertEqual(windows["five_hour"]["percent"], 82)
+        self.assertEqual(seen["url"], acp_server.CLAUDE_USAGE_URL)
+        self.assertEqual(seen["headers"]["authorization"], "Bearer jeton-local")
+        self.assertEqual(seen["headers"]["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(seen["headers"]["anthropic-version"], "2023-06-01")
+
+    def test_a_rate_limited_endpoint_keeps_the_previous_gauge(self) -> None:
+        """Le `429` est le régime normal de cet endpoint, pas une panne.
+
+        La jauge doit garder sa dernière valeur plutôt que disparaître — c'est
+        exactement ce que le cache promet, et ce qui rend l'endpoint utilisable.
+        """
+        cache = acp_server.QuotaCache(ttl=900.0, retry=120.0)
+        first = cache.read(lambda: {"five_hour": {"percent": 82, "resetsAt": None}})
+        self.assertEqual(first["five_hour"]["percent"], 82)
+
+        cache.next_read = 0.0  # l'échéance est passée
+
+        def refused() -> dict[str, Any]:
+            raise urllib.error.HTTPError(
+                acp_server.CLAUDE_USAGE_URL, 429, "Too Many Requests", {}, None
+            )
+
+        self.assertEqual(cache.read(refused)["five_hour"]["percent"], 82)
+
+    def test_the_delay_asked_by_the_endpoint_is_honoured(self) -> None:
+        """Relevé sur le VPS : `Retry-After: 2353`, soit trente-neuf minutes.
+
+        Réessayer toutes les deux minutes ne fait que prolonger la punition sans
+        jamais obtenir la jauge.
+        """
+        cache = acp_server.QuotaCache(ttl=1_800.0, retry=120.0)
+        cache.value = {"five_hour": {"percent": 82, "resetsAt": None}}
+        cache.next_read = 0.0
+
+        def refused() -> dict[str, Any]:
+            raise urllib.error.HTTPError(
+                acp_server.CLAUDE_USAGE_URL, 429, "Too Many Requests",
+                {"Retry-After": "2353"}, None,
+            )
+
+        before = time.monotonic()
+        cache.read(refused)
+
+        self.assertGreaterEqual(cache.next_read - before, 2_353)
+        # Et sans en-tête, on retombe sur le repli maison plutôt que sur zéro.
+        self.assertEqual(acp_server.retry_after_seconds(RuntimeError("rien")), 0.0)
+
+
 class ClaudeQuotaTests(unittest.TestCase):
     """Ce que `/usage` sait dire, et ce qu'il faut en tirer sans se tromper.
 
@@ -649,27 +780,10 @@ class ClaudeQuotaTests(unittest.TestCase):
     def test_prose_without_any_window_yields_nothing(self) -> None:
         self.assertEqual(acp_server.parse_claude_usage("Total cost: $0.0000"), {})
 
-    def test_the_environment_token_is_dropped_for_this_call_only(self) -> None:
-        # Le jeton de `setup-token` fait tourner les moteurs mais ferme
-        # `/usage`, et il l'emporte sur la session dès qu'il est présent.
-        seen: dict[str, Any] = {}
-
-        def fake_run(_args, **kwargs):
-            seen.update(kwargs["env"])
-            return types.SimpleNamespace(
-                returncode=0, stdout=json.dumps({"result": self.VPS}), stderr="",
-            )
-
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "jeton"}), \
-             mock.patch.object(acp_server.subprocess, "run", side_effect=fake_run):
-            windows = acp_server.claude_quota_windows()
-            # L'environnement du serveur, lui, garde son jeton : les tours en
-            # dépendent, et c'est ce qui fait qu'une session morte ne coûte que
-            # la jauge.
-            self.assertEqual(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), "jeton")
-
-        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", seen)
-        self.assertEqual(windows["five_hour"]["percent"], 52)
+    # Le test du jeton d'environnement écarté pour ce seul appel est parti avec
+    # son mécanisme : les plafonds ne passent plus par `claude -p /usage`, donc
+    # `CLAUDE_CODE_OAUTH_TOKEN` n'intervient plus dans leur lecture. Voir
+    # `ClaudeUsageEndpointTests` pour la source qui l'a remplacé.
 
 
 class CodexQuotaTests(unittest.TestCase):

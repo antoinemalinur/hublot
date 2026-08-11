@@ -1422,9 +1422,11 @@ class PromptTurn:
 # ---------------------------------------------------------------------------
 WEEK_MINUTES = 7 * 24 * 60
 
-# `/usage` frappe un endpoint qui bannit pour un quart d'heure au moindre excès.
-# Une jauge de cinq heures n'a aucun besoin d'être plus fraîche que ça.
-CLAUDE_QUOTA_TTL = 900.0
+# L'endpoint d'usage de Claude est le plus avare des deux : relevé sur le VPS, un
+# excès rend `Retry-After: 2353` — près de quarante minutes de punition. Une demi
+# -heure entre deux lectures reste très en deçà de ce que tolère une jauge de cinq
+# heures, et laisse la place à un autre client du même compte.
+CLAUDE_QUOTA_TTL = 1_800.0
 # `codex app-server` est local et gratuit, mais lancer un processus toutes les
 # huit secondes — la cadence des mesures de contexte — n'aurait aucun sens.
 CODEX_QUOTA_TTL = 300.0
@@ -1522,9 +1524,14 @@ class QuotaCache:
         try:
             fresh = fetch()
         except Exception as exc:  # noqa: BLE001 — jamais fatal pour un tour
-            log(f"plafonds illisibles : {exc!r}")
+            # Quand le moteur dit lui-même dans combien de temps revenir, on
+            # l'écoute. `/api/oauth/usage` répond `Retry-After: 2353` — près de
+            # quarante minutes — et réessayer toutes les deux minutes ne fait
+            # que prolonger la punition sans jamais obtenir la jauge.
+            delay = max(self.retry, retry_after_seconds(exc))
+            log(f"plafonds illisibles : {exc!r} (nouvel essai dans {delay:.0f} s)")
             with self._maybe_lock(locked):
-                self.next_read = now + self.retry
+                self.next_read = now + delay
                 return self.value
         with self._maybe_lock(locked):
             if fresh:
@@ -1539,32 +1546,84 @@ class QuotaCache:
         return self.lock if locked else contextlib.nullcontext()
 
 
+def retry_after_seconds(error: Exception) -> float:
+    """Le délai que le serveur demande d'attendre, ou zéro s'il n'en donne pas."""
+    headers = getattr(error, "headers", None)
+    if headers is None:
+        return 0.0
+    try:
+        return max(0.0, float(headers.get("Retry-After") or 0))
+    except (TypeError, ValueError):
+        # Certaines API répondent une date HTTP plutôt qu'un nombre de secondes.
+        return 0.0
+
+
 CLAUDE_QUOTA = QuotaCache(CLAUDE_QUOTA_TTL, QUOTA_RETRY)
 CODEX_QUOTA = QuotaCache(CODEX_QUOTA_TTL, QUOTA_RETRY)
 
 
 def claude_quota_windows() -> dict[str, Any]:
-    """Les plafonds de Claude, demandés au CLI comme le ferait un terminal.
+    """Les plafonds de Claude, là où ils sont réellement lisibles.
 
-    `CLAUDE_CODE_OAUTH_TOKEN` est écarté **pour ce seul appel**. Le jeton de
-    `setup-token` fait tourner les moteurs mais n'ouvre pas `/usage`, qui exige
-    la session `claude.ai` ; et il l'emporte sur elle dès qu'il est présent dans
-    l'environnement. Les deux identités cohabitent donc, chacune pour ce qu'elle
-    sait faire — et une session qui expire ne coûte plus que la jauge, jamais le
-    moteur. C'est très précisément la panne du 8 août : la session est morte, et
-    avec elle **tous** les tours Claude.
+    C'est l'endpoint que le CLI interroge lui-même, avec les identifiants qu'il
+    a déposés sur cette machine : on demande donc bien au moteur ce qu'il sait,
+    sans passer par un service qui ne nous appartient pas.
+
+    Ce qui a changé, et pourquoi : `claude -p /usage` ne répond plus ce qu'on
+    croyait. Hors session interactive, le CLI ne traite pas `/usage` comme une
+    commande mais comme une demande ordinaire — relevé sur le VPS en 2.1.220, il
+    rend `num_turns: 0` et un `result` qui récapitule le coût de la session,
+    jamais « Current session: X% used ». Le parseur n'y trouvait aucune fenêtre,
+    et la barre perdait sa cellule dès qu'on passait sur Claude.
+
+    L'endpoint est agressivement limité : deux appels rapprochés suffisent à
+    obtenir un `429`. C'est `QuotaCache` qui le protège — un quart d'heure entre
+    deux lectures, un repli plus long après un échec, et jamais de valeur vidée.
     """
-    env = dict(os.environ)
-    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-    done = subprocess.run(
-        ["claude", "-p", "/usage", "--output-format", "json"],
-        capture_output=True, text=True, timeout=QUOTA_TIMEOUT,
-        env=env, cwd=REPOS_BASE, stdin=subprocess.DEVNULL,
-    )
-    if done.returncode != 0:
-        raise RuntimeError(f"/usage a rendu {done.returncode}")
-    payload = json.loads(done.stdout)
-    return parse_claude_usage(str(payload.get("result") or ""))
+    try:
+        oauth = json.loads(
+            (Path.home() / ".claude" / ".credentials.json").read_text(encoding="utf-8")
+        )["claudeAiOauth"]
+        token = str(oauth["accessToken"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"identifiants OAuth Claude illisibles : {exc}") from exc
+
+    request = urllib.request.Request(CLAUDE_USAGE_URL, method="GET", headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "anthropic-version": "2023-06-01",
+        "User-Agent": "claude-cli/2.1.220",
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(request, timeout=QUOTA_TIMEOUT) as response:
+        return claude_usage_windows(json.loads(response.read().decode("utf-8")))
+
+
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def claude_usage_windows(payload: dict[str, Any]) -> dict[str, Any]:
+    """Les deux fenêtres, telles que l'endpoint OAuth les nomme.
+
+    `utilization` est un pourcentage déjà borné à cent, `resets_at` un instant
+    ISO. Une fenêtre absente est simplement absente : mieux vaut une jauge en
+    moins qu'un chiffre inventé.
+    """
+    windows: dict[str, Any] = {}
+    for key in ("five_hour", "seven_day"):
+        entry = payload.get(key)
+        if not isinstance(entry, dict):
+            continue
+        try:
+            percent = round(float(entry["utilization"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        resets = entry.get("resets_at")
+        windows[key] = {
+            "percent": percent,
+            "resetsAt": resets if isinstance(resets, str) and resets else None,
+        }
+    return windows
 
 
 def parse_claude_usage(text: str) -> dict[str, Any]:
