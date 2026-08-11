@@ -900,6 +900,16 @@ class PromptTurn:
             if not event.get("is_error"):
                 return str(event.get("stop_reason") or "end_turn")
 
+            # Couper un tour le fait finir en erreur : le moteur meurt sur son
+            # signal et rend `error_during_execution`. Ce n'est pas une panne à
+            # rapporter, c'est le bouton d'arrêt qui a fonctionné. L'afficher
+            # posait « ⚠️ error_during_execution » dans le fil juste avant
+            # « interrompu » — deux lignes pour un seul geste, dont une qui
+            # ressemblait à un incident.
+            if self.cancelled:
+                log("tour arrêté à la demande")
+                return "cancelled"
+
             # Un tour refusé sans un mot est le pire des cas : la réponse
             # s'arrête au milieu d'une phrase et rien ne dit pourquoi. Claude
             # donne la raison — « Output blocked by content filtering policy »,
@@ -934,7 +944,9 @@ class PromptTurn:
         if not force and now - self.context_pushed_at < self.CONTEXT_INTERVAL:
             return
         self.context_pushed_at = now
-        await self.session.send_status(used=self.context_used)
+        # Une mesure du tour en cours : elle n'existe nulle part ailleurs, elle
+        # entre donc dans le fil.
+        await self.session.send_status(used=self.context_used, persist=True)
 
     async def _translate_stream(self, inner: dict[str, Any]) -> None:
         kind = inner.get("type")
@@ -1101,7 +1113,8 @@ class PromptTurn:
         # Codex n'a pas d'équivalent de l'événement `result` de Claude : sa
         # consommation de contexte n'existe que dans son propre journal, et
         # c'est maintenant qu'il vient de le refermer qu'on peut l'y lire.
-        await self.session.send_status()
+        # C'est la seule mesure du tour : elle est neuve, elle se garde.
+        await self.session.send_status(persist=True)
         return reason
 
     async def _codex_attempt(self, prompt: str, handoff_path: str | None,
@@ -1793,7 +1806,8 @@ class Session:
             {"sessionUpdate": "hublot_activity", **payload}, persist=False
         )
 
-    async def send_status(self, used: int = 0, size: int = 0) -> None:
+    async def send_status(self, used: int = 0, size: int = 0,
+                          *, persist: bool = False) -> None:
         """L'état complet, sur le même canal que la consommation de contexte.
 
         Les plafonds voyagent dans `_meta` : un client ACP ordinaire les ignore,
@@ -1803,6 +1817,14 @@ class Session:
         Envoyer zéro effaçait la cellule « CTX » de la barre à chaque ouverture
         de conversation et à chaque changement de réglage — le chiffre ne
         revenait qu'au tour suivant, et jamais du tout sous Codex.
+
+        `persist` sépare les deux natures d'appel, et son défaut est « non » :
+        seule une mesure **nouvelle** entre dans le fil. Republier un état déjà
+        connu — à l'ouverture d'une conversation, au changement de réglage —
+        réécrivait le journal, donc son `mtime` ; une conversation seulement
+        ouverte se datait alors de l'instant, et remontait en tête des listes
+        comme si on venait d'y écrire. Chaque réouverture ajoutait en prime un
+        palier à la marée de contexte qui n'avait jamais été mesuré.
         """
         # Au repos, la barre suit le choix explicite — même si son quota impose
         # momentanément un relais. Pendant un tour, le moteur qui travaille
@@ -1851,7 +1873,7 @@ class Session:
                 "engine": engine,
                 "limits": limits,
             }},
-        })
+        }, persist=persist)
 
     async def update(self, payload: dict[str, Any], *, persist: bool = True) -> None:
         if persist:

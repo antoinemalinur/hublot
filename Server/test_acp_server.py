@@ -41,7 +41,17 @@ sys.modules.setdefault("bot", types.SimpleNamespace(
     CODEX_LAST_MESSAGE="/tmp/codex-last-message",
     CODEX_EFFORT_FILE="/tmp/codex-effort",
     state_lock=threading.RLock(),
-    state={"codex_effort": "low"},
+    # `send_status` lit l'état comme le ferait le relais : le moteur épinglé,
+    # le modèle Claude et son effort. Une doublure amputée faisait passer une
+    # `KeyError` pour un comportement du serveur.
+    state={
+        "codex_effort": "low", "manual_engine": "claude",
+        "model": "opus", "claude_effort": "high",
+    },
+    MODELS={"opus": ("claude-opus-5", "Opus", 200_000)},
+    CLAUDE_EFFORTS=("high",),
+    CLAUDE_EFFORT_FILE="/tmp/claude-effort",
+    engine_for_next_task=lambda: "claude",
     save_effort=lambda _path, _effort: None,
     log=lambda _message: None,
     # Les trois verdicts que le relais rend sur une sortie de moteur. Les
@@ -62,7 +72,8 @@ class RecordingSession:
     def __init__(self) -> None:
         self.statuses: list[tuple[int, int]] = []
 
-    async def send_status(self, used: int = 0, size: int = 0) -> None:
+    async def send_status(self, used: int = 0, size: int = 0,
+                          *, persist: bool = False) -> None:
         self.statuses.append((used, size))
 
 
@@ -119,6 +130,101 @@ class ConnectionSurvivalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(recorded, [{"sessionUpdate": "agent_message_chunk"}])
         self.assertTrue(session._notification_failed)
+
+
+class SilentConnection:
+    """Une liaison qui accepte tout sans rien faire.
+
+    Ce qui compte ici est ce que le serveur **écrit sur disque**, pas ce qu'il
+    envoie au téléphone.
+    """
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, Any] = {}
+
+    async def notify(self, _method: str, _params: dict) -> None:
+        return None
+
+
+class OpeningAConversationTests(unittest.IsolatedAsyncioTestCase):
+    """Ouvrir une conversation ne doit pas compter comme y avoir écrit.
+
+    Le cas signalé depuis l'iPhone le 10 août 2026 : toucher une discussion
+    sans rien taper, et la voir aussitôt datée « il y a deux secondes ».
+
+    Le fil de ce test n'a **aucun horodatage par message** : c'est l'état de
+    toutes les conversations déjà sur le VPS, écrites avant que `record` ne
+    date chaque ligne. Pour elles, la liste retombe sur le `mtime` du journal —
+    et `send_status()` le réécrivait à chaque ouverture.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.previous_state = acp_server.continuity.STATE
+        acp_server.continuity.STATE = Path(self.temporary.name)
+        self.cwd = "/tmp/repos/projet"
+        self.session_id = "fil-sans-horodatage"
+
+        transcript, _ = acp_server.continuity._paths(self.cwd, self.session_id)
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        with transcript.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(
+                {"role": "user", "engine": "claude", "text": "Ma demande d'hier"},
+                ensure_ascii=False,
+            ) + "\n")
+        # Une conversation d'il y a une heure, pas d'il y a deux secondes.
+        old = time.time() - 3_600
+        os.utime(transcript, (old, old))
+        self.transcript = transcript
+
+    def tearDown(self) -> None:
+        acp_server.continuity.STATE = self.previous_state
+        self.temporary.cleanup()
+
+    def _listed_date(self) -> str:
+        listed = acp_server.continuity.list_sessions(self.cwd)
+        return str(listed[0]["updatedAt"])
+
+    def _offline(self):
+        """Ni `claude -p /usage`, ni le journal du moteur : ni l'un ni l'autre
+        n'existe sur la machine de test, et aucun des deux n'est le sujet."""
+        return (
+            mock.patch.object(acp_server, "quota_snapshot", return_value={}),
+            mock.patch.object(
+                acp_server.Session, "measure_context", return_value=(0, 200_000)
+            ),
+        )
+
+    async def test_opening_a_conversation_does_not_redate_it(self) -> None:
+        before = self._listed_date()
+
+        quota, measure = self._offline()
+        with quota, measure:
+            # Le geste exact de l'utilisateur : ouvrir, sans rien écrire. C'est
+            # ce que `_load_session` fait en dernier.
+            session = acp_server.Session(SilentConnection(), self.session_id, self.cwd)
+            await session.send_status()
+
+        self.assertEqual(self._listed_date(), before)
+
+    async def test_a_turns_own_measurement_still_enters_the_thread(self) -> None:
+        """Le garde-fou ne doit pas emporter la marée de contexte avec lui.
+
+        Une mesure prise pendant un tour n'existe nulle part ailleurs : sans
+        elle, rouvrir un fil afficherait une jauge vide jusqu'au tour suivant.
+        """
+        session = acp_server.Session(SilentConnection(), self.session_id, self.cwd)
+
+        quota, measure = self._offline()
+        with quota, measure:
+            await session.send_status(used=17_050, size=200_000, persist=True)
+
+        measured = [
+            entry for entry in acp_server.continuity.replay(self.cwd, self.session_id)
+            if entry.get("role") == "usage"
+        ]
+        self.assertEqual(len(measured), 1)
+        self.assertEqual(measured[0]["update"]["used"], 17_050)
 
 
 class ConcurrentConversationCatalogTests(unittest.IsolatedAsyncioTestCase):
@@ -322,7 +428,8 @@ class AuthSession:
     async def notify_engine(self, engine: str, reason: str) -> None:
         self.engines.append((engine, reason))
 
-    async def send_status(self, used: int = 0, size: int = 0) -> None:
+    async def send_status(self, used: int = 0, size: int = 0,
+                          *, persist: bool = False) -> None:
         pass
 
     async def update(self, _payload: dict, persist: bool = True) -> None:
@@ -435,6 +542,46 @@ class ClaudeAuthenticationTests(unittest.IsolatedAsyncioTestCase):
             }):
                 (Path(empty) / ".credentials.json").write_text("{}", encoding="utf-8")
                 self.assertIn("OAuth", acp_server.claude_auth_source())
+
+
+class CancelledTurnTests(unittest.IsolatedAsyncioTestCase):
+    """Arrêter un tour est un geste réussi, pas un incident.
+
+    Signalé depuis l'iPhone le 10 août 2026 : toucher le bouton d'arrêt
+    inscrivait « ⚠️ error_during_execution » dans le fil, juste avant
+    « interrompu ». Le moteur meurt sur son signal et Claude clôt le tour par un
+    `result` en erreur — c'est la mécanique de l'arrêt, pas une panne à lire.
+    """
+
+    async def test_stopping_a_turn_writes_no_error_in_the_thread(self) -> None:
+        session = AuthSession()
+        turn = acp_server.PromptTurn(session, "question")
+        await turn.cancel()
+
+        reason = await turn._translate({
+            "type": "result",
+            "is_error": True,
+            "subtype": "error_during_execution",
+        })
+
+        self.assertEqual(reason, "cancelled")
+        self.assertEqual(session.texts, [])
+
+    async def test_a_real_failure_is_still_reported(self) -> None:
+        """Le garde-fou ne doit pas rendre le serveur muet sur les vraies pannes."""
+        session = AuthSession()
+        turn = acp_server.PromptTurn(session, "question")
+
+        reason = await turn._translate({
+            "type": "result",
+            "is_error": True,
+            "result": "Output blocked by content filtering policy",
+        })
+
+        self.assertEqual(reason, "refusal")
+        self.assertTrue(
+            any("content filtering" in text for text in session.texts), session.texts
+        )
 
 
 class ClaudeQuotaTests(unittest.TestCase):
@@ -603,7 +750,8 @@ class ActiveTurnConfigurationTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self) -> None:
                 self.statuses = 0
 
-            async def send_status(self) -> None:
+            async def send_status(self, used: int = 0, size: int = 0,
+                                  *, persist: bool = False) -> None:
                 self.statuses += 1
 
         class Turn:
@@ -649,7 +797,8 @@ class ActiveTurnConfigurationTests(unittest.IsolatedAsyncioTestCase):
             cwd = "/tmp/repos/projet"
             turn = None
 
-            async def send_status(self) -> None:
+            async def send_status(self, used: int = 0, size: int = 0,
+                                  *, persist: bool = False) -> None:
                 raise RuntimeError("quota illisible")
 
         class Turn:
