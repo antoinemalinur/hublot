@@ -14,6 +14,8 @@
         case sessionsError = "sessions-error"
         case sessionsInstructions = "sessions-instructions"
         case concurrentConversations = "concurrent-conversations"
+        case conversationAge = "conversation-age"
+        case engineSwitchQuota = "engine-switch-quota"
         case conversation
         case conversationWorking = "conversation-working"
         case codexQuota = "codex-quota"

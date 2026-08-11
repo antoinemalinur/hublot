@@ -31,6 +31,10 @@ struct IAClient_UIApp: App {
                     ConversationView.screenTestDemo
                 case .concurrentConversations:
                     ConcurrentConversationsFixture()
+                case .conversationAge:
+                    ConversationAgeFixture()
+                case .engineSwitchQuota:
+                    EngineSwitchQuotaFixture()
                 case .conversationWorking:
                     ConversationQueueFixture()
                 case .sessions, .sessionsInstructions:
@@ -281,6 +285,267 @@ struct IAClient_UIApp: App {
                 "method": "session/update",
                 "params": ["sessionId": sessionId, "update": update],
             ])
+        }
+
+        private func emit(_ object: [String: Any]) {
+            guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+            continuation.yield(data)
+        }
+    }
+
+    /// Le parcours de la date : une conversation vieille de trente minutes,
+    /// qu'on ouvre puis qu'on quitte.
+    ///
+    /// Le relais témoin renvoie **toujours** le même instant, calculé une fois
+    /// au démarrage. Rien de ce que fait l'app ne peut donc changer cette date :
+    /// si l'écran finit par annoncer « il y a quelques secondes », c'est que
+    /// l'app l'a inventée — ouvrir une conversation n'est pas y écrire.
+    private struct ConversationAgeFixture: View {
+        @State private var model: AppModel
+
+        init() {
+            let transport = ConversationAgeTransport()
+            var environment = HublotEnvironment.ephemeral(
+                serverURL: "ws://127.0.0.1:8326", token: "ui-test",
+                makeConnection: { _, _ in ACPConnection(transport: transport) }
+            )
+            environment.sleep = { duration in try await Task.sleep(for: duration) }
+            _model = State(initialValue: AppModel(environment: environment))
+        }
+
+        var body: some View {
+            Group {
+                switch model.screen {
+                case .sessions(let project):
+                    SessionsView(model: model, project: project)
+                case .conversation:
+                    if let chat = model.chat {
+                        ConversationView(
+                            sessionTitle: chat.title, engine: chat.engine,
+                            turns: chat.turns,
+                            onBack: { model.closeConversation() },
+                            onDictate: { _ in nil }
+                        )
+                    }
+                default:
+                    HoldingView(purpose: .launching) {}
+                }
+            }
+            .task {
+                await model.connect()
+                guard let project = model.projects.first(where: { $0.name == "hublot" })
+                else { return }
+                await model.open(project)
+            }
+        }
+    }
+
+    private actor ConversationAgeTransport: ACPTransport {
+        private let stream: AsyncThrowingStream<Data, Error>
+        private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+        /// Trente minutes, figées au lancement : le serveur ne redate jamais
+        /// cette conversation, quoi qu'on lui demande.
+        private let recordedAt = Date().addingTimeInterval(-1_800)
+
+        init() {
+            let pair = AsyncThrowingStream<Data, Error>.makeStream()
+            stream = pair.stream
+            continuation = pair.continuation
+        }
+
+        var frames: AsyncThrowingStream<Data, Error> { stream }
+        func connect() async throws {}
+        func disconnect() async { continuation.finish() }
+
+        private var iso: String {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime]
+            return formatter.string(from: recordedAt)
+        }
+
+        func send(_ frame: Data) async throws {
+            guard let request = try JSONSerialization.jsonObject(with: frame) as? [String: Any],
+                let method = request["method"] as? String,
+                let id = request["id"] as? Int
+            else { return }
+
+            switch method {
+            case "initialize":
+                reply(id, [
+                    "protocolVersion": 1,
+                    "agentCapabilities": [
+                        "loadSession": true,
+                        "sessionCapabilities": ["list": [:], "resume": [:]],
+                    ],
+                ])
+            case "hublot/projects":
+                reply(id, ["projects": [[
+                    "name": "hublot", "path": "/root/repos/hublot",
+                    "sessionCount": 1, "updatedAt": iso,
+                ]]])
+            case "session/list":
+                reply(id, ["sessions": [[
+                    "sessionId": "fil-ancien", "cwd": "/root/repos/hublot",
+                    "title": "Corrige le compteur", "updatedAt": iso, "exchanges": 2,
+                ]]])
+            case "session/load":
+                reply(id, ["configOptions": []])
+            case "hublot/running":
+                reply(id, ["turns": []])
+            case "hublot/instructions":
+                reply(id, ["instructions": NSNull()])
+            default:
+                reply(id, [:])
+            }
+        }
+
+        private func reply(_ id: Int, _ result: [String: Any]) {
+            guard let data = try? JSONSerialization.data(withJSONObject: [
+                "jsonrpc": "2.0", "id": id, "result": result,
+            ]) else { return }
+            continuation.yield(data)
+        }
+    }
+
+    /// Une conversation neuve, ouverte sous Codex, qu'on bascule sur Claude.
+    ///
+    /// Le relais témoin répond comme le VPS le jour du signalement : `/usage`
+    /// ne rend à Claude que sa fenêtre hebdomadaire, sans la session de 5 h.
+    /// La barre doit continuer d'afficher un plafond — c'est sa disparition
+    /// qui était le défaut.
+    private struct EngineSwitchQuotaFixture: View {
+        @State private var model: AppModel
+
+        init() {
+            let transport = EngineSwitchTransport()
+            var environment = HublotEnvironment.ephemeral(
+                serverURL: "ws://127.0.0.1:8327", token: "ui-test",
+                makeConnection: { _, _ in ACPConnection(transport: transport) }
+            )
+            environment.sleep = { duration in try await Task.sleep(for: duration) }
+            _model = State(initialValue: AppModel(environment: environment))
+        }
+
+        var body: some View {
+            Group {
+                if let chat = model.chat {
+                    ConversationView(
+                        sessionTitle: chat.title, engine: chat.engine,
+                        turns: chat.turns,
+                        onBack: { model.closeConversation() },
+                        configOptions: chat.configOptions,
+                        status: chat.metrics,
+                        contextPercent: chat.contextPercent,
+                        onChoose: { option, value in
+                            Task { await chat.choose(option, value: value) }
+                        },
+                        onDictate: { _ in nil }
+                    )
+                } else {
+                    HoldingView(purpose: .launching) {}
+                }
+            }
+            .task {
+                await model.connect()
+                guard let project = model.projects.first(where: { $0.name == "hublot" })
+                else { return }
+                // Le geste : une conversation neuve, pas une reprise.
+                await model.startSession(in: project)
+            }
+        }
+    }
+
+    private actor EngineSwitchTransport: ACPTransport {
+        private let stream: AsyncThrowingStream<Data, Error>
+        private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+        private var engine = "codex"
+
+        init() {
+            let pair = AsyncThrowingStream<Data, Error>.makeStream()
+            stream = pair.stream
+            continuation = pair.continuation
+        }
+
+        var frames: AsyncThrowingStream<Data, Error> { stream }
+        func connect() async throws {}
+        func disconnect() async { continuation.finish() }
+
+        /// Les réglages tels que le serveur les publie — `engine` au singulier,
+        /// comme `acp_server.py`.
+        private var options: [[String: Any]] {
+            [[
+                "id": "engine", "name": "Moteur", "category": "mode", "type": "select",
+                "currentValue": engine,
+                "options": [
+                    ["value": "claude", "name": "Claude"],
+                    ["value": "codex", "name": "Codex"],
+                ],
+            ]]
+        }
+
+        /// Codex annonce sa semaine ; Claude, sur ce compte, **aussi** — sa
+        /// session de 5 h n'est pas lisible. C'est le cas où la cellule
+        /// disparaissait faute de repli.
+        private var limits: [String: Any] {
+            ["seven_day": ["percent": engine == "codex" ? 36 : 47,
+                           "resetsAt": "2099-01-01T00:00:00Z"]]
+        }
+
+        func send(_ frame: Data) async throws {
+            guard let request = try JSONSerialization.jsonObject(with: frame) as? [String: Any],
+                let method = request["method"] as? String,
+                let id = request["id"] as? Int
+            else { return }
+            let params = request["params"] as? [String: Any] ?? [:]
+
+            switch method {
+            case "initialize":
+                reply(id, [
+                    "protocolVersion": 1,
+                    "agentCapabilities": ["loadSession": true,
+                                          "sessionCapabilities": ["list": [:]]],
+                ])
+            case "hublot/projects":
+                reply(id, ["projects": [[
+                    "name": "hublot", "path": "/root/repos/hublot",
+                    "sessionCount": 0, "updatedAt": "2026-08-10T19:00:00Z",
+                ]]])
+            case "session/new":
+                reply(id, ["sessionId": "fil-neuf", "configOptions": options])
+                pushStatus()
+            case "session/set_config_option":
+                if String(describing: params["configId"] ?? "") == "engine" {
+                    engine = String(describing: params["value"] ?? "codex")
+                }
+                reply(id, ["configOptions": options])
+                pushStatus()
+            case "session/list":
+                reply(id, ["sessions": []])
+            case "hublot/running":
+                reply(id, ["turns": []])
+            case "hublot/instructions":
+                reply(id, ["instructions": NSNull()])
+            default:
+                reply(id, [:])
+            }
+        }
+
+        /// Le serveur republie l'état après chaque changement de réglage.
+        private func pushStatus() {
+            emit([
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": ["sessionId": "fil-neuf", "update": [
+                    "sessionUpdate": "usage_update", "used": 12_000, "size": 200_000,
+                    "_meta": ["hublot": [
+                        "model": engine == "codex" ? "GPT-5.6-Sol" : "Opus",
+                        "effort": "high", "engine": engine, "limits": limits,
+                    ]],
+                ]],
+            ])
+        }
+
+        private func reply(_ id: Int, _ result: [String: Any]) {
+            emit(["jsonrpc": "2.0", "id": id, "result": result])
         }
 
         private func emit(_ object: [String: Any]) {

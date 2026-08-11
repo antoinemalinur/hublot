@@ -227,6 +227,42 @@ final class SessionsScreenTests: HublotUITestCase {
         XCTAssertTrue(runningSession.exists)
     }
 
+    /// Le geste rapporté depuis l'iPhone le 10 août 2026 : toucher une
+    /// discussion sans rien y écrire, revenir, et la voir datée « il y a deux
+    /// secondes ».
+    ///
+    /// Le relais témoin fige la date à trente minutes et ne la bouge jamais.
+    /// Toute date plus fraîche à l'écran vient donc de l'app elle-même — soit
+    /// qu'elle l'invente, soit qu'elle cesse de demander au serveur.
+    func testOpeningAConversationDoesNotMakeItLookRecent() {
+        launch("conversation-age")
+
+        let row = app.buttons.matching(
+            NSPredicate(format: "label CONTAINS 'Corrige le compteur'")
+        ).firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        XCTAssertTrue(plainLabel(of: row).contains("il y a 30 min"), row.label)
+
+        row.tap()
+
+        // La conversation s'ouvre : c'est le geste, et il doit aboutir.
+        let back = element("conversation-back")
+        XCTAssertTrue(back.waitForExistence(timeout: 10))
+        back.tap()
+
+        let returned = app.buttons.matching(
+            NSPredicate(format: "label CONTAINS 'Corrige le compteur'")
+        ).firstMatch
+        XCTAssertTrue(returned.waitForExistence(timeout: 10))
+        let seen = plainLabel(of: returned)
+        XCTAssertTrue(seen.contains("il y a 30 min"), "vu : \(seen)")
+        // Et surtout pas ce qu'affichait le bug : une conversation qu'on vient
+        // seulement de consulter n'a pas été modifiée à l'instant.
+        XCTAssertFalse(seen.contains("il y a 0"), "vu : \(seen)")
+        XCTAssertFalse(seen.contains(" s"), "vu : \(seen)")
+        XCTAssertFalse(seen.contains("maintenant"), "vu : \(seen)")
+    }
+
     func testEmptyAndErrorStatesRemainReadable() {
         launch("sessions-empty")
         XCTAssertTrue(app.staticTexts["Aucune conversation"].waitForExistence(timeout: 3))
@@ -477,6 +513,41 @@ final class AccessibilityAndLayoutScreenTests: HublotUITestCase {
         let tokens = element("context-token-count")
         XCTAssertTrue(tokens.waitForExistence(timeout: 5))
         XCTAssertTrue(plainLabel(of: tokens).contains("jetons"), tokens.label)
+    }
+
+    /// Signalé depuis l'iPhone : ouvrir une conversation neuve, passer de Codex
+    /// à Claude, et voir la cellule de quota disparaître de la barre.
+    ///
+    /// Le relais témoin répond comme le VPS ce jour-là : Claude n'annonce que
+    /// sa fenêtre hebdomadaire, sans session de 5 h. La barre n'avait alors
+    /// aucun repli — là où Codex en a un depuis toujours dans l'autre sens.
+    func testStatusBarKeepsItsQuotaAfterSwitchingToClaude() {
+        launch("engine-switch-quota")
+
+        let status = element("status-bar")
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        XCTAssertTrue(status.label.contains("7J: 36%"), "vu : \(status.label)")
+
+        let engine = element("config-engine")
+        XCTAssertTrue(engine.waitForExistence(timeout: 5))
+        XCTAssertTrue(engine.label.contains("Codex"), "vu : \(engine.label)")
+        engine.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+
+        let claude = app.buttons["Claude"]
+        XCTAssertTrue(claude.waitForExistence(timeout: 5))
+        claude.tap()
+
+        // La bascule est faite : la barre doit toujours porter un plafond, et
+        // celui de Claude — pas celui qu'affichait Codex une seconde plus tôt.
+        let switched = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS '7J: 47%'"), object: status
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [switched], timeout: 10), .completed,
+            "vu : \(status.label)"
+        )
+        XCTAssertTrue(status.exists)
+        XCTAssertTrue(status.isHittable)
     }
 
     func testEngineCannotChangeWhileCodexIsStillRunning() {
