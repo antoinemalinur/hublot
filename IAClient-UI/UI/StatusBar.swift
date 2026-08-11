@@ -55,6 +55,12 @@ enum StatusBar {
             }
         } else if let window = status?.fiveHour {
             quota = ("5H", window)
+        } else if let weekly = status?.weekly {
+            // Claude se juge sur sa session de 5 h, mais l'endpoint d'usage ne
+            // la rend pas toujours. Sans ce repli, la cellule disparaissait
+            // purement et simplement au passage sur Claude : une jauge
+            // hebdomadaire, sous son vrai nom, vaut mieux qu'une barre muette.
+            quota = ("7J", weekly)
         } else {
             quota = nil
         }
