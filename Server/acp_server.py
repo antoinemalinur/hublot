@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import hashlib
 import json
 import os
@@ -135,6 +136,24 @@ CODEX_MODELS_CACHE = Path(
 CODEX_MODEL_FILE = Path(
     os.environ.get("ACP_CODEX_MODEL_FILE") or (Path(BASE) / "state" / "codex-model")
 )
+# La fenêtre publiée dans les événements du CLI est celle que sa surface locale
+# emploie avant compaction (258 400 aujourd'hui), pas la capacité globale du
+# modèle que la marée promet d'afficher. Les fiches API OpenAI donnent 1 050 000
+# jetons pour GPT-5.6, GPT-5.5 et GPT-5.4, mais 400 000 pour GPT-5.4 mini :
+# https://developers.openai.com/api/docs/models/gpt-5.6-sol
+# https://developers.openai.com/api/docs/models/gpt-5.5
+# https://developers.openai.com/api/docs/models/gpt-5.4
+# https://developers.openai.com/api/docs/models/gpt-5.4-mini
+CODEX_MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "gpt-5.6": 1_050_000,
+    "gpt-5.6-sol": 1_050_000,
+    "gpt-5.6-sol-wm": 1_050_000,
+    "gpt-5.6-terra": 1_050_000,
+    "gpt-5.6-luna": 1_050_000,
+    "gpt-5.5": 1_050_000,
+    "gpt-5.4": 1_050_000,
+    "gpt-5.4-mini": 400_000,
+}
 FALLBACK_CODEX_MODELS: tuple[dict[str, Any], ...] = (
     {
         "model": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol",
@@ -155,6 +174,15 @@ FALLBACK_CODEX_MODELS: tuple[dict[str, Any], ...] = (
         "defaultEffort": "medium",
     },
 )
+
+
+def codex_model_context_window(model: str, measured: int) -> int:
+    """Capacité globale du modèle, ou mesure du CLI si elle est inconnue.
+
+    Le repli est volontaire : une future famille ne doit pas hériter par
+    supposition de la fenêtre GPT-5.6.
+    """
+    return CODEX_MODEL_CONTEXT_WINDOWS.get(model, measured)
 
 
 def codex_model_catalog() -> dict[str, dict[str, Any]]:
@@ -473,6 +501,12 @@ class PromptTurn:
         # celle qui reste marquée « occupée » refuse tous les envois suivants.
         self.bound: list["Session"] = [session]
         self.text = text
+        # La liste doit pouvoir nommer un tour dès sa soumission, avant même
+        # que les pièces jointes aient fini d'être écrites ou que le moteur ait
+        # reçu la demande. Sinon un retour rapide à la liste prend un instantané
+        # où cette conversation n'existe pas encore, et elle y reste invisible.
+        self.submitted_at = continuity.now_iso()
+        self.prompt_recorded = False
         # Franchi quand le tour a vraiment rendu la main. Un `cancel()` envoie
         # un signal ; il ne dit pas que le processus est mort, et repartir avant
         # remettrait deux moteurs sur le même fichier.
@@ -580,6 +614,7 @@ class PromptTurn:
         # Le fil d'abord : la demande fait partie de ce que le moteur entrant
         # doit voir, même si c'est lui qui va y répondre.
         continuity.record(self.session.cwd, self.session.id, "user", self.text)
+        self.prompt_recorded = True
 
         # La passation ne contient que ce que ce moteur-là n'a pas vu **dans
         # cette conversation**. Rester sur le même moteur n'en produit aucune ;
@@ -866,6 +901,16 @@ class PromptTurn:
             if not event.get("is_error"):
                 return str(event.get("stop_reason") or "end_turn")
 
+            # Couper un tour le fait finir en erreur : le moteur meurt sur son
+            # signal et rend `error_during_execution`. Ce n'est pas une panne à
+            # rapporter, c'est le bouton d'arrêt qui a fonctionné. L'afficher
+            # posait « ⚠️ error_during_execution » dans le fil juste avant
+            # « interrompu » — deux lignes pour un seul geste, dont une qui
+            # ressemblait à un incident.
+            if self.cancelled:
+                log("tour arrêté à la demande")
+                return "cancelled"
+
             # Un tour refusé sans un mot est le pire des cas : la réponse
             # s'arrête au milieu d'une phrase et rien ne dit pourquoi. Claude
             # donne la raison — « Output blocked by content filtering policy »,
@@ -900,7 +945,9 @@ class PromptTurn:
         if not force and now - self.context_pushed_at < self.CONTEXT_INTERVAL:
             return
         self.context_pushed_at = now
-        await self.session.send_status(used=self.context_used)
+        # Une mesure du tour en cours : elle n'existe nulle part ailleurs, elle
+        # entre donc dans le fil.
+        await self.session.send_status(used=self.context_used, persist=True)
 
     async def _translate_stream(self, inner: dict[str, Any]) -> None:
         kind = inner.get("type")
@@ -1067,7 +1114,8 @@ class PromptTurn:
         # Codex n'a pas d'équivalent de l'événement `result` de Claude : sa
         # consommation de contexte n'existe que dans son propre journal, et
         # c'est maintenant qu'il vient de le refermer qu'on peut l'y lire.
-        await self.session.send_status()
+        # C'est la seule mesure du tour : elle est neuve, elle se garde.
+        await self.session.send_status(persist=True)
         return reason
 
     async def _codex_attempt(self, prompt: str, handoff_path: str | None,
@@ -1374,9 +1422,11 @@ class PromptTurn:
 # ---------------------------------------------------------------------------
 WEEK_MINUTES = 7 * 24 * 60
 
-# `/usage` frappe un endpoint qui bannit pour un quart d'heure au moindre excès.
-# Une jauge de cinq heures n'a aucun besoin d'être plus fraîche que ça.
-CLAUDE_QUOTA_TTL = 900.0
+# L'endpoint d'usage de Claude est le plus avare des deux : relevé sur le VPS, un
+# excès rend `Retry-After: 2353` — près de quarante minutes de punition. Une demi
+# -heure entre deux lectures reste très en deçà de ce que tolère une jauge de cinq
+# heures, et laisse la place à un autre client du même compte.
+CLAUDE_QUOTA_TTL = 1_800.0
 # `codex app-server` est local et gratuit, mais lancer un processus toutes les
 # huit secondes — la cadence des mesures de contexte — n'aurait aucun sens.
 CODEX_QUOTA_TTL = 300.0
@@ -1423,21 +1473,67 @@ class QuotaCache:
         self.retry = retry
         self.value: dict[str, Any] = {}
         self.next_read = 0.0
+        # Vrai pendant qu'un thread va chercher la valeur suivante : les autres
+        # appels se contentent de l'ancienne au lieu d'ouvrir un second processus.
+        self.refreshing = False
         # Le verrou évite la ruée : dix conversations qui s'ouvrent ensemble ne
         # doivent produire qu'une seule lecture.
         self.lock = threading.Lock()
 
     def read(self, fetch: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        """La dernière valeur connue, tout de suite.
+
+        Relire coûte un processus — `claude -p /usage` démarre un CLI Node, et
+        la borne est à 25 s. Payer cette attente dans l'appel qui ouvre une
+        conversation faisait patienter l'écran pour une jauge, alors qu'une
+        mesure vieille de quelques minutes fait exactement le même office.
+        L'échéance passée, on rend donc l'ancienne valeur et on va chercher la
+        neuve derrière ; seul le tout premier remplissage attend.
+        """
         now = time.monotonic()
         with self.lock:
             if now < self.next_read:
                 return self.value
-            try:
-                fresh = fetch()
-            except Exception as exc:  # noqa: BLE001 — jamais fatal pour un tour
-                log(f"plafonds illisibles : {exc!r}")
-                self.next_read = now + self.retry
+            if not self.value:
+                # Rien à montrer encore : cette fois-là, il faut bien attendre.
+                return self._renew(fetch, now)
+            if self.refreshing:
                 return self.value
+            self.refreshing = True
+
+        threading.Thread(
+            target=self._refresh, args=(fetch,), daemon=True,
+            name="hublot-quota",
+        ).start()
+        with self.lock:
+            return self.value
+
+    def _refresh(self, fetch: Callable[[], dict[str, Any]]) -> None:
+        """Le rafraîchissement de fond, verrou relâché pendant l'appel."""
+        try:
+            self._renew(fetch, time.monotonic(), locked=True)
+        finally:
+            with self.lock:
+                self.refreshing = False
+
+    def _renew(self, fetch: Callable[[], dict[str, Any]], now: float,
+               *, locked: bool = False) -> dict[str, Any]:
+        """Interroge le moteur et retient ce qu'il rend. Un échec ne vide jamais
+        la valeur : une jauge un peu vieille vaut mieux qu'une jauge qui
+        clignote."""
+        try:
+            fresh = fetch()
+        except Exception as exc:  # noqa: BLE001 — jamais fatal pour un tour
+            # Quand le moteur dit lui-même dans combien de temps revenir, on
+            # l'écoute. `/api/oauth/usage` répond `Retry-After: 2353` — près de
+            # quarante minutes — et réessayer toutes les deux minutes ne fait
+            # que prolonger la punition sans jamais obtenir la jauge.
+            delay = max(self.retry, retry_after_seconds(exc))
+            log(f"plafonds illisibles : {exc!r} (nouvel essai dans {delay:.0f} s)")
+            with self._maybe_lock(locked):
+                self.next_read = now + delay
+                return self.value
+        with self._maybe_lock(locked):
             if fresh:
                 self.value = fresh
                 self.next_read = now + self.ttl
@@ -1445,33 +1541,89 @@ class QuotaCache:
                 self.next_read = now + self.retry
             return self.value
 
+    def _maybe_lock(self, locked: bool):
+        """Le verrou, sauf quand l'appelant le tient déjà."""
+        return self.lock if locked else contextlib.nullcontext()
+
+
+def retry_after_seconds(error: Exception) -> float:
+    """Le délai que le serveur demande d'attendre, ou zéro s'il n'en donne pas."""
+    headers = getattr(error, "headers", None)
+    if headers is None:
+        return 0.0
+    try:
+        return max(0.0, float(headers.get("Retry-After") or 0))
+    except (TypeError, ValueError):
+        # Certaines API répondent une date HTTP plutôt qu'un nombre de secondes.
+        return 0.0
+
 
 CLAUDE_QUOTA = QuotaCache(CLAUDE_QUOTA_TTL, QUOTA_RETRY)
 CODEX_QUOTA = QuotaCache(CODEX_QUOTA_TTL, QUOTA_RETRY)
 
 
 def claude_quota_windows() -> dict[str, Any]:
-    """Les plafonds de Claude, demandés au CLI comme le ferait un terminal.
+    """Les plafonds de Claude, là où ils sont réellement lisibles.
 
-    `CLAUDE_CODE_OAUTH_TOKEN` est écarté **pour ce seul appel**. Le jeton de
-    `setup-token` fait tourner les moteurs mais n'ouvre pas `/usage`, qui exige
-    la session `claude.ai` ; et il l'emporte sur elle dès qu'il est présent dans
-    l'environnement. Les deux identités cohabitent donc, chacune pour ce qu'elle
-    sait faire — et une session qui expire ne coûte plus que la jauge, jamais le
-    moteur. C'est très précisément la panne du 8 août : la session est morte, et
-    avec elle **tous** les tours Claude.
+    C'est l'endpoint que le CLI interroge lui-même, avec les identifiants qu'il
+    a déposés sur cette machine : on demande donc bien au moteur ce qu'il sait,
+    sans passer par un service qui ne nous appartient pas.
+
+    Ce qui a changé, et pourquoi : `claude -p /usage` ne répond plus ce qu'on
+    croyait. Hors session interactive, le CLI ne traite pas `/usage` comme une
+    commande mais comme une demande ordinaire — relevé sur le VPS en 2.1.220, il
+    rend `num_turns: 0` et un `result` qui récapitule le coût de la session,
+    jamais « Current session: X% used ». Le parseur n'y trouvait aucune fenêtre,
+    et la barre perdait sa cellule dès qu'on passait sur Claude.
+
+    L'endpoint est agressivement limité : deux appels rapprochés suffisent à
+    obtenir un `429`. C'est `QuotaCache` qui le protège — un quart d'heure entre
+    deux lectures, un repli plus long après un échec, et jamais de valeur vidée.
     """
-    env = dict(os.environ)
-    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-    done = subprocess.run(
-        ["claude", "-p", "/usage", "--output-format", "json"],
-        capture_output=True, text=True, timeout=QUOTA_TIMEOUT,
-        env=env, cwd=REPOS_BASE, stdin=subprocess.DEVNULL,
-    )
-    if done.returncode != 0:
-        raise RuntimeError(f"/usage a rendu {done.returncode}")
-    payload = json.loads(done.stdout)
-    return parse_claude_usage(str(payload.get("result") or ""))
+    try:
+        oauth = json.loads(
+            (Path.home() / ".claude" / ".credentials.json").read_text(encoding="utf-8")
+        )["claudeAiOauth"]
+        token = str(oauth["accessToken"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"identifiants OAuth Claude illisibles : {exc}") from exc
+
+    request = urllib.request.Request(CLAUDE_USAGE_URL, method="GET", headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "anthropic-version": "2023-06-01",
+        "User-Agent": "claude-cli/2.1.220",
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(request, timeout=QUOTA_TIMEOUT) as response:
+        return claude_usage_windows(json.loads(response.read().decode("utf-8")))
+
+
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def claude_usage_windows(payload: dict[str, Any]) -> dict[str, Any]:
+    """Les deux fenêtres, telles que l'endpoint OAuth les nomme.
+
+    `utilization` est un pourcentage déjà borné à cent, `resets_at` un instant
+    ISO. Une fenêtre absente est simplement absente : mieux vaut une jauge en
+    moins qu'un chiffre inventé.
+    """
+    windows: dict[str, Any] = {}
+    for key in ("five_hour", "seven_day"):
+        entry = payload.get(key)
+        if not isinstance(entry, dict):
+            continue
+        try:
+            percent = round(float(entry["utilization"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        resets = entry.get("resets_at")
+        windows[key] = {
+            "percent": percent,
+            "resetsAt": resets if isinstance(resets, str) and resets else None,
+        }
+    return windows
 
 
 def parse_claude_usage(text: str) -> dict[str, Any]:
@@ -1669,7 +1821,12 @@ def running_turns() -> list[dict[str, Any]]:
 
 
 def session_catalog(cwd: str) -> list[dict[str, Any]]:
-    """Fusionne les fils natifs Claude et le fil commun utilisé par Codex."""
+    """Fusionne les fils natifs, le fil commun et les demandes en vol.
+
+    Un prompt avec image doit écrire sa pièce jointe avant d'entrer dans le
+    journal persistant. Pendant cette courte fenêtre, le registre des tours est
+    la seule source qui sache que la conversation existe déjà.
+    """
     merged: dict[str, dict[str, Any]] = {}
     for session in store.list_sessions(cwd):
         session_id = str(session.get("sessionId") or "")
@@ -1692,6 +1849,27 @@ def session_catalog(cwd: str) -> list[dict[str, Any]]:
             int(current.get("exchanges") or 0),
             int(session.get("exchanges") or 0),
         )
+
+    for session_id, turn in list(ACTIVE_TURNS.items()):
+        if turn.session.cwd != cwd:
+            continue
+        flat = " ".join(turn.text.split())
+        title = flat[:79] + "…" if len(flat) > 80 else flat
+        current = merged.get(session_id)
+        if current is None:
+            merged[session_id] = {
+                "sessionId": session_id,
+                "cwd": cwd,
+                "title": title or "Conversation avec image",
+                "updatedAt": turn.submitted_at,
+                "exchanges": 1,
+            }
+            continue
+        current["updatedAt"] = max(
+            str(current.get("updatedAt") or ""), turn.submitted_at
+        )
+        if not turn.prompt_recorded:
+            current["exchanges"] = int(current.get("exchanges") or 0) + 1
 
     sessions = list(merged.values())
     sessions.sort(key=lambda session: str(session.get("updatedAt") or ""), reverse=True)
@@ -1733,7 +1911,8 @@ class Session:
             {"sessionUpdate": "hublot_activity", **payload}, persist=False
         )
 
-    async def send_status(self, used: int = 0, size: int = 0) -> None:
+    async def send_status(self, used: int = 0, size: int = 0,
+                          *, persist: bool = False) -> None:
         """L'état complet, sur le même canal que la consommation de contexte.
 
         Les plafonds voyagent dans `_meta` : un client ACP ordinaire les ignore,
@@ -1743,6 +1922,14 @@ class Session:
         Envoyer zéro effaçait la cellule « CTX » de la barre à chaque ouverture
         de conversation et à chaque changement de réglage — le chiffre ne
         revenait qu'au tour suivant, et jamais du tout sous Codex.
+
+        `persist` sépare les deux natures d'appel, et son défaut est « non » :
+        seule une mesure **nouvelle** entre dans le fil. Republier un état déjà
+        connu — à l'ouverture d'une conversation, au changement de réglage —
+        réécrivait le journal, donc son `mtime` ; une conversation seulement
+        ouverte se datait alors de l'instant, et remontait en tête des listes
+        comme si on venait d'y écrire. Chaque réouverture ajoutait en prime un
+        palier à la marée de contexte qui n'avait jamais été mesuré.
         """
         # Au repos, la barre suit le choix explicite — même si son quota impose
         # momentanément un relais. Pendant un tour, le moteur qui travaille
@@ -1766,7 +1953,7 @@ class Session:
                     self.turn.model if self.turn and self.turn.model else str(bot.CODEX_MODEL)
                 )
                 effort = bot.state["codex_effort"]
-                context_size = size
+                context_size = codex_model_context_window(model_label, size)
             else:
                 model = bot.state["model"]
                 model_label = bot.MODELS[model][1]
@@ -1791,7 +1978,7 @@ class Session:
                 "engine": engine,
                 "limits": limits,
             }},
-        })
+        }, persist=persist)
 
     async def update(self, payload: dict[str, Any], *, persist: bool = True) -> None:
         if persist:
@@ -1939,10 +2126,15 @@ class Connection:
             return await self._new_session(params)
         if method == "session/load":
             return await self._load_session(params)
+        # Ces deux-là touchent le disque pour chaque conversation de chaque
+        # projet. Rendus depuis la boucle, ils y suspendaient tout le reste : le
+        # texte d'un tour en cours cessait d'arriver le temps d'un retour à la
+        # liste, et deux écrans ouverts se mettaient en file l'un derrière
+        # l'autre. Un thread rend la main immédiatement.
         if method == "session/list":
-            return self._list_sessions(params)
+            return await asyncio.to_thread(self._list_sessions, params)
         if method == "hublot/projects":
-            return self._list_projects()
+            return await asyncio.to_thread(self._list_projects)
         if method == "hublot/running":
             return {"turns": running_turns()}
         if method == "hublot/instructions":
@@ -2076,6 +2268,15 @@ class Connection:
         config_id = str(params.get("configId") or "")
         value = str(params.get("value") or "")
         switched = False
+        session = self.sessions.get(str(params.get("sessionId") or ""))
+
+        # Le moteur d'un processus déjà lancé ne peut pas être remplacé. Avant,
+        # le choix était tout de même persisté : le menu disait alors « Claude »
+        # tandis que le tour et sa barre continuaient honnêtement sous Codex.
+        # `permission` est le seul réglage qui puisse encore servir au tour en
+        # cours, notamment à son prochain appel de commande.
+        if session is not None and session.turn is not None and config_id != "permission":
+            raise ValueError("arrêtez le tour en cours avant de changer ce réglage")
 
         if config_id == "permission":
             if value not in {"ask", "auto"}:
@@ -2120,7 +2321,6 @@ class Connection:
         else:
             raise ValueError(f"réglage inconnu ou valeur refusée : {config_id}={value}")
 
-        session = self.sessions.get(str(params.get("sessionId") or ""))
         if session is not None:
             # Le client ne peut pas deviner ce que « Auto » a résolu : on le lui
             # dit, sinon la pastille du moteur reste sur sa valeur d'ouverture.
@@ -2470,22 +2670,11 @@ class Connection:
             for block in blocks
             if block.get("type") == "text"
         ).strip()
-
-        # Les images d'abord : elles peuvent constituer à elles seules la
-        # demande — « regarde ça » se dit très bien sans un mot.
-        paths = await asyncio.to_thread(self._store_images, session.cwd, blocks)
-        if paths:
-            listing = "\n".join(f"- {path}" for path in paths)
-            preamble = (
-                "Image jointe à cette demande, lis-la avec l'outil Read avant de répondre :"
-                if len(paths) == 1
-                else "Images jointes à cette demande, lis-les avec l'outil Read "
-                     "avant de répondre :"
-            )
-            joined = f"{preamble}\n{listing}"
-            text = f"{text}\n\n{joined}" if text else joined
-
-        if not text:
+        has_images = any(
+            isinstance(block, dict) and block.get("type") == "image"
+            for block in blocks
+        )
+        if not text and not has_images:
             return {"stopReason": "end_turn"}
 
         # Deux tours sur une même conversation, c'est deux processus qui se
@@ -2511,11 +2700,38 @@ class Connection:
             except asyncio.TimeoutError:
                 log(f"tour orphelin toujours vivant sur {session.id}, on continue")
 
+        # Inscrire le tour avant la première opération suspendue. `session/list`
+        # et `hublot/running` peuvent arriver sur la même liaison pendant le
+        # rangement d'une image ; ils doivent déjà voir ce second fil.
         turn = PromptTurn(session, text)
         session.turn = turn
         ACTIVE_TURNS[session.id] = turn
         try:
+            # Les images peuvent constituer à elles seules la demande —
+            # « regarde ça » se dit très bien sans un mot.
+            paths = await asyncio.to_thread(self._store_images, session.cwd, blocks) \
+                if has_images else []
+            if paths:
+                listing = "\n".join(f"- {path}" for path in paths)
+                preamble = (
+                    "Image jointe à cette demande, lis-la avec l'outil Read avant de répondre :"
+                    if len(paths) == 1
+                    else "Images jointes à cette demande, lis-les avec l'outil Read "
+                         "avant de répondre :"
+                )
+                joined = f"{preamble}\n{listing}"
+                text = f"{text}\n\n{joined}" if text else joined
+
+            if not text:
+                return {"stopReason": "end_turn"}
+            turn.text = text
+            # Le bouton d'arrêt peut maintenant atteindre le tour pendant le
+            # rangement de sa pièce jointe. S'il a été touché dans ce créneau,
+            # ne pas lancer le moteur une fois l'écriture terminée.
+            if turn.cancelled:
+                return {"stopReason": "cancelled"}
             stop_reason = await turn.run()
+            return {"stopReason": stop_reason}
         finally:
             # `detach` et non `session.turn = None` : une reprise de liaison a
             # pu rattacher ce tour à une seconde session, et celle qu'on oublie
@@ -2525,7 +2741,19 @@ class Connection:
             turn.finished.set()
             if ACTIVE_TURNS.get(session.id) is turn:
                 del ACTIVE_TURNS[session.id]
-        return {"stopReason": stop_reason}
+            # `send_status` donnait la priorité au moteur réellement en vol.
+            # Une fois le tour détaché, republier fait reprendre la main au
+            # choix configuré ; sinon la dernière jauge Codex restait affichée
+            # sous Claude jusqu'à la prochaine ouverture de la conversation.
+            #
+            # Cette republication est un confort d'affichage, jamais le verdict
+            # du tour : levée depuis un `finally`, son exception remplacerait
+            # celle du moteur — ou ferait échouer un tour qui a réussi. Le
+            # client verrait « erreur » pour une réponse qu'il a déjà reçue.
+            try:
+                await turn.session.send_status()
+            except Exception as error:  # noqa: BLE001
+                log(f"statut non republié sur {session.id} : {error}")
 
     async def _cancel(self, params: dict[str, Any]) -> None:
         session = self.sessions.get(str(params.get("sessionId") or ""))

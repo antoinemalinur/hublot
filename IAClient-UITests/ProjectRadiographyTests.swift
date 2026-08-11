@@ -201,11 +201,41 @@ struct ProjectRadiographyTests {
     @Test("Remonter la chronologie ne déplace aucune région")
     func placesDoNotMoveWhileScrubbing() throws {
         // Les places sont calculées sur le fil entier : une région apparue au
-        // trentième outil occupe déjà sa case au premier.
-        let early = RegionLayout.layout(totalSlots: 9, in: Self.field)
-        let late = RegionLayout.layout(totalSlots: 9, in: Self.field)
-        #expect(early == late)
-        #expect(early.slots[3] == late.slots[3])
+        // dernier outil occupe déjà sa case au premier. Sans ça, les continents
+        // tournent autour de l'écran pendant qu'on déplace la chronologie.
+        //
+        // Le fil est bâti pour que le nombre de régions **change** entre les
+        // deux instants : c'est la seule forme où un calcul fait sur l'instant
+        // visible donnerait un autre résultat que sur le fil entier.
+        let turns: [Turn] = [
+            .toolCall(.init(
+                id: "a", title: "App.swift", kind: .read, status: .completed,
+                location: "/root/repos/P/App/App.swift"
+            )),
+            .toolCall(.init(
+                id: "b", title: "Server.py", kind: .edit, status: .completed,
+                location: "/root/repos/P/Server/Server.py"
+            )),
+            .toolCall(.init(
+                id: "c", title: "Tests.swift", kind: .read, status: .completed,
+                location: "/root/repos/P/Tests/Tests.swift"
+            )),
+        ]
+        let map = ProjectRadiography(turns: turns)
+
+        let first = map.snapshot(through: 0)
+        let whole = map.snapshot()
+
+        // Une seule région est visible au premier pas, trois à la fin…
+        #expect(first.regions.count == 1)
+        #expect(whole.regions.count == 3)
+        // …mais la carte réserve dès le départ les places des trois.
+        #expect(first.totalSlots == whole.totalSlots)
+
+        // Et la région commune ne bouge pas d'une case entre les deux instants.
+        let early = try #require(first.regions.first)
+        let late = try #require(whole.regions.first { $0.id == early.id })
+        #expect(early.slot == late.slot)
     }
 
     @Test("Une carte terminée ne rend rien d'animé")
@@ -224,13 +254,18 @@ struct ProjectRadiographyTests {
                 location: "/root/repos/P/Server/B.swift"
             )),
         ]
-        for isLive in [true, false] {
+        // Rendre les deux et vérifier qu'une image sort ne disait rien : le test
+        // passait que `isLive` soit lu, ignoré ou inversé. C'est la différence
+        // entre les deux états qui porte la règle.
+        func pixels(isLive: Bool) throws -> Data {
             let view = RadiographyView(projectName: "P", turns: turns, isLive: isLive)
                 .frame(width: 390, height: 844)
             let renderer = ImageRenderer(content: view)
             renderer.scale = 1
-            #expect(renderer.uiImage != nil)
+            return try #require(renderer.uiImage?.pngData())
         }
+
+        #expect(try pixels(isLive: true) != pixels(isLive: false))
     }
 
     @Test("La mise à jour ACP conserve l'emplacement réel dans le fil")

@@ -58,6 +58,7 @@ struct ConnectionView: View {
                     .buttonStyle(.glassProminent)
                     .tint(Hublot.ember)
                     .disabled(!model.isConfigured || model.isBusy)
+                    .accessibilityIdentifier("connect-button")
                 }
                 .padding(Hublot.unit * 3)
             }
@@ -97,6 +98,7 @@ struct ConnectionView: View {
                 .focused($focus, equals: field)
                 .padding(Hublot.unit * 1.5)
                 .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 14, style: .continuous))
+                .accessibilityIdentifier("connection-url")
         }
     }
 
@@ -113,6 +115,7 @@ struct ConnectionView: View {
                 .focused($focus, equals: .token)
                 .padding(Hublot.unit * 1.5)
                 .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 14, style: .continuous))
+                .accessibilityIdentifier("connection-token")
         }
     }
 }

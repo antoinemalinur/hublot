@@ -14,11 +14,29 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
 CLAUDE_PROJECTS = Path(os.environ.get("CLAUDE_PROJECTS", "/root/.claude/projects"))
+
+# Résumer une conversation coûte la lecture et le décodage de tout son fichier —
+# plusieurs mégaoctets pour un fil de travail, outils compris. Les listes le
+# faisaient à chaque affichage, pour chaque conversation, et l'écran d'accueil
+# les rouvrait toutes, tous projets confondus : le prix d'un simple retour en
+# arrière était la relecture de l'historique entier.
+#
+# Un fil déjà terminé ne change plus jamais. La signature du fichier — sa taille
+# et sa date — suffit à le savoir : identique, on garde le résumé ; différente,
+# on relit. Aucune invalidation à tenir à jour, et un fichier modifié par un
+# autre processus est vu immédiatement.
+_SUMMARY_CACHE: dict[str, tuple[tuple[float, int], tuple[str, int, str | None]]] = {}
+_SUMMARY_LOCK = threading.Lock()
+# De quoi couvrir très largement un VPS réel sans laisser la mémoire filer si
+# des milliers de fils s'accumulent.
+_SUMMARY_CACHE_MAX = 2_048
 
 
 def _iso(timestamp: float) -> str:
@@ -82,7 +100,7 @@ def list_sessions(cwd: str) -> list[dict[str, Any]]:
             modified = path.stat().st_mtime
         except OSError:
             continue
-        title, exchanges = _summarise(path)
+        title, exchanges, last_prompt_at = _summarise(path)
         if not exchanges:
             # Une session sans un seul échange est un vestige : la montrer
             # promettrait un historique qui n'existe pas.
@@ -91,15 +109,49 @@ def list_sessions(cwd: str) -> list[dict[str, Any]]:
             "sessionId": path.stem,
             "cwd": cwd,
             "title": title,
-            "updatedAt": _iso(modified),
+            # Ouvrir ou reprendre une session peut réécrire son fichier. La
+            # date montrée dans les listes est celle de la dernière demande
+            # humaine, pas celle de cette activité technique.
+            "updatedAt": last_prompt_at or _iso(modified),
             "exchanges": exchanges,
         })
     sessions.sort(key=lambda s: s["updatedAt"], reverse=True)
     return sessions
 
 
-def _summarise(path: Path) -> tuple[str, int]:
-    """Titre et nombre d'échanges, sans charger tout le fichier en mémoire.
+def _summarise(path: Path) -> tuple[str, int, str | None]:
+    """Titre, nombre d'échanges et dernière demande — relus une seule fois.
+
+    Le résultat est retenu tant que le fichier ne bouge pas. Voir
+    `_SUMMARY_CACHE` : c'est ce qui sépare une liste instantanée d'une relecture
+    de tout l'historique à chaque affichage.
+    """
+    key = str(path)
+    try:
+        status = path.stat()
+        signature = (status.st_mtime, status.st_size)
+    except OSError:
+        # Sans signature, rien à retenir : on lit, et c'est tout.
+        return _read_summary(path)
+
+    with _SUMMARY_LOCK:
+        remembered = _SUMMARY_CACHE.get(key)
+        if remembered is not None and remembered[0] == signature:
+            return remembered[1]
+
+    summary = _read_summary(path)
+
+    with _SUMMARY_LOCK:
+        # Une éviction grossière suffit : ces entrées sont minuscules et le seuil
+        # n'est jamais atteint sur un VPS réel.
+        if len(_SUMMARY_CACHE) >= _SUMMARY_CACHE_MAX:
+            _SUMMARY_CACHE.clear()
+        _SUMMARY_CACHE[key] = (signature, summary)
+    return summary
+
+
+def _read_summary(path: Path) -> tuple[str, int, str | None]:
+    """La lecture elle-même, sans cache.
 
     Claude écrit lui-même un `ai-title` quand il en a produit un ; à défaut on
     prend la première demande. Un titre inventé ici serait moins bon que le
@@ -107,6 +159,7 @@ def _summarise(path: Path) -> tuple[str, int]:
     """
     ai_title: str | None = None
     first_prompt: str | None = None
+    last_prompt_at: str | None = None
     exchanges = 0
 
     for event in _events(path):
@@ -119,10 +172,25 @@ def _summarise(path: Path) -> tuple[str, int]:
                 exchanges += 1
                 if first_prompt is None:
                     first_prompt = text
+                last_prompt_at = _timestamp_of(event) or last_prompt_at
 
     title = ai_title or first_prompt or "Conversation"
     flat = " ".join(title.split())
-    return (flat[:79] + "…" if len(flat) > 80 else flat), exchanges
+    return (flat[:79] + "…" if len(flat) > 80 else flat), exchanges, last_prompt_at
+
+
+def _timestamp_of(event: dict[str, Any]) -> str | None:
+    """Normalise l'horodatage ISO écrit par Claude, ou l'écarte s'il est faux."""
+    value = event.get("timestamp")
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return _iso(parsed.timestamp())
 
 
 def replay(cwd: str, session_id: str) -> Iterator[tuple[str, str]]:

@@ -436,6 +436,36 @@ struct ConversationFlowTests {
         #expect(!claudeBar.contains("7J"))
     }
 
+    @Test("Claude sans fenêtre de 5 h montre sa semaine plutôt que rien")
+    func claudeFallsBackToItsWeeklyWindow() throws {
+        // Signalé depuis l'iPhone le 10 août 2026 : passer sur Claude faisait
+        // disparaître la cellule de quota. `/usage` ne rend pas toujours la
+        // session de 5 h — une session `claude.ai` fatiguée suffit — et la
+        // barre n'avait alors aucun repli, là où Codex en a un depuis toujours.
+        let claude = try JSONCoding.decoder.decode(
+            SessionStatus.self,
+            from: Data(
+                """
+                {"model":"opus","effort":"high","engine":"claude",\
+                 "limits":{"seven_day":{"percent":38,\
+                 "resetsAt":"2026-08-11T00:13:37+00:00"}}}
+                """.utf8
+            )
+        )
+
+        let bar = try #require(StatusBar.content(status: claude, contextPercent: nil))
+        #expect(bar.hasPrefix("7J: 38%"))
+        #expect(!bar.contains("5H"))
+
+        // Et rien n'est inventé quand le moteur ne rend aucun plafond : une
+        // jauge fausse serait pire que pas de jauge.
+        let muet = try JSONCoding.decoder.decode(
+            SessionStatus.self,
+            from: Data(#"{"model":"opus","effort":"high","engine":"claude"}"#.utf8)
+        )
+        #expect(StatusBar.cells(status: muet, contextPercent: 12).map(\.percent) == [12])
+    }
+
     // MARK: Un tour qui a survécu à la veille
 
     /// Le scénario exact vécu sur Office Chess : une demande longue, le

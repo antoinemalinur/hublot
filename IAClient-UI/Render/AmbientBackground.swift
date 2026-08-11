@@ -119,6 +119,7 @@ struct AmbientBackground: View {
 
     @State private var phase: CGFloat = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private var motionReduced: Bool { HublotMotion.isReduced(reduceMotion) }
 
     var body: some View {
         MeshGradient(
@@ -150,7 +151,7 @@ struct AmbientBackground: View {
         // Respecter « réduire les animations » : la lueur reste, elle ne bouge
         // plus. L'information d'état est portée par la couleur, pas par le
         // mouvement — on ne perd rien en la figeant.
-        guard !reduceMotion else {
+        guard !motionReduced else {
             phase = 0.5
             return
         }

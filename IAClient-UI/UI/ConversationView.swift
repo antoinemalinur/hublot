@@ -41,6 +41,8 @@ struct ConversationView: View {
     /// Vrai pendant qu'un tour tourne : le bouton d'envoi devient un bouton
     /// d'arrêt, et c'est le seul moyen de reprendre la main avant la fin.
     var isWorking = false
+    /// Demandes déjà confiées au fil, qui partiront après le tour courant.
+    var queuedPromptCount = 0
     /// Vrai pendant qu'on se rebranche : le chrome le dit, plutôt que de laisser
     /// croire à une réponse qui met du temps à venir.
     var isReconnecting = false
@@ -125,9 +127,11 @@ struct ConversationView: View {
                 Composer(
                     engine: engine,
                     configOptions: configOptions,
+                    status: status,
                     commands: commands,
                     onChoose: onChoose,
                     isWorking: isWorking,
+                    queuedPromptCount: queuedPromptCount,
                     onStop: onStop,
                     onDictate: onDictate,
                     onSend: onSend
@@ -347,6 +351,7 @@ struct SessionChrome: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(onBack == nil)
+                .accessibilityIdentifier("conversation-back")
                 .glassEffect(.regular.interactive(), in: .capsule)
                 .glassEffectID("session", in: glass)
 
@@ -682,9 +687,11 @@ struct PlanRing: View {
 struct Composer: View {
     let engine: Engine
     var configOptions: [ConfigOption] = []
+    var status: SessionStatus?
     var commands: [String] = []
     var onChoose: (ConfigOption, String) -> Void = { _, _ in }
     var isWorking = false
+    var queuedPromptCount = 0
     var onStop: () -> Void = {}
     var onDictate: ((Data) async -> String?)?
     let onSend: (String, [Attachment]) -> Void
@@ -701,7 +708,11 @@ struct Composer: View {
     private var hasSomethingToSend: Bool { !draft.isEmpty || !attachments.isEmpty }
 
     /// Ce que le bouton fait, dans l'ordre de priorité : arrêter un
-    /// enregistrement, arrêter un tour, envoyer ce qui est écrit, dicter.
+    /// enregistrement, envoyer ce qui est écrit, arrêter un tour, dicter.
+    ///
+    /// L'envoi passe avant l'arrêt lorsque le champ est rempli : pendant un
+    /// tour, il met ainsi le message en file. Un bouton d'arrêt séparé reste
+    /// alors visible juste à côté.
     private func act() {
         if dictation.phase == .recording {
             Task {
@@ -721,7 +732,6 @@ struct Composer: View {
             }
             return
         }
-        if isWorking { onStop(); return }
         if hasSomethingToSend {
             // Le champ et le bouton possèdent le même état. Quand le brouillon
             // vivait dans ``ConversationView``, le TextField focalisé pouvait
@@ -738,6 +748,7 @@ struct Composer: View {
             onSend(text, images)
             return
         }
+        if isWorking { onStop(); return }
         Task { await dictation.start() }
     }
 
@@ -757,13 +768,21 @@ struct Composer: View {
 
     private var glyph: String {
         if dictation.phase == .recording { "stop.fill" }
+        else if hasSomethingToSend { "arrow.up" }
         else if isWorking { "stop.fill" }
-        else if !hasSomethingToSend { "mic.fill" }
-        else { "arrow.up" }
+        else { "mic.fill" }
     }
 
     private var glyphSize: CGFloat {
         glyph == "arrow.up" ? 15 : 13
+    }
+
+    private var actionLabel: String {
+        if dictation.phase == .recording { return "Arrêter la dictée" }
+        if hasSomethingToSend {
+            return isWorking ? "Mettre le message en attente" : "Envoyer le message"
+        }
+        return isWorking ? "Arrêter la réponse" : "Démarrer la dictée"
     }
 
     /// L'invite dit ce qui bloque quand quelque chose bloque : un micro refusé
@@ -800,6 +819,25 @@ struct Composer: View {
 
         return GlassEffectContainer(spacing: Hublot.unit * 1.5) {
             VStack(alignment: .leading, spacing: Hublot.unit * 1.25) {
+                if queuedPromptCount > 0 {
+                    Label(
+                        queuedPromptCount == 1
+                            ? "1 message en attente"
+                            : "\(queuedPromptCount) messages en attente",
+                        systemImage: "clock.arrow.circlepath"
+                    )
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Hublot.ember)
+                    .padding(.horizontal, Hublot.unit * 1.5)
+                    // Un `Label` expose son icône et son texte séparément : les
+                    // deux héritaient de l'identifiant, VoiceOver énonçait la
+                    // file en deux temps et toute recherche par identifiant en
+                    // trouvait deux. Le compteur est une seule information.
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("composer-queue")
+                    .transition(.opacity.combined(with: .offset(y: 6)))
+                }
+
                 // Les réglages s'effacent pendant qu'on écrit : au moment de
                 // formuler une demande, le choix du modèle n'est plus la
                 // question.
@@ -811,7 +849,15 @@ struct Composer: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: Hublot.unit) {
                             ForEach(configOptions) { option in
-                                PillMenu(option: option) { onChoose(option, $0) }
+                                PillMenu(
+                                    option: option,
+                                    displayLabel: liveLabel(for: option)
+                                ) { onChoose(option, $0) }
+                                    // Modèle, effort et moteur ne peuvent agir
+                                    // qu'au prochain tour. Les laisser changer
+                                    // pendant celui-ci donnait deux vérités à
+                                    // l'écran : Claude en bas, Codex en haut.
+                                    .disabled(isWorking && option.id != "permission")
                             }
                         }
                         .padding(.trailing, Hublot.unit * 2)
@@ -907,10 +953,23 @@ struct Composer: View {
                             .lineLimit(1...6)
                     }
 
-                    // Un seul bouton, quatre offices. Deux ou trois boutons
-                    // côte à côte auraient demandé de viser ; là où il n'y en a
-                    // qu'un, le geste est le même et c'est l'état qui décide de
-                    // son sens.
+                    // Tant qu'il n'y a rien à envoyer, le bouton garde son
+                    // office historique : arrêter le tour. Dès qu'un brouillon
+                    // existe, l'arrêt reste distinct afin que l'autre bouton
+                    // puisse mettre le nouveau message en file.
+                    if isWorking && hasSomethingToSend {
+                        Button(action: onStop) {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 13, weight: .semibold))
+                                .frame(width: 34, height: 34)
+                        }
+                        .buttonStyle(.glass)
+                        .accessibilityIdentifier("composer-stop")
+                        .accessibilityLabel("Arrêter la réponse")
+                        .tint(Hublot.removed)
+                        .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                    }
+
                     Button(action: act) {
                         Group {
                             if dictation.phase == .transcribing {
@@ -925,6 +984,7 @@ struct Composer: View {
                     }
                     .buttonStyle(.glassProminent)
                     .accessibilityIdentifier("composer-action")
+                    .accessibilityLabel(actionLabel)
                     .tint(dictation.phase == .recording ? Hublot.removed : Hublot.ember)
                     .disabled(dictation.phase == .transcribing)
                     .animation(.snappy(duration: 0.2), value: isWorking)
@@ -940,9 +1000,29 @@ struct Composer: View {
         }
         .background { EdgeScrim(edge: .bottom).ignoresSafeArea() }
         .animation(.snappy(duration: 0.28), value: isWriting)
+        .animation(.snappy(duration: 0.2), value: hasSomethingToSend)
+        .animation(.snappy(duration: 0.2), value: queuedPromptCount)
         .onChange(of: picked) { _, items in
             guard !items.isEmpty else { return }
             Task { await absorb(items) }
+        }
+    }
+
+    /// Pendant un tour, les descripteurs de réglages disent encore ce qui est
+    /// configuré pour le prochain départ. La rangée, elle, est lue comme l'état
+    /// présent. Si Claude est épinglé mais indisponible, Codex assure l'intérim :
+    /// montrer « Claude · Opus » sous sa jauge Codex reproduit exactement la
+    /// contradiction signalée. Le statut vivant gagne jusqu'à la fin du tour.
+    private func liveLabel(for option: ConfigOption) -> String? {
+        guard isWorking else { return nil }
+        switch option.id {
+        // Le moteur en vol se nomme comme l'option le nomme au repos : « Codex »
+        // et non son `rawValue`. Sans ce détour, la pastille changeait de casse
+        // au départ du tour et revenait à « Codex » à son terme.
+        case "engine": return option.name(for: engine.rawValue)
+        case "model": return status?.model
+        case "effort": return status?.effort?.capitalized
+        default: return nil
         }
     }
 }
@@ -988,6 +1068,7 @@ struct AttachmentChip: View {
 /// séparée, l'espace en bas d'écran est trop cher.
 struct PillMenu: View {
     let option: ConfigOption
+    var displayLabel: String?
     let onSelect: (String) -> Void
 
     var body: some View {
@@ -1009,7 +1090,7 @@ struct PillMenu: View {
                 .disabled(choice.value == option.currentValueString)
             }
         } label: {
-            capsule(option.currentLabel)
+            capsule(displayLabel ?? option.currentLabel)
         }
         .buttonStyle(.plain)
         .glassEffect(.regular.interactive(), in: .capsule)
@@ -1090,6 +1171,18 @@ struct CommandPalette: View {
             ))
         }
 
+        /// Le même fil pendant un tour, avec une file pilotée par le témoin UI.
+        static func workingScreenTestDemo(
+            queuedPromptCount: Int,
+            onSend: @escaping (String, [Attachment]) -> Void
+        ) -> ConversationView {
+            var view = screenTestDemo
+            view.isWorking = true
+            view.queuedPromptCount = queuedPromptCount
+            view.onSend = onSend
+            return view
+        }
+
         /// Le même fil, mené par Codex, avec **les deux** fenêtres remplies.
         ///
         /// C'est le seul cas où la préférence se voit. Codex est plafonné par
@@ -1105,6 +1198,51 @@ struct CommandPalette: View {
                     "seven_day": .init(percent: 64, resetsAt: .now.addingTimeInterval(172_800)),
                 ]
             ))
+        }
+
+        /// Le cas de la capture du 10 août : Codex travaille encore et le
+        /// sélecteur ne doit pas permettre d'afficher Claude comme moteur
+        /// courant avant que le bouton d'arrêt ait rendu la main.
+        static var activeEngineLockDemo: ConversationView {
+            ConversationView(
+                sessionTitle: "Vérifier le dépôt", engine: .codex,
+                turns: [.assistant(.init(id: "live", markdown: "Codex travaille."))],
+                configOptions: [
+                    ConfigOption(
+                        id: "engine", name: "Moteur", category: "mode", type: "select",
+                        // Le prochain tour est épinglé sur Claude, mais le tour
+                        // déjà en vol est Codex : c'est l'état de la capture.
+                        currentValue: .string("claude"),
+                        options: [
+                            .init(value: "claude", name: "Claude", description: nil),
+                            .init(value: "codex", name: "Codex", description: nil),
+                        ]
+                    ),
+                    // L'exception du verrou : les permissions peuvent encore
+                    // servir au tour en cours, à son prochain appel de commande.
+                    ConfigOption(
+                        id: "permission", name: "Permissions", category: "mode",
+                        type: "select", currentValue: .string("ask"),
+                        options: [
+                            .init(value: "ask", name: "Demander", description: nil),
+                            .init(value: "auto", name: "Tout autoriser", description: nil),
+                        ]
+                    ),
+                ],
+                status: SessionStatus(
+                    model: "GPT-5.6-Sol", effort: "max", engine: "codex",
+                    limits: [
+                        "seven_day": .init(
+                            percent: 36, resetsAt: .now.addingTimeInterval(118 * 60 + 27)
+                        )
+                    ]
+                ),
+                contextPercent: 14,
+                activity: .init(
+                    running: true, phase: .thinking, engine: "codex", elapsed: 89, quiet: 1
+                ),
+                activityAt: .now, isWorking: true
+            )
         }
 
         private static func demo(engine: Engine, status: SessionStatus) -> ConversationView {
@@ -1152,7 +1290,11 @@ struct CommandPalette: View {
                     options: [.init(value: "concise", name: "Concis", description: nil)]
                 ),
                 ConfigOption(
-                    id: "permissions", name: "Permissions", category: "mode", type: "select",
+                    // Le serveur publie ce réglage au singulier (`acp_server.py`),
+                    // et c'est cet identifiant exact qui le laisse modifiable
+                    // pendant un tour. Au pluriel, l'écran témoin décrivait une
+                    // app qui n'existe pas.
+                    id: "permission", name: "Permissions", category: "mode", type: "select",
                     currentValue: .string("allow_all"),
                     options: [
                         .init(value: "allow_all", name: "Tout autoriser", description: nil)
@@ -1161,15 +1303,20 @@ struct CommandPalette: View {
             ]
             // La marée de ce fil témoin. La dernière mesure vaut exactement
             // 42 % — le même chiffre que `contextPercent` ci-dessous, sinon
-            // l'écran et la barre qui l'ouvre se contrediraient.
-            let readings = [6_800, 19_400, 33_100, 51_700, 68_200, 84_000]
+            // l'écran et la barre qui l'ouvre se contrediraient. Le témoin
+            // Codex porte la fenêtre globale publiée pour GPT-5.6 ; c'est le
+            // parcours tactile de régression du dénominateur affiché.
+            let contextSize = engine == .codex ? 1_050_000 : 200_000
+            let readings = engine == .codex
+                ? [35_700, 101_850, 173_775, 271_425, 358_050, 441_000]
+                : [6_800, 19_400, 33_100, 51_700, 68_200, 84_000]
             let history = readings.enumerated().map { index, used in
                 ContextTide.Sample(
                     id: "demo-ctx-\(index)", sequence: index,
-                    used: used, size: 200_000,
+                    used: used, size: contextSize,
                     at: Date(timeIntervalSinceReferenceDate: 800_000_000)
                         .addingTimeInterval(Double(index) * 120),
-                    model: "Opus", engine: "claude"
+                    model: status.model, engine: status.engine
                 )
             }
 

@@ -92,6 +92,23 @@ final class ChatSession {
     /// lancé — typiquement celui qui tournait encore pendant la veille.
     private(set) var isRemoteTurnRunning = false
 
+    /// Les demandes écrites pendant que l'agent travaille encore.
+    ///
+    /// Elles restent ici, au niveau du fil, plutôt que dans le composer : une
+    /// rotation, une reconstruction SwiftUI ou la fermeture du clavier ne doit
+    /// jamais perdre un message que l'interface a annoncé « en attente ».
+    private(set) var queuedPromptCount = 0
+
+    private struct QueuedPrompt {
+        let text: String
+        let attachments: [Attachment]
+    }
+
+    private var promptQueue: [QueuedPrompt] = []
+    /// Une seule tâche vide la file. Sans ce verrou logique, deux taps rapides
+    /// pourraient lancer deux `session/prompt` en parallèle sur le même fil.
+    private var isDrainingPromptQueue = false
+
     private let connection: ACPConnection
     private let events: AsyncStream<ACPConnection.Event>
     private let workingDirectory: String
@@ -124,6 +141,7 @@ final class ChatSession {
     private var historySettlement: CheckedContinuation<Void, Never>?
 
     private let log = Logger(subsystem: "hublot", category: "session")
+    private let environment: HublotEnvironment
 
     /// Une session déjà ouverte par `AppModel` : la poignée de main et le choix
     /// de la session lui appartiennent, pas au fil de conversation.
@@ -135,8 +153,11 @@ final class ChatSession {
     init(
         connection: ACPConnection, events: AsyncStream<ACPConnection.Event>,
         workingDirectory: String, sessionId: String,
-        title: String, isResuming: Bool = false, status: SessionStatus? = nil
+        title: String, isResuming: Bool = false, status: SessionStatus? = nil,
+        environment providedEnvironment: HublotEnvironment? = nil
     ) {
+        let environment = providedEnvironment ?? .live
+        self.environment = environment
         // Déterminé par l'appelant, pas déduit de l'ordre d'arrivée : une
         // conversation qui commence par une réponse — cela arrive — laissait
         // tous les messages rejoués marqués « en cours d'écriture », curseur
@@ -193,7 +214,34 @@ final class ChatSession {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         // Une image seule est une demande valable : « regarde ça ». Ce qu'elle
         // veut dire, le serveur l'écrira à côté du chemin du fichier.
-        guard !trimmed.isEmpty || !attachments.isEmpty, let sessionId else { return }
+        guard !trimmed.isEmpty || !attachments.isEmpty, sessionId != nil else { return }
+
+        promptQueue.append(.init(text: trimmed, attachments: attachments))
+        queuedPromptCount = promptQueue.count
+        await drainPromptQueue()
+    }
+
+    /// Vide la file strictement dans l'ordre, et seulement quand aucun tour
+    /// repris depuis le serveur ne possède encore la main.
+    private func drainPromptQueue() async {
+        guard !isDrainingPromptQueue, !isRemoteTurnRunning else { return }
+        isDrainingPromptQueue = true
+        defer { isDrainingPromptQueue = false }
+
+        while !promptQueue.isEmpty, !isRemoteTurnRunning {
+            let prompt = promptQueue.removeFirst()
+            queuedPromptCount = promptQueue.count
+            guard await perform(prompt) else { return }
+        }
+    }
+
+    /// Exécute une seule demande. La séparation avec `send` est ce qui permet
+    /// à l'appel public de ranger un message sans emboîter un second tour dans
+    /// celui qui est déjà suspendu sur le réseau.
+    private func perform(_ prompt: QueuedPrompt) async -> Bool {
+        guard let sessionId else { return false }
+        let trimmed = prompt.text
+        let attachments = prompt.attachments
 
         isReplaying = false
         isPrompting = true
@@ -201,7 +249,7 @@ final class ChatSession {
         // et l'afficher ferait apparaître une durée déjà longue à la seconde
         // zéro.
         activity = .init(running: true, phase: .starting, engine: engine.rawValue)
-        activityAt = .now
+        activityAt = environment.now()
         turns.append(
             .user(
                 .init(
@@ -228,10 +276,12 @@ final class ChatSession {
             // l'aperçu de la notification partait vide, et le curseur s'éteignait
             // sur une réponse encore en train de s'écrire à l'écran.
             await settle(reason: result.stopReason)
-            Notifier.turnFinished(session: title, preview: lastAssistantText)
+            environment.notifyTurnFinished(title, lastAssistantText)
+            return true
         } catch {
             finishStreaming(reason: nil)
             status = .failed(error.localizedDescription)
+            return false
         }
     }
 
@@ -251,7 +301,7 @@ final class ChatSession {
             // pour toujours et le curseur battrait sur un tour déjà fini — mieux
             // vaut conclure en retard que jamais.
             Task { [weak self] in
-                try? await Task.sleep(for: .seconds(5))
+                try? await self?.environment.sleep(.seconds(5))
                 guard let self, self.settlement != nil else { return }
                 self.log.error("jalon de fin de tour perdu")
                 self.finishStreaming(reason: reason)
@@ -313,6 +363,12 @@ final class ChatSession {
     /// n'a pas obtenu.
     func choose(_ option: ConfigOption, value: String) async {
         guard let sessionId, option.currentValueString != value else { return }
+        // Un moteur ne se remplace pas au milieu de sa réponse. Laisser partir
+        // le réglage faisait pourtant afficher « Claude » dans le composeur
+        // pendant que la barre — justement — décrivait encore le tour Codex.
+        // Les permissions restent modifiables : elles peuvent être nécessaires
+        // à la prochaine commande du tour en cours.
+        guard !isWorking || option.id == "permission" else { return }
         do {
             let result = try await connection.call(
                 "session/set_config_option",
@@ -444,7 +500,7 @@ final class ChatSession {
     /// travaillait toujours et qu'aucun envoi ne serait accepté.
     private func adopt(_ beat: Activity) {
         activity = beat
-        activityAt = .now
+        activityAt = environment.now()
         if let name = beat.engine, let known = Engine(rawValue: name) { engine = known }
 
         guard !isPrompting else { return }
@@ -456,7 +512,10 @@ final class ChatSession {
         } else if isRemoteTurnRunning {
             isRemoteTurnRunning = false
             finishStreaming(reason: beat.stopReason)
-            Notifier.turnFinished(session: title, preview: lastAssistantText)
+            environment.notifyTurnFinished(title, lastAssistantText)
+            // Aucun appel local n'attend la fin d'un tour repris. Sa dernière
+            // pulsation doit donc réveiller explicitement la file.
+            Task { [weak self] in await self?.drainPromptQueue() }
         }
     }
 
@@ -640,7 +699,7 @@ final class ChatSession {
             }
         )
         turns.append(.permission(turn))
-        Notifier.permissionNeeded(tool: turn.toolTitle, detail: turn.detail)
+        environment.notifyPermissionNeeded(turn.toolTitle, turn.detail)
     }
 
     /// Le début de la dernière réponse, pour le corps de la notification.

@@ -1,0 +1,48 @@
+{
+  "configurations" : [
+    {
+      "id" : "E77B17CA-E085-4DB9-A268-AEE5CFC67C9B",
+      "name" : "Validation exhaustive",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "codeCoverage" : {
+      "targets" : [
+        {
+          "containerPath" : "container:IAClient-UI.xcodeproj",
+          "identifier" : "B579B08D3024089200B27C68",
+          "name" : "IAClient-UI"
+        }
+      ]
+    },
+    "executionOrder" : "random",
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:IAClient-UI.xcodeproj",
+      "identifier" : "B579B08D3024089200B27C68",
+      "name" : "IAClient-UI"
+    },
+    "testTimeoutsEnabled" : true
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:IAClient-UI.xcodeproj",
+        "identifier" : "BB0003000000000000000001",
+        "name" : "IAClient-UITests"
+      }
+    },
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:IAClient-UI.xcodeproj",
+        "identifier" : "CC0003000000000000000001",
+        "name" : "IAClient-UIScreenTests"
+      }
+    }
+  ],
+  "version" : 1
+}

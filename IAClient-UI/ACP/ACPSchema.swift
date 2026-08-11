@@ -114,7 +114,14 @@ nonisolated struct ConfigOption: Decodable, Sendable, Identifiable, Hashable {
     /// « claude-opus-5 ». Repli sur la valeur brute si l'agent ne nomme pas.
     var currentLabel: String {
         guard let current = currentValueString else { return name }
-        return options?.first { $0.value == current }?.name ?? current
+        return name(for: current)
+    }
+
+    /// Le nom lisible d'une valeur donnée, pas seulement de la valeur courante.
+    /// Pendant un tour, la pastille montre le moteur qui travaille — il faut
+    /// pouvoir le nommer sans que ce soit encore la valeur retenue.
+    func name(for value: String) -> String {
+        options?.first { $0.value == value }?.name ?? value
     }
 }
 

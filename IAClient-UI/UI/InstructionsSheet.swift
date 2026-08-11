@@ -65,6 +65,7 @@ struct InstructionsSheet: View {
             }
             .buttonStyle(.plain)
             .glassEffect(.regular.interactive(), in: .circle)
+            .accessibilityIdentifier("close-instructions")
         }
         .padding(.horizontal, Hublot.unit * 3)
         .padding(.top, Hublot.unit * 2)

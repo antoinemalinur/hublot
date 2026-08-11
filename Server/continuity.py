@@ -33,6 +33,11 @@ from typing import Any
 
 STATE = Path(os.environ.get("ACP_CONTINUITY", "/opt/tg-claude/state/acp-continuity"))
 
+# Le résumé de chaque fil, retenu tant que son fichier ne bouge pas. Voir
+# `_summarise` : sans lui, lister un projet relisait tout l'historique.
+_SUMMARY_CACHE: dict[str, tuple[tuple[float, int], dict[str, Any] | None]] = {}
+_SUMMARY_CACHE_MAX = 2_048
+
 
 def _paths(cwd: str, session_id: str) -> tuple[Path, Path]:
     key = "".join(c if c.isalnum() else "-" for c in cwd)
@@ -51,7 +56,14 @@ def record(cwd: str, session_id: str, role: str, text: str, engine: str | None =
     transcript.parent.mkdir(parents=True, exist_ok=True)
     with transcript.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(
-            {"role": role, "engine": engine, "text": text}, ensure_ascii=False
+            {
+                "role": role, "engine": engine, "text": text,
+                # Le mtime change aussi quand une mesure de contexte ou un
+                # outil est rejoué. L'instant du message doit donc voyager
+                # avec lui pour que les listes datent la dernière demande.
+                "timestamp": now_iso(),
+            },
+            ensure_ascii=False,
         ) + "\n")
 
 
@@ -151,6 +163,49 @@ def replay(cwd: str, session_id: str) -> list[dict[str, Any]]:
     return _transcript(cwd, session_id)
 
 
+def _summarise(
+    cwd: str, session_id: str, signature: tuple[float, int]
+) -> dict[str, Any] | None:
+    """Le titre, la date et le nombre d'échanges d'un fil — relus une seule fois.
+
+    Lister un projet décodait jusqu'ici l'intégralité de chaque fil, outils et
+    mesures compris, à chaque affichage. Un fil clos ne bouge plus : sa taille
+    et sa date suffisent à s'en assurer, et le résumé se garde tant qu'elles ne
+    changent pas. Rend `None` pour un fil sans une seule demande — le montrer
+    promettrait un historique qui n'existe pas.
+    """
+    key = f"{cwd}\0{session_id}"
+    remembered = _SUMMARY_CACHE.get(key)
+    if remembered is not None and remembered[0] == signature:
+        return remembered[1]
+
+    prompts = [
+        entry for entry in _transcript(cwd, session_id)
+        if entry.get("role") == "user" and str(entry.get("text") or "").strip()
+    ]
+    summary: dict[str, Any] | None = None
+    if prompts:
+        flat = " ".join(str(prompts[0].get("text") or "").split())
+        title = flat[:79] + "…" if len(flat) > 80 else flat
+        last_prompt_at = prompts[-1].get("timestamp")
+        summary = {
+            "title": title or "Conversation",
+            # Les anciens fils n'avaient pas encore d'horodatage par message ;
+            # leur mtime reste le seul repli possible jusqu'au prompt suivant.
+            "updatedAt": (
+                last_prompt_at
+                if isinstance(last_prompt_at, str) and last_prompt_at
+                else _iso(signature[0])
+            ),
+            "exchanges": len(prompts),
+        }
+
+    if len(_SUMMARY_CACHE) >= _SUMMARY_CACHE_MAX:
+        _SUMMARY_CACHE.clear()
+    _SUMMARY_CACHE[key] = (signature, summary)
+    return summary
+
+
 def _iso(timestamp: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(timestamp))
 
@@ -174,26 +229,17 @@ def list_sessions(cwd: str) -> list[dict[str, Any]]:
 
     sessions: list[dict[str, Any]] = []
     for path in directory.glob("*.jsonl"):
-        entries = _transcript(cwd, path.stem)
-        prompts = [
-            str(entry.get("text") or "").strip()
-            for entry in entries if entry.get("role") == "user"
-        ]
-        prompts = [prompt for prompt in prompts if prompt]
-        if not prompts:
-            continue
         try:
-            modified = path.stat().st_mtime
+            status = path.stat()
         except OSError:
             continue
-        flat = " ".join(prompts[0].split())
-        title = flat[:79] + "…" if len(flat) > 80 else flat
+        summary = _summarise(cwd, path.stem, (status.st_mtime, status.st_size))
+        if summary is None:
+            continue
         sessions.append({
             "sessionId": path.stem,
             "cwd": cwd,
-            "title": title or "Conversation",
-            "updatedAt": _iso(modified),
-            "exchanges": len(prompts),
+            **summary,
         })
     sessions.sort(key=lambda session: session["updatedAt"], reverse=True)
     return sessions

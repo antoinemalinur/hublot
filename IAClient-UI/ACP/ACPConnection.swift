@@ -37,6 +37,7 @@ actor ACPConnection {
     }
 
     private let transport: any ACPTransport
+    private let sleep: @Sendable (Duration) async throws -> Void
     private let log = Logger(subsystem: "hublot", category: "acp")
 
     private var nextID = 1
@@ -56,8 +57,14 @@ actor ACPConnection {
     private var subscribers: [Int: AsyncStream<Event>.Continuation] = [:]
     private var nextSubscriberID = 0
 
-    init(transport: any ACPTransport) {
+    init(
+        transport: any ACPTransport,
+        sleep providedSleep: (@Sendable (Duration) async throws -> Void)? = nil
+    ) {
         self.transport = transport
+        self.sleep = providedSleep ?? { duration in
+            try await Task.sleep(for: duration)
+        }
     }
 
     /// S'abonne. Chaque appel rend un flux indépendant qui reçoit **tout**.
@@ -141,9 +148,10 @@ actor ACPConnection {
         nextID += 1
         let frame = try JSONCoding.encoder.encode(RPCRequest(id: id, method: method, params: params))
 
+        let sleep = self.sleep
         let watchdog: Task<Void, Never>? = timeout.map { limit in
             Task { [weak self] in
-                try? await Task.sleep(for: limit)
+                try? await sleep(limit)
                 guard !Task.isCancelled else { return }
                 await self?.expire(id, method: method)
             }

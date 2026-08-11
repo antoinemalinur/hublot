@@ -38,6 +38,7 @@ struct ContextGauge: View {
     var isLive = false
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private var motionReduced: Bool { HublotMotion.isReduced(reduceMotion) }
 
     // Le laiton du cerclage, repris à l'identique de `Porthole` : c'est le même
     // atelier qui a fabriqué les deux pièces.
@@ -66,15 +67,15 @@ struct ContextGauge: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 60, paused: reduceMotion)) { context in
+        TimelineView(.animation(minimumInterval: 1 / 60, paused: motionReduced)) { context in
             let time = context.date.timeIntervalSinceReferenceDate
             // Mêmes périodes premières entre elles que le hublot : le mouvement
             // ne se répète jamais à l'identique et l'œil ne trouve pas la
             // boucle.
-            let yaw = reduceMotion ? -6.0 : sin(time * 0.37) * 15
-            let pitch = reduceMotion ? 4.0 : cos(time * 0.27) * 10
+            let yaw = motionReduced ? -6.0 : sin(time * 0.37) * 15
+            let pitch = motionReduced ? 4.0 : cos(time * 0.27) * 10
             // La surface ne frémit que si quelque chose se remplit vraiment.
-            let swell = (isLive && !reduceMotion) ? sin(time * 1.6) : 0
+            let swell = (isLive && !motionReduced) ? sin(time * 1.6) : 0
 
             assembly(yaw: yaw, pitch: pitch, swell: swell, time: time)
                 .rotation3DEffect(

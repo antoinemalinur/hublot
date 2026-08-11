@@ -9,15 +9,31 @@ import threading
 import time
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
+# Les charger avant `acp_server` est essentiel : en production celui-ci place
+# `/opt/tg-claude` en tête du chemin pour trouver `bot.py`. Sur le VPS de test,
+# cela ferait sinon importer les copies déployées (potentiellement plus
+# anciennes) au lieu des fichiers de cette branche.
+import continuity  # noqa: F401, E402
+import radiography  # noqa: F401, E402
+import sessions  # noqa: F401, E402
+import usage  # noqa: F401, E402
 
-# Le dépôt iOS ne contient pas les modules d'exploitation du VPS. Le relais ne
-# les exerce pas dans ces tests : de petits substituts suffisent pour importer
-# ses classes et tester le contrat de streaming lui-même.
+
+# Le dépôt ne contient pas `bot.py` ni le constructeur de passation du VPS.
+# Les modules de sessions, continuité et radiographie sont en revanche bien
+# présents ici : les remplacer polluerait `sys.modules` et ferait tester leurs
+# propres suites contre une coquille vide lors d'une découverte globale.
 os.environ.setdefault("ACP_TOKEN", "test-token")
+# `acp_server` donne normalement priorité à `/opt/tg-claude`. En test, cela
+# chargeait les anciennes copies de `continuity.py` et `sessions.py` installées
+# sur la machine, puis les laissait dans `sys.modules` pour toute la découverte.
+# La suite dépendait donc de son ordre et de l'état du VPS local.
+os.environ.setdefault("TG_CLAUDE_BASE", str(Path(__file__).resolve().parent))
 sys.modules.setdefault("bot", types.SimpleNamespace(
     REPOS_BASE="/tmp/repos",
     CODEX_MODEL="gpt-test",
@@ -26,7 +42,17 @@ sys.modules.setdefault("bot", types.SimpleNamespace(
     CODEX_LAST_MESSAGE="/tmp/codex-last-message",
     CODEX_EFFORT_FILE="/tmp/codex-effort",
     state_lock=threading.RLock(),
-    state={"codex_effort": "low"},
+    # `send_status` lit l'état comme le ferait le relais : le moteur épinglé,
+    # le modèle Claude et son effort. Une doublure amputée faisait passer une
+    # `KeyError` pour un comportement du serveur.
+    state={
+        "codex_effort": "low", "manual_engine": "claude",
+        "model": "opus", "claude_effort": "high",
+    },
+    MODELS={"opus": ("claude-opus-5", "Opus", 200_000)},
+    CLAUDE_EFFORTS=("high",),
+    CLAUDE_EFFORT_FILE="/tmp/claude-effort",
+    engine_for_next_task=lambda: "claude",
     save_effort=lambda _path, _effort: None,
     log=lambda _message: None,
     # Les trois verdicts que le relais rend sur une sortie de moteur. Les
@@ -36,7 +62,6 @@ sys.modules.setdefault("bot", types.SimpleNamespace(
     mark_claude_unavailable=lambda _reason, **_kwargs: None,
 ))
 sys.modules.setdefault("handoff", types.SimpleNamespace())
-sys.modules.setdefault("sessions", types.SimpleNamespace())
 
 import acp_server  # noqa: E402
 
@@ -47,9 +72,15 @@ class RecordingSession:
 
     def __init__(self) -> None:
         self.statuses: list[tuple[int, int]] = []
+        # `persist` doit être retenu, pas jeté : c'est lui qui décide si la
+        # mesure d'un tour entre au fil. Sans lui ici, retirer le `persist=True`
+        # de `_push_context` ne faisait broncher aucun test.
+        self.persisted: list[bool] = []
 
-    async def send_status(self, used: int = 0, size: int = 0) -> None:
+    async def send_status(self, used: int = 0, size: int = 0,
+                          *, persist: bool = False) -> None:
         self.statuses.append((used, size))
+        self.persisted.append(persist)
 
 
 class ContextStreamingTests(unittest.IsolatedAsyncioTestCase):
@@ -75,6 +106,10 @@ class ContextStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         await turn._push_context(force=True)
         self.assertEqual(session.statuses[-1], (6_000, 0))
+        # Une mesure prise pendant le tour n'existe nulle part ailleurs : elle
+        # doit entrer dans le fil, sinon la marée de contexte est vide à la
+        # réouverture.
+        self.assertTrue(session.persisted[-1])
 
     async def test_context_is_republished_after_eight_seconds_without_a_new_event(self) -> None:
         session = RecordingSession()
@@ -105,6 +140,223 @@ class ConnectionSurvivalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(recorded, [{"sessionUpdate": "agent_message_chunk"}])
         self.assertTrue(session._notification_failed)
+
+
+class SilentConnection:
+    """Une liaison qui accepte tout sans rien faire.
+
+    Ce qui compte ici est ce que le serveur **écrit sur disque**, pas ce qu'il
+    envoie au téléphone.
+    """
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, Any] = {}
+
+    async def notify(self, _method: str, _params: dict) -> None:
+        return None
+
+
+class OpeningAConversationTests(unittest.IsolatedAsyncioTestCase):
+    """Ouvrir une conversation ne doit pas compter comme y avoir écrit.
+
+    Le cas signalé depuis l'iPhone le 10 août 2026 : toucher une discussion
+    sans rien taper, et la voir aussitôt datée « il y a deux secondes ».
+
+    Le fil de ce test n'a **aucun horodatage par message** : c'est l'état de
+    toutes les conversations déjà sur le VPS, écrites avant que `record` ne
+    date chaque ligne. Pour elles, la liste retombe sur le `mtime` du journal —
+    et `send_status()` le réécrivait à chaque ouverture.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.previous_state = acp_server.continuity.STATE
+        acp_server.continuity.STATE = Path(self.temporary.name)
+        self.cwd = "/tmp/repos/projet"
+        self.session_id = "fil-sans-horodatage"
+
+        transcript, _ = acp_server.continuity._paths(self.cwd, self.session_id)
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        with transcript.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(
+                {"role": "user", "engine": "claude", "text": "Ma demande d'hier"},
+                ensure_ascii=False,
+            ) + "\n")
+        # Une conversation d'il y a une heure, pas d'il y a deux secondes.
+        old = time.time() - 3_600
+        os.utime(transcript, (old, old))
+        self.transcript = transcript
+
+    def tearDown(self) -> None:
+        acp_server.continuity.STATE = self.previous_state
+        self.temporary.cleanup()
+
+    def _listed_date(self) -> str:
+        listed = acp_server.continuity.list_sessions(self.cwd)
+        return str(listed[0]["updatedAt"])
+
+    def _offline(self):
+        """Ni `claude -p /usage`, ni le journal du moteur : ni l'un ni l'autre
+        n'existe sur la machine de test, et aucun des deux n'est le sujet."""
+        return (
+            mock.patch.object(acp_server, "quota_snapshot", return_value={}),
+            mock.patch.object(
+                acp_server.Session, "measure_context", return_value=(0, 200_000)
+            ),
+        )
+
+    async def test_opening_a_conversation_does_not_redate_it(self) -> None:
+        # La date attendue est celle du fichier, calculée ici : comparer le fil
+        # à lui-même laisserait passer un repli devenu constant — ou devenu
+        # « maintenant », qui est justement le bug.
+        expected = acp_server.continuity._iso(self.transcript.stat().st_mtime)
+        self.assertEqual(self._listed_date(), expected)
+
+        quota, measure = self._offline()
+        with quota, measure:
+            # Le geste exact de l'utilisateur : ouvrir, sans rien écrire. C'est
+            # ce que `_load_session` fait en dernier.
+            session = acp_server.Session(SilentConnection(), self.session_id, self.cwd)
+            await session.send_status()
+
+        self.assertEqual(self._listed_date(), expected)
+
+    async def test_a_turns_own_measurement_still_enters_the_thread(self) -> None:
+        """Le garde-fou ne doit pas emporter la marée de contexte avec lui.
+
+        Une mesure prise pendant un tour n'existe nulle part ailleurs : sans
+        elle, rouvrir un fil afficherait une jauge vide jusqu'au tour suivant.
+        """
+        session = acp_server.Session(SilentConnection(), self.session_id, self.cwd)
+
+        quota, measure = self._offline()
+        with quota, measure:
+            await session.send_status(used=17_050, size=200_000, persist=True)
+
+        measured = [
+            entry for entry in acp_server.continuity.replay(self.cwd, self.session_id)
+            if entry.get("role") == "usage"
+        ]
+        self.assertEqual(len(measured), 1)
+        self.assertEqual(measured[0]["update"]["used"], 17_050)
+
+
+class ConcurrentConversationCatalogTests(unittest.IsolatedAsyncioTestCase):
+    """Une seconde demande doit exister avant son premier travail lent.
+
+    Le cas vu dans l'app : quitter un premier fil encore actif, en ouvrir un
+    second, envoyer puis revenir aussitôt à la liste. Le rangement des images
+    passait par un thread avant l'inscription du second tour. Pendant cette
+    fenêtre, `session/list` et `hublot/running` ne voyaient que le premier fil,
+    et la liste ne se rechargeait plus ensuite.
+    """
+
+    async def asyncSetUp(self) -> None:
+        acp_server.ACTIVE_TURNS.clear()
+
+    async def asyncTearDown(self) -> None:
+        acp_server.ACTIVE_TURNS.clear()
+
+    async def test_second_prompt_is_listed_while_its_attachment_is_stored(self) -> None:
+        cwd = "/tmp/repos/projet"
+        first_session = types.SimpleNamespace(id="premier", cwd=cwd)
+        first_turn = acp_server.PromptTurn(first_session, "Première demande")
+        acp_server.ACTIVE_TURNS[first_session.id] = first_turn
+
+        connection = acp_server.Connection(types.SimpleNamespace())
+        second = acp_server.Session(connection, "second", cwd)
+        connection.sessions[second.id] = second
+
+        storage_started = asyncio.Event()
+        release_storage = asyncio.Event()
+
+        async def blocked_storage(_function, *_args, **_kwargs):
+            storage_started.set()
+            await release_storage.wait()
+            return ["/tmp/repos/projet/.hublot/images/deuxieme.jpg"]
+
+        async def completed_turn(_turn) -> str:
+            return "end_turn"
+
+        blocks = [
+            {"type": "text", "text": "Deuxième demande"},
+            {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/jpeg"},
+        ]
+        with mock.patch("asyncio.to_thread", side_effect=blocked_storage), \
+             mock.patch.object(acp_server.PromptTurn, "run", completed_turn), \
+             mock.patch.object(acp_server.store, "list_sessions", create=True, return_value=[{
+                 "sessionId": "premier", "cwd": cwd, "title": "Première demande",
+                 "updatedAt": "2026-08-10T19:00:00.000Z", "exchanges": 1,
+             }]), \
+             mock.patch.object(acp_server.continuity, "list_sessions", return_value=[]):
+            prompt = asyncio.create_task(connection._prompt({
+                "sessionId": second.id, "prompt": blocks,
+            }))
+            await asyncio.wait_for(storage_started.wait(), timeout=1)
+
+            self.assertEqual(
+                {turn["sessionId"] for turn in acp_server.running_turns()},
+                {"premier", "second"},
+            )
+            self.assertEqual(
+                {session["sessionId"] for session in acp_server.session_catalog(cwd)},
+                {"premier", "second"},
+            )
+
+            release_storage.set()
+            self.assertEqual((await prompt)["stopReason"], "end_turn")
+
+    async def test_text_only_prompt_never_waits_for_attachment_storage(self) -> None:
+        connection = acp_server.Connection(types.SimpleNamespace())
+        session = acp_server.Session(connection, "texte-seul", "/tmp/repos/projet")
+        connection.sessions[session.id] = session
+        turn_started = asyncio.Event()
+        release_turn = asyncio.Event()
+
+        async def running_turn(_turn) -> str:
+            turn_started.set()
+            await release_turn.wait()
+            return "end_turn"
+
+        with mock.patch("asyncio.to_thread", new_callable=mock.AsyncMock) as storage, \
+             mock.patch.object(acp_server.PromptTurn, "run", running_turn):
+            prompt = asyncio.create_task(connection._prompt({
+                "sessionId": session.id,
+                "prompt": [{"type": "text", "text": "Demande sans image"}],
+            }))
+            await asyncio.wait_for(turn_started.wait(), timeout=1)
+
+            storage.assert_not_awaited()
+            self.assertIn(session.id, acp_server.ACTIVE_TURNS)
+            release_turn.set()
+            self.assertEqual((await prompt)["stopReason"], "end_turn")
+
+    async def test_cancel_during_attachment_storage_never_starts_the_engine(self) -> None:
+        connection = acp_server.Connection(types.SimpleNamespace())
+        session = acp_server.Session(connection, "annule", "/tmp/repos/projet")
+        connection.sessions[session.id] = session
+        storage_started = asyncio.Event()
+        release_storage = asyncio.Event()
+
+        async def blocked_storage(_function, *_args, **_kwargs):
+            storage_started.set()
+            await release_storage.wait()
+            return ["/tmp/repos/projet/.hublot/images/annule.jpg"]
+
+        with mock.patch("asyncio.to_thread", side_effect=blocked_storage), \
+             mock.patch.object(acp_server.PromptTurn, "run", new_callable=mock.AsyncMock) as run:
+            prompt = asyncio.create_task(connection._prompt({
+                "sessionId": session.id,
+                "prompt": [{"type": "image", "data": "aW1hZ2U=",
+                            "mimeType": "image/jpeg"}],
+            }))
+            await asyncio.wait_for(storage_started.wait(), timeout=1)
+
+            await connection._cancel({"sessionId": session.id})
+            release_storage.set()
+
+            self.assertEqual((await prompt)["stopReason"], "cancelled")
+            run.assert_not_awaited()
 
 
 class ContextPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -147,6 +399,33 @@ class ContextPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recorded, [])
 
 
+class CodexContextWindowTests(unittest.TestCase):
+    def test_every_selectable_model_uses_its_documented_global_window(
+        self,
+    ) -> None:
+        expected = {
+            "gpt-5.6-sol": 1_050_000,
+            "gpt-5.6-terra": 1_050_000,
+            "gpt-5.6-luna": 1_050_000,
+            "gpt-5.5": 1_050_000,
+            "gpt-5.4": 1_050_000,
+            "gpt-5.4-mini": 400_000,
+        }
+        # Valeur exacte du journal qui produisait la capture « 258 400 ».
+        for model, window in expected.items():
+            with self.subTest(model=model):
+                self.assertEqual(
+                    acp_server.codex_model_context_window(model, 258_400),
+                    window,
+                )
+
+    def test_an_unknown_model_keeps_the_window_measured_by_codex(self) -> None:
+        self.assertEqual(
+            acp_server.codex_model_context_window("future-model", 384_000),
+            384_000,
+        )
+
+
 class AuthSession:
     """Ce que la conversation reçoit vraiment : du texte et des bascules."""
 
@@ -163,7 +442,8 @@ class AuthSession:
     async def notify_engine(self, engine: str, reason: str) -> None:
         self.engines.append((engine, reason))
 
-    async def send_status(self, used: int = 0, size: int = 0) -> None:
+    async def send_status(self, used: int = 0, size: int = 0,
+                          *, persist: bool = False) -> None:
         pass
 
     async def update(self, _payload: dict, persist: bool = True) -> None:
@@ -278,6 +558,176 @@ class ClaudeAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("OAuth", acp_server.claude_auth_source())
 
 
+class CancelledTurnTests(unittest.IsolatedAsyncioTestCase):
+    """Arrêter un tour est un geste réussi, pas un incident.
+
+    Signalé depuis l'iPhone le 10 août 2026 : toucher le bouton d'arrêt
+    inscrivait « ⚠️ error_during_execution » dans le fil, juste avant
+    « interrompu ». Le moteur meurt sur son signal et Claude clôt le tour par un
+    `result` en erreur — c'est la mécanique de l'arrêt, pas une panne à lire.
+    """
+
+    async def test_stopping_a_turn_writes_no_error_in_the_thread(self) -> None:
+        session = AuthSession()
+        turn = acp_server.PromptTurn(session, "question")
+        await turn.cancel()
+
+        reason = await turn._translate({
+            "type": "result",
+            "is_error": True,
+            "subtype": "error_during_execution",
+        })
+
+        self.assertEqual(reason, "cancelled")
+        self.assertEqual(session.texts, [])
+
+    async def test_a_real_failure_is_still_reported(self) -> None:
+        """Le garde-fou ne doit pas rendre le serveur muet sur les vraies pannes."""
+        session = AuthSession()
+        turn = acp_server.PromptTurn(session, "question")
+
+        reason = await turn._translate({
+            "type": "result",
+            "is_error": True,
+            "result": "Output blocked by content filtering policy",
+        })
+
+        self.assertEqual(reason, "refusal")
+        self.assertTrue(
+            any("content filtering" in text for text in session.texts), session.texts
+        )
+
+
+class ClaudeUsageEndpointTests(unittest.TestCase):
+    """La source qui rend vraiment les plafonds de Claude.
+
+    Le 10 août 2026, la barre perdait sa cellule dès qu'on passait sur Claude.
+    `claude -p /usage` avait cessé de répondre ce qu'on croyait : hors session
+    interactive, le CLI traite `/usage` comme une demande ordinaire et rend un
+    récapitulatif de coût. Aucune fenêtre à en tirer, donc aucune jauge.
+    """
+
+    #: La charge exacte rendue par `/api/oauth/usage`, relevée sur le VPS.
+    PAYLOAD = {
+        "five_hour": {
+            "utilization": 82.0, "resets_at": "2026-08-11T07:00:00.299210+00:00",
+            "limit_dollars": None,
+        },
+        "seven_day": {
+            "utilization": 12.0, "resets_at": "2026-08-17T17:00:00.299237+00:00",
+        },
+    }
+
+    def test_both_windows_are_read_from_the_oauth_payload(self) -> None:
+        windows = acp_server.claude_usage_windows(self.PAYLOAD)
+
+        self.assertEqual(windows["five_hour"]["percent"], 82)
+        self.assertEqual(
+            windows["five_hour"]["resetsAt"], "2026-08-11T07:00:00.299210+00:00"
+        )
+        self.assertEqual(windows["seven_day"]["percent"], 12)
+
+    def test_what_the_cli_now_returns_yields_no_window(self) -> None:
+        """La sortie réelle de `claude -p /usage` en 2.1.220.
+
+        Elle ne doit surtout pas être lue comme une jauge : c'est un
+        récapitulatif de coût, pas un relevé de plafond.
+        """
+        result = (
+            "Total cost:            $0.0000\n"
+            "Total duration (API):  0s\n"
+            "Usage:                 0 input, 0 output, 0 cache read, 0 cache write"
+        )
+        self.assertEqual(acp_server.parse_claude_usage(result), {})
+
+    def test_a_missing_or_broken_window_is_left_out(self) -> None:
+        windows = acp_server.claude_usage_windows({
+            "five_hour": {"utilization": None},
+            "seven_day": {"utilization": 7.0},
+        })
+
+        self.assertNotIn("five_hour", windows)
+        self.assertEqual(windows["seven_day"]["percent"], 7)
+        self.assertIsNone(windows["seven_day"]["resetsAt"])
+
+    def test_the_call_carries_the_headers_the_cli_uses(self) -> None:
+        """Les identifiants viennent du CLI, et l'appel se présente comme lui.
+
+        Sans l'en-tête `anthropic-beta`, l'endpoint refuse la requête : ce sont
+        ces quatre lignes qui font la différence entre une jauge et un 401.
+        """
+        seen: dict[str, Any] = {}
+
+        class Response:
+            def read(self) -> bytes:
+                return json.dumps(ClaudeUsageEndpointTests.PAYLOAD).encode()
+
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+
+        def fake_open(request, timeout=0):
+            seen["url"] = request.full_url
+            seen["headers"] = {k.lower(): v for k, v in request.headers.items()}
+            return Response()
+
+        credentials = json.dumps({"claudeAiOauth": {"accessToken": "jeton-local"}})
+        with tempfile.TemporaryDirectory() as home:
+            claude = Path(home) / ".claude"
+            claude.mkdir()
+            (claude / ".credentials.json").write_text(credentials, encoding="utf-8")
+            with mock.patch.object(acp_server.Path, "home", return_value=Path(home)), \
+                 mock.patch.object(acp_server.urllib.request, "urlopen", fake_open):
+                windows = acp_server.claude_quota_windows()
+
+        self.assertEqual(windows["five_hour"]["percent"], 82)
+        self.assertEqual(seen["url"], acp_server.CLAUDE_USAGE_URL)
+        self.assertEqual(seen["headers"]["authorization"], "Bearer jeton-local")
+        self.assertEqual(seen["headers"]["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(seen["headers"]["anthropic-version"], "2023-06-01")
+
+    def test_a_rate_limited_endpoint_keeps_the_previous_gauge(self) -> None:
+        """Le `429` est le régime normal de cet endpoint, pas une panne.
+
+        La jauge doit garder sa dernière valeur plutôt que disparaître — c'est
+        exactement ce que le cache promet, et ce qui rend l'endpoint utilisable.
+        """
+        cache = acp_server.QuotaCache(ttl=900.0, retry=120.0)
+        first = cache.read(lambda: {"five_hour": {"percent": 82, "resetsAt": None}})
+        self.assertEqual(first["five_hour"]["percent"], 82)
+
+        cache.next_read = 0.0  # l'échéance est passée
+
+        def refused() -> dict[str, Any]:
+            raise urllib.error.HTTPError(
+                acp_server.CLAUDE_USAGE_URL, 429, "Too Many Requests", {}, None
+            )
+
+        self.assertEqual(cache.read(refused)["five_hour"]["percent"], 82)
+
+    def test_the_delay_asked_by_the_endpoint_is_honoured(self) -> None:
+        """Relevé sur le VPS : `Retry-After: 2353`, soit trente-neuf minutes.
+
+        Réessayer toutes les deux minutes ne fait que prolonger la punition sans
+        jamais obtenir la jauge.
+        """
+        cache = acp_server.QuotaCache(ttl=1_800.0, retry=120.0)
+        cache.value = {"five_hour": {"percent": 82, "resetsAt": None}}
+        cache.next_read = 0.0
+
+        def refused() -> dict[str, Any]:
+            raise urllib.error.HTTPError(
+                acp_server.CLAUDE_USAGE_URL, 429, "Too Many Requests",
+                {"Retry-After": "2353"}, None,
+            )
+
+        before = time.monotonic()
+        cache.read(refused)
+
+        self.assertGreaterEqual(cache.next_read - before, 2_353)
+        # Et sans en-tête, on retombe sur le repli maison plutôt que sur zéro.
+        self.assertEqual(acp_server.retry_after_seconds(RuntimeError("rien")), 0.0)
+
+
 class ClaudeQuotaTests(unittest.TestCase):
     """Ce que `/usage` sait dire, et ce qu'il faut en tirer sans se tromper.
 
@@ -330,27 +780,10 @@ class ClaudeQuotaTests(unittest.TestCase):
     def test_prose_without_any_window_yields_nothing(self) -> None:
         self.assertEqual(acp_server.parse_claude_usage("Total cost: $0.0000"), {})
 
-    def test_the_environment_token_is_dropped_for_this_call_only(self) -> None:
-        # Le jeton de `setup-token` fait tourner les moteurs mais ferme
-        # `/usage`, et il l'emporte sur la session dès qu'il est présent.
-        seen: dict[str, Any] = {}
-
-        def fake_run(_args, **kwargs):
-            seen.update(kwargs["env"])
-            return types.SimpleNamespace(
-                returncode=0, stdout=json.dumps({"result": self.VPS}), stderr="",
-            )
-
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "jeton"}), \
-             mock.patch.object(acp_server.subprocess, "run", side_effect=fake_run):
-            windows = acp_server.claude_quota_windows()
-            # L'environnement du serveur, lui, garde son jeton : les tours en
-            # dépendent, et c'est ce qui fait qu'une session morte ne coûte que
-            # la jauge.
-            self.assertEqual(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), "jeton")
-
-        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", seen)
-        self.assertEqual(windows["five_hour"]["percent"], 52)
+    # Le test du jeton d'environnement écarté pour ce seul appel est parti avec
+    # son mécanisme : les plafonds ne passent plus par `claude -p /usage`, donc
+    # `CLAUDE_CODE_OAUTH_TOKEN` n'intervient plus dans leur lecture. Voir
+    # `ClaudeUsageEndpointTests` pour la source qui l'a remplacé.
 
 
 class CodexQuotaTests(unittest.TestCase):
@@ -419,6 +852,108 @@ class QuotaCacheTests(unittest.TestCase):
         self.assertEqual(cache.read(failing)["five_hour"]["percent"], 55)
         self.assertEqual(cache.read(failing)["five_hour"]["percent"], 55)
         self.assertEqual(len(boom), 1, "on ne réessaie pas à chaque mesure")
+
+
+class ActiveTurnConfigurationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_engine_cannot_be_changed_under_a_running_turn(self) -> None:
+        connection = acp_server.Connection(types.SimpleNamespace())
+        session = types.SimpleNamespace(turn=object())
+        connection.sessions["session-test"] = session
+
+        with self.assertRaisesRegex(ValueError, "tour en cours"):
+            await connection._set_config_option({
+                "sessionId": "session-test", "configId": "engine",
+                "type": "select", "value": "claude",
+            })
+
+    async def test_status_is_republished_after_the_running_engine_detaches(self) -> None:
+        connection = acp_server.Connection(types.SimpleNamespace())
+
+        class Session:
+            id = "session-test"
+            cwd = "/tmp/repos/projet"
+            turn = None
+
+            def __init__(self) -> None:
+                self.statuses = 0
+
+            async def send_status(self, used: int = 0, size: int = 0,
+                                  *, persist: bool = False) -> None:
+                self.statuses += 1
+
+        class Turn:
+            def __init__(self, session, _text) -> None:
+                self.session = session
+                self.finished = asyncio.Event()
+                # Le rangement des pièces jointes a déplacé le départ du moteur
+                # dans le `try` : le tour y est consulté avant de courir.
+                self.cancelled = False
+                self.text = _text
+
+            async def run(self) -> str:
+                return "end_turn"
+
+            def detach(self) -> None:
+                self.session.turn = None
+
+        session = Session()
+        connection.sessions[session.id] = session
+        with mock.patch.object(acp_server, "PromptTurn", Turn):
+            result = await connection._prompt({
+                "sessionId": session.id,
+                "prompt": [{"type": "text", "text": "question"}],
+            })
+
+        self.assertEqual(result, {"stopReason": "end_turn"})
+        self.assertEqual(session.statuses, 1)
+        self.assertIsNone(session.turn)
+
+    async def test_a_failed_status_republication_never_hides_the_turn_verdict(
+        self,
+    ) -> None:
+        """Le tour a répondu ; la jauge est un confort, pas son verdict.
+
+        La republication vit dans un `finally` : sans garde-fou, une lecture de
+        quota en panne y lèverait après coup et le client recevrait une erreur
+        JSON-RPC pour une réponse qu'il a pourtant reçue en entier.
+        """
+        connection = acp_server.Connection(types.SimpleNamespace())
+
+        class Session:
+            id = "session-test"
+            cwd = "/tmp/repos/projet"
+            turn = None
+
+            async def send_status(self, used: int = 0, size: int = 0,
+                                  *, persist: bool = False) -> None:
+                raise RuntimeError("quota illisible")
+
+        class Turn:
+            def __init__(self, session, text) -> None:
+                self.session = session
+                self.finished = asyncio.Event()
+                self.cancelled = False
+                self.text = text
+
+            async def run(self) -> str:
+                return "end_turn"
+
+            def detach(self) -> None:
+                self.session.turn = None
+
+        session = Session()
+        connection.sessions[session.id] = session
+        with mock.patch.object(acp_server, "PromptTurn", Turn):
+            result = await connection._prompt({
+                "sessionId": session.id,
+                "prompt": [{"type": "text", "text": "question"}],
+            })
+
+        self.assertEqual(result, {"stopReason": "end_turn"})
+        # Et le tour est bien sorti du registre : une panne de statut ne doit
+        # pas non plus laisser la conversation « occupée » pour toujours.
+        self.assertNotIn(session.id, acp_server.ACTIVE_TURNS)
+        self.assertIsNone(session.turn)
 
 
 if __name__ == "__main__":

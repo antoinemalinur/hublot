@@ -253,7 +253,7 @@ private struct TideCurve: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private var animates: Bool { isLive && !reduceMotion }
+    private var animates: Bool { isLive && !HublotMotion.isReduced(reduceMotion) }
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !animates)) { time in
@@ -425,6 +425,7 @@ private struct SampleInspector: View {
             Text("\(sample.used.formatted()) / \(sample.size.formatted()) jetons")
                 .font(.hublotMono)
                 .foregroundStyle(Hublot.prose)
+                .accessibilityIdentifier("context-token-count")
 
             // Le sommet n'apparaît que s'il est derrière nous : une compaction
             // fait retomber le contexte, et c'est justement ce qu'on veut voir.
@@ -468,6 +469,15 @@ extension ContextTideView {
             return ContextTideView(
                 projectName: "Office Chess", history: samples, isLive: true
             )
+        }
+
+        /// Meme donnees, mais sans pulsation temporelle pour la reference
+        /// visuelle. Le scenario interactif reste vivant et continue de
+        /// verifier le retour au direct.
+        static var snapshotDemo: ContextTideView {
+            var view = demo
+            view.isLive = false
+            return view
         }
     #endif
 }
