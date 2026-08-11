@@ -43,6 +43,13 @@ struct IAClient_UIApp: App {
                     )
                 case .projects:
                     ProjectsScreenFixture(projects: ProjectListResult.Project.samples)
+                case .projectsPromptAge:
+                    ProjectsScreenFixture(projects: [
+                        .init(
+                            name: "dernier-prompt", path: "/root/repos/dernier-prompt",
+                            sessionCount: 3, updatedAt: .now.addingTimeInterval(-3_600)
+                        ),
+                    ])
                 case .projectsEmpty:
                     ProjectsScreenFixture(projects: [])
                 case .projectsError:

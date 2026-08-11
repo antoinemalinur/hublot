@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import continuity
 
@@ -145,6 +147,21 @@ class ContinuityRadiographyTests(unittest.TestCase):
         self.assertTrue(continuity.forget(self.cwd, self.session_id))
         self.assertEqual(continuity.replay(self.cwd, self.session_id), [])
         self.assertFalse(continuity.forget(self.cwd, self.session_id))
+
+    def test_technical_writes_do_not_replace_the_last_prompt_time(self) -> None:
+        prompt_time = 1_786_371_600.0
+        with patch("continuity.time.time", return_value=prompt_time):
+            continuity.record(self.cwd, self.session_id, "user", "Une demande")
+        continuity.record_usage(self.cwd, self.session_id, {
+            "sessionUpdate": "usage_update", "used": 4_200, "size": 200_000,
+            "ts": "2026-08-10T19:12:00.000Z",
+        })
+        transcript, _ = continuity._paths(self.cwd, self.session_id)
+        os.utime(transcript, (prompt_time + 18_000, prompt_time + 18_000))
+
+        listed = continuity.list_sessions(self.cwd)
+
+        self.assertEqual(listed[0]["updatedAt"], continuity._iso(prompt_time))
 
 
 if __name__ == "__main__":

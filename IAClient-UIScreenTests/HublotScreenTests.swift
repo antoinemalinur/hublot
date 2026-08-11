@@ -78,6 +78,16 @@ final class ConnectionScreenTests: HublotUITestCase {
 }
 
 final class ProjectsScreenTests: HublotUITestCase {
+    func testProjectAgeShowsTheLastPromptTime() {
+        launch("projects-prompt-age")
+
+        let project = app.buttons.matching(
+            NSPredicate(format: "label CONTAINS 'dernier-prompt'")
+        ).firstMatch
+        XCTAssertTrue(project.waitForExistence(timeout: 3))
+        XCTAssertTrue(project.label.contains("il y a 1 h"), project.label)
+    }
+
     func testSearchIsCaseInsensitiveAndItsEmptyStateIsObservable() {
         launch("projects")
 

@@ -51,7 +51,14 @@ def record(cwd: str, session_id: str, role: str, text: str, engine: str | None =
     transcript.parent.mkdir(parents=True, exist_ok=True)
     with transcript.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(
-            {"role": role, "engine": engine, "text": text}, ensure_ascii=False
+            {
+                "role": role, "engine": engine, "text": text,
+                # Le mtime change aussi quand une mesure de contexte ou un
+                # outil est rejoué. L'instant du message doit donc voyager
+                # avec lui pour que les listes datent la dernière demande.
+                "timestamp": now_iso(),
+            },
+            ensure_ascii=False,
         ) + "\n")
 
 
@@ -176,23 +183,31 @@ def list_sessions(cwd: str) -> list[dict[str, Any]]:
     for path in directory.glob("*.jsonl"):
         entries = _transcript(cwd, path.stem)
         prompts = [
-            str(entry.get("text") or "").strip()
-            for entry in entries if entry.get("role") == "user"
+            entry for entry in entries
+            if entry.get("role") == "user"
+            and str(entry.get("text") or "").strip()
         ]
-        prompts = [prompt for prompt in prompts if prompt]
         if not prompts:
             continue
         try:
             modified = path.stat().st_mtime
         except OSError:
             continue
-        flat = " ".join(prompts[0].split())
+        first_prompt = str(prompts[0].get("text") or "")
+        flat = " ".join(first_prompt.split())
         title = flat[:79] + "…" if len(flat) > 80 else flat
+        last_prompt_at = prompts[-1].get("timestamp")
         sessions.append({
             "sessionId": path.stem,
             "cwd": cwd,
             "title": title or "Conversation",
-            "updatedAt": _iso(modified),
+            # Les anciens fils n'avaient pas encore d'horodatage par message ;
+            # leur mtime reste le seul repli possible jusqu'au prompt suivant.
+            "updatedAt": (
+                last_prompt_at
+                if isinstance(last_prompt_at, str) and last_prompt_at
+                else _iso(modified)
+            ),
             "exchanges": len(prompts),
         })
     sessions.sort(key=lambda session: session["updatedAt"], reverse=True)
