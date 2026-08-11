@@ -92,6 +92,23 @@ final class ChatSession {
     /// lancé — typiquement celui qui tournait encore pendant la veille.
     private(set) var isRemoteTurnRunning = false
 
+    /// Les demandes écrites pendant que l'agent travaille encore.
+    ///
+    /// Elles restent ici, au niveau du fil, plutôt que dans le composer : une
+    /// rotation, une reconstruction SwiftUI ou la fermeture du clavier ne doit
+    /// jamais perdre un message que l'interface a annoncé « en attente ».
+    private(set) var queuedPromptCount = 0
+
+    private struct QueuedPrompt {
+        let text: String
+        let attachments: [Attachment]
+    }
+
+    private var promptQueue: [QueuedPrompt] = []
+    /// Une seule tâche vide la file. Sans ce verrou logique, deux taps rapides
+    /// pourraient lancer deux `session/prompt` en parallèle sur le même fil.
+    private var isDrainingPromptQueue = false
+
     private let connection: ACPConnection
     private let events: AsyncStream<ACPConnection.Event>
     private let workingDirectory: String
@@ -197,7 +214,34 @@ final class ChatSession {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         // Une image seule est une demande valable : « regarde ça ». Ce qu'elle
         // veut dire, le serveur l'écrira à côté du chemin du fichier.
-        guard !trimmed.isEmpty || !attachments.isEmpty, let sessionId else { return }
+        guard !trimmed.isEmpty || !attachments.isEmpty, sessionId != nil else { return }
+
+        promptQueue.append(.init(text: trimmed, attachments: attachments))
+        queuedPromptCount = promptQueue.count
+        await drainPromptQueue()
+    }
+
+    /// Vide la file strictement dans l'ordre, et seulement quand aucun tour
+    /// repris depuis le serveur ne possède encore la main.
+    private func drainPromptQueue() async {
+        guard !isDrainingPromptQueue, !isRemoteTurnRunning else { return }
+        isDrainingPromptQueue = true
+        defer { isDrainingPromptQueue = false }
+
+        while !promptQueue.isEmpty, !isRemoteTurnRunning {
+            let prompt = promptQueue.removeFirst()
+            queuedPromptCount = promptQueue.count
+            guard await perform(prompt) else { return }
+        }
+    }
+
+    /// Exécute une seule demande. La séparation avec `send` est ce qui permet
+    /// à l'appel public de ranger un message sans emboîter un second tour dans
+    /// celui qui est déjà suspendu sur le réseau.
+    private func perform(_ prompt: QueuedPrompt) async -> Bool {
+        guard let sessionId else { return false }
+        let trimmed = prompt.text
+        let attachments = prompt.attachments
 
         isReplaying = false
         isPrompting = true
@@ -233,9 +277,11 @@ final class ChatSession {
             // sur une réponse encore en train de s'écrire à l'écran.
             await settle(reason: result.stopReason)
             environment.notifyTurnFinished(title, lastAssistantText)
+            return true
         } catch {
             finishStreaming(reason: nil)
             status = .failed(error.localizedDescription)
+            return false
         }
     }
 
@@ -461,6 +507,9 @@ final class ChatSession {
             isRemoteTurnRunning = false
             finishStreaming(reason: beat.stopReason)
             environment.notifyTurnFinished(title, lastAssistantText)
+            // Aucun appel local n'attend la fin d'un tour repris. Sa dernière
+            // pulsation doit donc réveiller explicitement la file.
+            Task { [weak self] in await self?.drainPromptQueue() }
         }
     }
 

@@ -175,6 +175,92 @@ struct ChatSessionSettingsTests {
         #expect(await bench.until { await transport.methods().contains("session/cancel") })
     }
 
+    @Test("Les messages ecrits pendant un tour partent ensuite, un par un")
+    func promptsQueueBehindTheCurrentTurn() async throws {
+        let transport = HeldPromptTransport()
+        let connection = ACPConnection(transport: transport)
+        try await connection.start()
+        let chat = ChatSession(
+            connection: connection, events: await connection.subscribe(),
+            workingDirectory: "/root/repos/demo", sessionId: Bench.sessionId,
+            title: "demo", environment: .ephemeral()
+        )
+
+        let first = Task { await chat.send("Premiere demande") }
+        #expect(await eventually { await transport.promptCount() == 1 })
+        #expect(chat.isWorking)
+
+        // Les appels suivants rendent la main tout de suite : ils ne doivent
+        // ni parler au serveur, ni apparaître comme déjà envoyés dans le fil.
+        await chat.send("Deuxieme demande")
+        await chat.send("Troisieme demande")
+        #expect(chat.queuedPromptCount == 2)
+        #expect(await transport.promptCount() == 1)
+        #expect(userTexts(in: chat) == ["Premiere demande"])
+
+        await transport.finishNextPrompt()
+        #expect(await eventually { await transport.promptCount() == 2 })
+        #expect(chat.queuedPromptCount == 1)
+        #expect(userTexts(in: chat) == ["Premiere demande", "Deuxieme demande"])
+
+        await transport.finishNextPrompt()
+        #expect(await eventually { await transport.promptCount() == 3 })
+        #expect(chat.queuedPromptCount == 0)
+        #expect(userTexts(in: chat) == [
+            "Premiere demande", "Deuxieme demande", "Troisieme demande",
+        ])
+
+        await transport.finishNextPrompt()
+        await first.value
+        #expect(!chat.isWorking)
+    }
+
+    @Test("La fin d'un tour repris reveille la file locale")
+    func queuedPromptStartsAfterRemoteTurnFinishes() async throws {
+        let transport = HeldPromptTransport()
+        let connection = ACPConnection(transport: transport)
+        try await connection.start()
+        let chat = ChatSession(
+            connection: connection, events: await connection.subscribe(),
+            workingDirectory: "/root/repos/demo", sessionId: Bench.sessionId,
+            title: "demo", environment: .ephemeral()
+        )
+
+        await transport.emit(Self.activity(
+            Bench.sessionId, #""running":true,"phase":"thinking","elapsed":12,"quiet":1"#
+        ))
+        #expect(await eventually { chat.isWorking })
+
+        await chat.send("A envoyer au retour")
+        #expect(chat.queuedPromptCount == 1)
+        #expect(await transport.promptCount() == 0)
+
+        await transport.emit(Self.activity(
+            Bench.sessionId,
+            #""running":false,"phase":"done","elapsed":15,"quiet":0,"stopReason":"end_turn""#
+        ))
+        #expect(await eventually { await transport.promptCount() == 1 })
+        #expect(userTexts(in: chat) == ["A envoyer au retour"])
+
+        await transport.finishNextPrompt()
+        #expect(await eventually { !chat.isWorking })
+    }
+
+    private func eventually(_ condition: () async -> Bool, limit: Int = 500) async -> Bool {
+        for _ in 0..<limit {
+            if await condition() { return true }
+            await Task.yield()
+        }
+        return await condition()
+    }
+
+    private func userTexts(in chat: ChatSession) -> [String] {
+        chat.turns.compactMap { turn in
+            if case .user(let user) = turn { return user.text }
+            return nil
+        }
+    }
+
     @Test("Ouvrir le fil ouvre la liaison qui le porte")
     func startingTheThreadOpensTheLink() async throws {
         let transport = ScriptedTransport()
@@ -401,5 +487,54 @@ actor ScriptedTransport: ACPTransport {
         }
         let result = replies[method] ?? "{}"
         continuation?.yield(Data(#"{"jsonrpc":"2.0","id":\#(id),"result":\#(result)}"#.utf8))
+    }
+}
+
+/// Garde les réponses de `session/prompt` jusqu'à ce que le test les libère.
+/// C'est la seule manière de prouver qu'un deuxième message n'est pas parti en
+/// parallèle : un relais qui répond immédiatement ne laisse aucune file vivre.
+actor HeldPromptTransport: ACPTransport {
+    private var stream: AsyncThrowingStream<Data, Error>?
+    private var continuation: AsyncThrowingStream<Data, Error>.Continuation?
+    private var promptIDs: [Int] = []
+    private var nextPromptToFinish = 0
+
+    var frames: AsyncThrowingStream<Data, Error> {
+        if let stream { return stream }
+        let pair = AsyncThrowingStream<Data, Error>.makeStream()
+        stream = pair.stream
+        continuation = pair.continuation
+        return pair.stream
+    }
+
+    func connect() async throws { _ = frames }
+    func disconnect() async { continuation?.finish() }
+
+    func emit(_ line: String) { continuation?.yield(Data(line.utf8)) }
+    func promptCount() -> Int { promptIDs.count }
+
+    func finishNextPrompt() {
+        guard promptIDs.indices.contains(nextPromptToFinish) else { return }
+        let id = promptIDs[nextPromptToFinish]
+        nextPromptToFinish += 1
+        continuation?.yield(Data(
+            #"{"jsonrpc":"2.0","id":\#(id),"result":{"stopReason":"end_turn"}}"#.utf8
+        ))
+    }
+
+    func send(_ frame: Data) async throws {
+        guard
+            let object = try JSONSerialization.jsonObject(with: frame) as? [String: Any],
+            let method = object["method"] as? String,
+            let id = object["id"] as? Int
+        else { return }
+
+        if method == "session/prompt" {
+            promptIDs.append(id)
+        } else {
+            continuation?.yield(Data(
+                #"{"jsonrpc":"2.0","id":\#(id),"result":{}}"#.utf8
+            ))
+        }
     }
 }

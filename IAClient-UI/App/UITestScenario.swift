@@ -13,6 +13,7 @@
         case sessionsError = "sessions-error"
         case sessionsInstructions = "sessions-instructions"
         case conversation
+        case conversationWorking = "conversation-working"
         case codexQuota = "codex-quota"
         case contextTide = "context-tide"
         case radiography

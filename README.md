@@ -148,6 +148,7 @@ n'en ressort pas.
 - envoi de photos : l'image est réduite sur le téléphone, posée sur le VPS, lue
   par le moteur ;
 - dictée via Whisper, notifications locales, arrêt d'un tour en cours ;
+- messages écrits pendant un tour rangés en file puis envoyés dans l'ordre ;
 - demandes de permission avec la commande réelle sous les yeux ;
 - lecture du `CLAUDE.md` d'un projet.
 

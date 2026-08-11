@@ -27,6 +27,8 @@ struct IAClient_UIApp: App {
                     ConversationView.codexQuotaDemo
                 case .conversation:
                     ConversationView.screenTestDemo
+                case .conversationWorking:
+                    ConversationQueueFixture()
                 case .sessions, .sessionsInstructions:
                     let project = ProjectListResult.Project.samples[1]
                     SessionsScreenFixture(
@@ -106,6 +108,19 @@ struct IAClient_UIApp: App {
             )
         }
     }
+
+    /// Un tour volontairement interminable pour exercer le composer sans
+    /// réseau. Le callback rend la mise en file observable par XCTest.
+    private struct ConversationQueueFixture: View {
+        @State private var queuedPromptCount = 0
+
+        var body: some View {
+            ConversationView.workingScreenTestDemo(
+                queuedPromptCount: queuedPromptCount,
+                onSend: { _, _ in queuedPromptCount += 1 }
+            )
+        }
+    }
 #endif
 
 /// La racine : connexion → projets → conversations → fil.
@@ -148,6 +163,7 @@ struct RootView: View {
                         activity: chat.activity,
                         activityAt: chat.activityAt,
                         isWorking: chat.isWorking,
+                        queuedPromptCount: chat.queuedPromptCount,
                         isReconnecting: model.isReconnecting,
                         onStop: { Task { await chat.cancel() } },
                         onDictate: { audio in try? await chat.transcribe(audio) }
