@@ -829,6 +829,11 @@ struct Composer: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Hublot.ember)
                     .padding(.horizontal, Hublot.unit * 1.5)
+                    // Un `Label` expose son icône et son texte séparément : les
+                    // deux héritaient de l'identifiant, VoiceOver énonçait la
+                    // file en deux temps et toute recherche par identifiant en
+                    // trouvait deux. Le compteur est une seule information.
+                    .accessibilityElement(children: .combine)
                     .accessibilityIdentifier("composer-queue")
                     .transition(.opacity.combined(with: .offset(y: 6)))
                 }
@@ -1011,10 +1016,13 @@ struct Composer: View {
     private func liveLabel(for option: ConfigOption) -> String? {
         guard isWorking else { return nil }
         switch option.id {
-        case "engine": engine.label
-        case "model": status?.model
-        case "effort": status?.effort?.capitalized
-        default: nil
+        // Le moteur en vol se nomme comme l'option le nomme au repos : « Codex »
+        // et non son `rawValue`. Sans ce détour, la pastille changeait de casse
+        // au départ du tour et revenait à « Codex » à son terme.
+        case "engine": return option.name(for: engine.rawValue)
+        case "model": return status?.model
+        case "effort": return status?.effort?.capitalized
+        default: return nil
         }
     }
 }

@@ -27,6 +27,17 @@ class HublotUITestCase: XCTestCase {
         app.descendants(matching: .any)[identifier]
     }
 
+    /// Le libellé, avec ses espaces insécables ramenées à des espaces ordinaires.
+    ///
+    /// La typographie française en pose entre un nombre et son unité — « 1 h »
+    /// s'écrit avec U+00A0. C'est l'affichage correct, mais une assertion tapée
+    /// au clavier ne le retrouve jamais : elle échoue sur un écran pourtant juste.
+    func plainLabel(of candidate: XCUIElement) -> String {
+        candidate.label
+            .replacingOccurrences(of: "\u{00A0}", with: " ")
+            .replacingOccurrences(of: "\u{202F}", with: " ")
+    }
+
     func assertInsideScreen(_ candidate: XCUIElement, inset: CGFloat = 1) {
         XCTAssertTrue(candidate.exists)
         let bounds = app.frame.insetBy(dx: -inset, dy: -inset)
@@ -85,7 +96,10 @@ final class ProjectsScreenTests: HublotUITestCase {
             NSPredicate(format: "label CONTAINS 'dernier-prompt'")
         ).firstMatch
         XCTAssertTrue(project.waitForExistence(timeout: 3))
-        XCTAssertTrue(project.label.contains("il y a 1 h"), project.label)
+        // Le repère du bug : le projet est daté d'une heure. Tant que la liste
+        // suivait le mtime du fichier, une simple relecture le ramenait à
+        // « maintenant » — c'est cet écart-là que l'âge affiché doit trahir.
+        XCTAssertTrue(plainLabel(of: project).contains("il y a 1 h"), project.label)
     }
 
     func testSearchIsCaseInsensitiveAndItsEmptyStateIsObservable() {
