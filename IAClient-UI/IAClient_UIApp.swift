@@ -25,6 +25,8 @@ struct IAClient_UIApp: App {
                     }
                 case .codexQuota:
                     ConversationView.codexQuotaDemo
+                case .activeEngineLock:
+                    ConversationView.activeEngineLockDemo
                 case .conversation:
                     ConversationView.screenTestDemo
                 case .sessions, .sessionsInstructions:

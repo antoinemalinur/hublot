@@ -65,6 +65,25 @@ struct ChatSessionSettingsTests {
         #expect(await transport.methods().contains("session/set_config_option") == false)
     }
 
+    @Test("Un moteur en cours verrouille ses réglages jusqu'à sa fin")
+    func activeTurnRejectsASettingChangeLocally() async throws {
+        let transport = ScriptedTransport(replies: [
+            "session/set_config_option": Self.options(current: "sonnet")
+        ])
+        let bench = try await Bench(transport: transport)
+        bench.chat.apply(try Self.setup())
+        let option = try #require(bench.chat.configOptions.first)
+        await transport.emit(Self.activity(
+            Bench.sessionId, #""running":true,"phase":"tool","engine":"codex","elapsed":8,"quiet":1"#
+        ))
+        #expect(await bench.until { bench.chat.isWorking })
+
+        await bench.chat.choose(option, value: "sonnet")
+
+        #expect(bench.chat.configOptions.first?.currentValueString == "opus")
+        #expect(await transport.methods().contains("session/set_config_option") == false)
+    }
+
     // MARK: Les permissions
 
     @Test("Une demande de permission dit ce que l'agent s'apprete vraiment a faire")

@@ -125,6 +125,7 @@ struct ConversationView: View {
                 Composer(
                     engine: engine,
                     configOptions: configOptions,
+                    status: status,
                     commands: commands,
                     onChoose: onChoose,
                     isWorking: isWorking,
@@ -682,6 +683,7 @@ struct PlanRing: View {
 struct Composer: View {
     let engine: Engine
     var configOptions: [ConfigOption] = []
+    var status: SessionStatus?
     var commands: [String] = []
     var onChoose: (ConfigOption, String) -> Void = { _, _ in }
     var isWorking = false
@@ -811,7 +813,15 @@ struct Composer: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: Hublot.unit) {
                             ForEach(configOptions) { option in
-                                PillMenu(option: option) { onChoose(option, $0) }
+                                PillMenu(
+                                    option: option,
+                                    displayLabel: liveLabel(for: option)
+                                ) { onChoose(option, $0) }
+                                    // Modèle, effort et moteur ne peuvent agir
+                                    // qu'au prochain tour. Les laisser changer
+                                    // pendant celui-ci donnait deux vérités à
+                                    // l'écran : Claude en bas, Codex en haut.
+                                    .disabled(isWorking && option.id != "permission")
                             }
                         }
                         .padding(.trailing, Hublot.unit * 2)
@@ -945,6 +955,21 @@ struct Composer: View {
             Task { await absorb(items) }
         }
     }
+
+    /// Pendant un tour, les descripteurs de réglages disent encore ce qui est
+    /// configuré pour le prochain départ. La rangée, elle, est lue comme l'état
+    /// présent. Si Claude est épinglé mais indisponible, Codex assure l'intérim :
+    /// montrer « Claude · Opus » sous sa jauge Codex reproduit exactement la
+    /// contradiction signalée. Le statut vivant gagne jusqu'à la fin du tour.
+    private func liveLabel(for option: ConfigOption) -> String? {
+        guard isWorking else { return nil }
+        switch option.id {
+        case "engine": engine.label
+        case "model": status?.model
+        case "effort": status?.effort?.capitalized
+        default: nil
+        }
+    }
 }
 
 /// Une image jointe, dans le composer : la vignette, son poids, et de quoi la
@@ -988,6 +1013,7 @@ struct AttachmentChip: View {
 /// séparée, l'espace en bas d'écran est trop cher.
 struct PillMenu: View {
     let option: ConfigOption
+    var displayLabel: String?
     let onSelect: (String) -> Void
 
     var body: some View {
@@ -1009,7 +1035,7 @@ struct PillMenu: View {
                 .disabled(choice.value == option.currentValueString)
             }
         } label: {
-            capsule(option.currentLabel)
+            capsule(displayLabel ?? option.currentLabel)
         }
         .buttonStyle(.plain)
         .glassEffect(.regular.interactive(), in: .capsule)
@@ -1105,6 +1131,41 @@ struct CommandPalette: View {
                     "seven_day": .init(percent: 64, resetsAt: .now.addingTimeInterval(172_800)),
                 ]
             ))
+        }
+
+        /// Le cas de la capture du 10 août : Codex travaille encore et le
+        /// sélecteur ne doit pas permettre d'afficher Claude comme moteur
+        /// courant avant que le bouton d'arrêt ait rendu la main.
+        static var activeEngineLockDemo: ConversationView {
+            ConversationView(
+                sessionTitle: "Vérifier le dépôt", engine: .codex,
+                turns: [.assistant(.init(id: "live", markdown: "Codex travaille."))],
+                configOptions: [
+                    ConfigOption(
+                        id: "engine", name: "Moteur", category: "mode", type: "select",
+                        // Le prochain tour est épinglé sur Claude, mais le tour
+                        // déjà en vol est Codex : c'est l'état de la capture.
+                        currentValue: .string("claude"),
+                        options: [
+                            .init(value: "claude", name: "Claude", description: nil),
+                            .init(value: "codex", name: "Codex", description: nil),
+                        ]
+                    )
+                ],
+                status: SessionStatus(
+                    model: "GPT-5.6-Sol", effort: "max", engine: "codex",
+                    limits: [
+                        "seven_day": .init(
+                            percent: 36, resetsAt: .now.addingTimeInterval(118 * 60 + 27)
+                        )
+                    ]
+                ),
+                contextPercent: 14,
+                activity: .init(
+                    running: true, phase: .thinking, engine: "codex", elapsed: 89, quiet: 1
+                ),
+                activityAt: .now, isWorking: true
+            )
         }
 
         private static func demo(engine: Engine, status: SessionStatus) -> ConversationView {

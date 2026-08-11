@@ -18,6 +18,11 @@ from unittest import mock
 # les exerce pas dans ces tests : de petits substituts suffisent pour importer
 # ses classes et tester le contrat de streaming lui-même.
 os.environ.setdefault("ACP_TOKEN", "test-token")
+# `acp_server` donne normalement priorité à `/opt/tg-claude`. En test, cela
+# chargeait les anciennes copies de `continuity.py` et `sessions.py` installées
+# sur la machine, puis les laissait dans `sys.modules` pour toute la découverte.
+# La suite dépendait donc de son ordre et de l'état du VPS local.
+os.environ.setdefault("TG_CLAUDE_BASE", str(Path(__file__).resolve().parent))
 sys.modules.setdefault("bot", types.SimpleNamespace(
     REPOS_BASE="/tmp/repos",
     CODEX_MODEL="gpt-test",
@@ -36,7 +41,6 @@ sys.modules.setdefault("bot", types.SimpleNamespace(
     mark_claude_unavailable=lambda _reason, **_kwargs: None,
 ))
 sys.modules.setdefault("handoff", types.SimpleNamespace())
-sys.modules.setdefault("sessions", types.SimpleNamespace())
 
 import acp_server  # noqa: E402
 
@@ -419,6 +423,56 @@ class QuotaCacheTests(unittest.TestCase):
         self.assertEqual(cache.read(failing)["five_hour"]["percent"], 55)
         self.assertEqual(cache.read(failing)["five_hour"]["percent"], 55)
         self.assertEqual(len(boom), 1, "on ne réessaie pas à chaque mesure")
+
+
+class ActiveTurnConfigurationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_engine_cannot_be_changed_under_a_running_turn(self) -> None:
+        connection = acp_server.Connection(types.SimpleNamespace())
+        session = types.SimpleNamespace(turn=object())
+        connection.sessions["session-test"] = session
+
+        with self.assertRaisesRegex(ValueError, "tour en cours"):
+            await connection._set_config_option({
+                "sessionId": "session-test", "configId": "engine",
+                "type": "select", "value": "claude",
+            })
+
+    async def test_status_is_republished_after_the_running_engine_detaches(self) -> None:
+        connection = acp_server.Connection(types.SimpleNamespace())
+
+        class Session:
+            id = "session-test"
+            cwd = "/tmp/repos/projet"
+            turn = None
+
+            def __init__(self) -> None:
+                self.statuses = 0
+
+            async def send_status(self) -> None:
+                self.statuses += 1
+
+        class Turn:
+            def __init__(self, session, _text) -> None:
+                self.session = session
+                self.finished = asyncio.Event()
+
+            async def run(self) -> str:
+                return "end_turn"
+
+            def detach(self) -> None:
+                self.session.turn = None
+
+        session = Session()
+        connection.sessions[session.id] = session
+        with mock.patch.object(acp_server, "PromptTurn", Turn):
+            result = await connection._prompt({
+                "sessionId": session.id,
+                "prompt": [{"type": "text", "text": "question"}],
+            })
+
+        self.assertEqual(result, {"stopReason": "end_turn"})
+        self.assertEqual(session.statuses, 1)
+        self.assertIsNone(session.turn)
 
 
 if __name__ == "__main__":
