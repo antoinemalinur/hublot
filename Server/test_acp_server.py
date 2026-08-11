@@ -71,10 +71,15 @@ class RecordingSession:
 
     def __init__(self) -> None:
         self.statuses: list[tuple[int, int]] = []
+        # `persist` doit être retenu, pas jeté : c'est lui qui décide si la
+        # mesure d'un tour entre au fil. Sans lui ici, retirer le `persist=True`
+        # de `_push_context` ne faisait broncher aucun test.
+        self.persisted: list[bool] = []
 
     async def send_status(self, used: int = 0, size: int = 0,
                           *, persist: bool = False) -> None:
         self.statuses.append((used, size))
+        self.persisted.append(persist)
 
 
 class ContextStreamingTests(unittest.IsolatedAsyncioTestCase):
@@ -100,6 +105,10 @@ class ContextStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         await turn._push_context(force=True)
         self.assertEqual(session.statuses[-1], (6_000, 0))
+        # Une mesure prise pendant le tour n'existe nulle part ailleurs : elle
+        # doit entrer dans le fil, sinon la marée de contexte est vide à la
+        # réouverture.
+        self.assertTrue(session.persisted[-1])
 
     async def test_context_is_republished_after_eight_seconds_without_a_new_event(self) -> None:
         session = RecordingSession()
@@ -196,7 +205,11 @@ class OpeningAConversationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_opening_a_conversation_does_not_redate_it(self) -> None:
-        before = self._listed_date()
+        # La date attendue est celle du fichier, calculée ici : comparer le fil
+        # à lui-même laisserait passer un repli devenu constant — ou devenu
+        # « maintenant », qui est justement le bug.
+        expected = acp_server.continuity._iso(self.transcript.stat().st_mtime)
+        self.assertEqual(self._listed_date(), expected)
 
         quota, measure = self._offline()
         with quota, measure:
@@ -205,7 +218,7 @@ class OpeningAConversationTests(unittest.IsolatedAsyncioTestCase):
             session = acp_server.Session(SilentConnection(), self.session_id, self.cwd)
             await session.send_status()
 
-        self.assertEqual(self._listed_date(), before)
+        self.assertEqual(self._listed_date(), expected)
 
     async def test_a_turns_own_measurement_still_enters_the_thread(self) -> None:
         """Le garde-fou ne doit pas emporter la marée de contexte avec lui.

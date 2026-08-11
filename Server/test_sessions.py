@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -138,3 +139,90 @@ class SummaryCacheTests(unittest.TestCase):
 
         self.assertEqual(listed[0]["title"], "Une toute autre demande")
         self.assertEqual(listed[0]["updatedAt"], "2026-08-10T18:00:00.000Z")
+
+
+class ThreadsWithoutTimestampsTests(unittest.TestCase):
+    """Les conversations déjà présentes sur le VPS.
+
+    Elles ont été écrites avant que chaque message porte sa date. Pour elles, la
+    liste n'a que le `mtime` du fichier — et c'est le cas qui a laissé passer,
+    jusqu'en production, un projet daté « il y a deux secondes » dès qu'on
+    l'ouvrait. Aucun test ne l'exerçait.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.previous_projects = sessions.CLAUDE_PROJECTS
+        sessions.CLAUDE_PROJECTS = Path(self.temporary.name)
+        sessions._SUMMARY_CACHE.clear()
+        self.cwd = str(Path(self.temporary.name) / "repos" / "office-chess")
+        self.directory = sessions.project_dir(self.cwd)
+        self.directory.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        sessions.CLAUDE_PROJECTS = self.previous_projects
+        sessions._SUMMARY_CACHE.clear()
+        self.temporary.cleanup()
+
+    def _write(self, name: str, events: list[dict], age: float) -> Path:
+        path = self.directory / name
+        path.write_text(
+            "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
+        )
+        moment = time.time() - age
+        os.utime(path, (moment, moment))
+        return path
+
+    def test_a_thread_without_timestamps_is_dated_by_its_file(self) -> None:
+        path = self._write("ancienne.jsonl", [
+            {"type": "user", "message": {"content": "Ma demande d'hier"}},
+            {"type": "assistant", "message": {"content": "Ma réponse"}},
+        ], age=3_600)
+
+        listed = sessions.list_sessions(self.cwd)
+
+        # La valeur, pas seulement sa stabilité : un repli devenu « maintenant »
+        # est exactement la régression qu'on retient ici.
+        self.assertEqual(listed[0]["updatedAt"], sessions._iso(path.stat().st_mtime))
+        self.assertEqual(listed[0]["title"], "Ma demande d'hier")
+
+    def test_dated_and_undated_threads_sort_together_without_raising(self) -> None:
+        """Le tri compare des chaînes : un `updatedAt` absent le ferait lever,
+        et c'est toute la liste des conversations qui disparaîtrait."""
+        self._write("ancienne.jsonl", [
+            {"type": "user", "message": {"content": "Sans horodatage"}},
+        ], age=7_200)
+        self._write("recente.jsonl", [
+            {
+                "type": "user", "timestamp": "2099-01-01T00:00:00.000Z",
+                "message": {"content": "Avec horodatage"},
+            },
+        ], age=86_400)
+
+        listed = sessions.list_sessions(self.cwd)
+
+        self.assertEqual(len(listed), 2)
+        self.assertTrue(all(isinstance(item["updatedAt"], str) for item in listed))
+        # La date portée par le message l'emporte sur l'âge du fichier.
+        self.assertEqual(listed[0]["title"], "Avec horodatage")
+
+    def test_an_unreadable_timestamp_does_not_lose_the_conversation(self) -> None:
+        """Une seule ligne corrompue ne doit pas emporter la liste entière."""
+        for moment in ("pas une date", "2026-08-10T14:00:00", 1_760_000_000):
+            with self.subTest(timestamp=moment):
+                sessions._SUMMARY_CACHE.clear()
+                path = self._write("douteuse.jsonl", [
+                    {
+                        "type": "user", "timestamp": moment,
+                        "message": {"content": "Demande lisible"},
+                    },
+                ], age=1_800)
+
+                listed = sessions.list_sessions(self.cwd)
+
+                self.assertEqual(len(listed), 1)
+                # Un horodatage naïf ou illisible ne fait pas foi : on retombe
+                # sur le fichier plutôt que d'inventer un fuseau.
+                self.assertEqual(
+                    listed[0]["updatedAt"], sessions._iso(path.stat().st_mtime)
+                )

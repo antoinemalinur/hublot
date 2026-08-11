@@ -1217,7 +1217,17 @@ struct CommandPalette: View {
                             .init(value: "claude", name: "Claude", description: nil),
                             .init(value: "codex", name: "Codex", description: nil),
                         ]
-                    )
+                    ),
+                    // L'exception du verrou : les permissions peuvent encore
+                    // servir au tour en cours, à son prochain appel de commande.
+                    ConfigOption(
+                        id: "permission", name: "Permissions", category: "mode",
+                        type: "select", currentValue: .string("ask"),
+                        options: [
+                            .init(value: "ask", name: "Demander", description: nil),
+                            .init(value: "auto", name: "Tout autoriser", description: nil),
+                        ]
+                    ),
                 ],
                 status: SessionStatus(
                     model: "GPT-5.6-Sol", effort: "max", engine: "codex",
@@ -1280,7 +1290,11 @@ struct CommandPalette: View {
                     options: [.init(value: "concise", name: "Concis", description: nil)]
                 ),
                 ConfigOption(
-                    id: "permissions", name: "Permissions", category: "mode", type: "select",
+                    // Le serveur publie ce réglage au singulier (`acp_server.py`),
+                    // et c'est cet identifiant exact qui le laisse modifiable
+                    // pendant un tour. Au pluriel, l'écran témoin décrivait une
+                    // app qui n'existe pas.
+                    id: "permission", name: "Permissions", category: "mode", type: "select",
                     currentValue: .string("allow_all"),
                     options: [
                         .init(value: "allow_all", name: "Tout autoriser", description: nil)

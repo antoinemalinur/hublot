@@ -84,6 +84,32 @@ struct ChatSessionSettingsTests {
         #expect(await transport.methods().contains("session/set_config_option") == false)
     }
 
+    @Test("Le verrou du tour epargne les permissions, qui peuvent encore servir")
+    func activeTurnStillAllowsAPermissionChange() async throws {
+        // L'exception de la garde `!isWorking || option.id == "permission"`
+        // n'etait exercee par aucun test : la simplifier en `!isWorking` serait
+        // passee inapercue, et l'agent se serait retrouve bloque derriere une
+        // demande qu'on ne pouvait plus lui accorder.
+        let transport = ScriptedTransport(replies: [
+            "session/set_config_option": Self.permissionOptions(current: "auto")
+        ])
+        let bench = try await Bench(transport: transport)
+        bench.chat.apply(try JSONCoding.decoder.decode(
+            SessionSetup.self, from: Data(Self.permissionOptions(current: "ask").utf8)
+        ))
+        let option = try #require(bench.chat.configOptions.first)
+        #expect(option.id == "permission")
+        await transport.emit(Self.activity(
+            Bench.sessionId, #""running":true,"phase":"tool","engine":"codex","elapsed":8,"quiet":1"#
+        ))
+        #expect(await bench.until { bench.chat.isWorking })
+
+        await bench.chat.choose(option, value: "auto")
+
+        #expect(await transport.methods().contains("session/set_config_option"))
+        #expect(bench.chat.configOptions.first?.currentValueString == "auto")
+    }
+
     // MARK: Les permissions
 
     @Test("Une demande de permission dit ce que l'agent s'apprete vraiment a faire")
@@ -415,6 +441,17 @@ struct ChatSessionSettingsTests {
         "configOptions":[{"id":"model","name":"Modele","type":"select",\
         "currentValue":"\(current)","options":[{"value":"opus","name":"Opus"},\
         {"value":"sonnet","name":"Sonnet"}]}]}
+        """
+    }
+
+    /// Les reglages tels que le serveur les publie pour les permissions —
+    /// `permission` au singulier, comme `acp_server.py`.
+    private static func permissionOptions(current: String) -> String {
+        """
+        {"sessionId":"\(Bench.sessionId)",\
+        "configOptions":[{"id":"permission","name":"Permissions","type":"select",\
+        "currentValue":"\(current)","options":[{"value":"ask","name":"Demander"},\
+        {"value":"auto","name":"Tout autoriser"}]}]}
         """
     }
 

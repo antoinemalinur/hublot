@@ -147,16 +147,28 @@ struct ContextTideTests {
         #expect(renderer.uiImage != nil)
     }
 
-    @Test("La jauge rend un niveau inconnu comme un niveau nul")
+    @Test("Une cuve vide et une cuve dont on ignore le niveau ne se ressemblent pas")
     @MainActor
-    func gaugeRendersWithoutMeasurement() throws {
-        for percent in [nil, 0, 42, 100] as [Int?] {
+    func gaugeSeparatesEmptyFromUnknown() throws {
+        // La règle est posée sur `ContextGauge.percent` : l'optionnel n'y est
+        // pas une commodité. Vérifier que chaque cas « rend une image » ne la
+        // protégeait pas — les quatre niveaux passaient, fussent-ils dessinés
+        // à l'identique.
+        func pixels(_ percent: Int?) throws -> Data {
             let renderer = ImageRenderer(
                 content: ContextGauge(percent: percent, size: 210)
                     .frame(width: 210, height: 210)
             )
             renderer.scale = 1
-            #expect(renderer.uiImage != nil)
+            return try #require(renderer.uiImage?.pngData())
         }
+
+        let unknown = try pixels(nil)
+        let empty = try pixels(0)
+        let middle = try pixels(42)
+
+        #expect(unknown != empty)
+        #expect(empty != middle)
+        #expect(unknown != middle)
     }
 }

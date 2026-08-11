@@ -89,16 +89,20 @@ final class ConnectionScreenTests: HublotUITestCase {
 }
 
 final class ProjectsScreenTests: HublotUITestCase {
-    func testProjectAgeShowsTheLastPromptTime() {
+    /// Le formatage de l'âge, et lui seul.
+    ///
+    /// La date vient de la fixture : ce test ne dit donc **rien** de la façon
+    /// dont elle est calculée. La régression qui datait un projet de « il y a
+    /// deux secondes » dès qu'on ouvrait une conversation vit côté serveur, et
+    /// c'est là qu'elle est retenue — `Server/test_acp_server.py`
+    /// (`OpeningAConversationTests`) et `Server/test_sessions.py`.
+    func testProjectAgeIsFormattedAsARelativeFrenchDelay() {
         launch("projects-prompt-age")
 
         let project = app.buttons.matching(
             NSPredicate(format: "label CONTAINS 'dernier-prompt'")
         ).firstMatch
         XCTAssertTrue(project.waitForExistence(timeout: 3))
-        // Le repère du bug : le projet est daté d'une heure. Tant que la liste
-        // suivait le mtime du fichier, une simple relecture le ramenait à
-        // « maintenant » — c'est cet écart-là que l'âge affiché doit trahir.
         XCTAssertTrue(plainLabel(of: project).contains("il y a 1 h"), project.label)
     }
 
@@ -439,7 +443,7 @@ final class AccessibilityAndLayoutScreenTests: HublotUITestCase {
 
         let options = element("config-options")
         options.swipeLeft()
-        let permissions = element("config-permissions")
+        let permissions = element("config-permission")
         XCTAssertTrue(permissions.waitForExistence(timeout: 5))
         XCTAssertTrue(permissions.isHittable)
         assertInsideScreen(permissions, inset: 8)
@@ -466,10 +470,13 @@ final class AccessibilityAndLayoutScreenTests: HublotUITestCase {
         XCTAssertTrue(status.label.contains("7J: 64%"), "vu : \(status.label)")
         XCTAssertFalse(status.label.contains("5H"), "vu : \(status.label)")
 
+        // La marée s'ouvre sur la mesure et sa fenêtre. Le dénominateur lui-même
+        // est écrit dans la fixture : sa régression se retient là où il est
+        // calculé — `CodexContextWindowTests`, côté serveur.
         status.tap()
         let tokens = element("context-token-count")
         XCTAssertTrue(tokens.waitForExistence(timeout: 5))
-        XCTAssertEqual(tokens.label.filter(\.isNumber), "4410001050000")
+        XCTAssertTrue(plainLabel(of: tokens).contains("jetons"), tokens.label)
     }
 
     func testEngineCannotChangeWhileCodexIsStillRunning() {
@@ -489,5 +496,14 @@ final class AccessibilityAndLayoutScreenTests: HublotUITestCase {
         engine.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         XCTAssertFalse(app.buttons["Claude"].waitForExistence(timeout: 1))
         XCTAssertTrue(status.label.contains("7J: 36%"), "vu : \(status.label)")
+
+        // Le verrou a son exception : une permission peut être nécessaire à la
+        // prochaine commande du tour en cours. La refuser bloquerait l'agent
+        // derrière une demande qu'on ne pourrait plus accorder.
+        let permission = element("config-permission")
+        XCTAssertTrue(permission.waitForExistence(timeout: 5))
+        XCTAssertTrue(permission.isEnabled)
+        permission.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        XCTAssertTrue(app.buttons["Tout autoriser"].waitForExistence(timeout: 3))
     }
 }

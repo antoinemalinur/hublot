@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -162,6 +163,43 @@ class ContinuityRadiographyTests(unittest.TestCase):
         listed = continuity.list_sessions(self.cwd)
 
         self.assertEqual(listed[0]["updatedAt"], continuity._iso(prompt_time))
+
+    def test_the_latest_prompt_dates_the_thread_not_the_first(self) -> None:
+        """Avec une seule demande au fil, `prompts[0]` et `prompts[-1]` sont le
+        même objet : il en faut deux pour que le choix ait un sens."""
+        first = 1_786_371_600.0
+        last = first + 7_200
+        with patch("continuity.time.time", return_value=first):
+            continuity.record(self.cwd, self.session_id, "user", "Première demande")
+        with patch("continuity.time.time", return_value=last):
+            continuity.record(self.cwd, self.session_id, "user", "Dernière demande")
+
+        listed = continuity.list_sessions(self.cwd)
+
+        self.assertEqual(listed[0]["updatedAt"], continuity._iso(last))
+        # Le titre, lui, reste celui de la première : c'est le sujet du fil.
+        self.assertEqual(listed[0]["title"], "Première demande")
+
+    def test_a_thread_written_before_timestamps_is_dated_by_its_file(self) -> None:
+        """Le format d'avant `record` : des lignes sans le moindre horodatage.
+
+        C'est l'état de toutes les conversations déjà sur le VPS, et le repli
+        `mtime` est leur seule date possible. Un repli qui rendrait « maintenant »
+        les ferait toutes remonter en tête à chaque écriture technique.
+        """
+        transcript, _ = continuity._paths(self.cwd, self.session_id)
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(
+            json.dumps({"role": "user", "engine": "claude", "text": "Demande d'hier"})
+            + "\n", encoding="utf-8",
+        )
+        moment = 1_786_300_000.0
+        os.utime(transcript, (moment, moment))
+
+        listed = continuity.list_sessions(self.cwd)
+
+        self.assertEqual(listed[0]["updatedAt"], continuity._iso(moment))
+        self.assertEqual(listed[0]["title"], "Demande d'hier")
 
 
 if __name__ == "__main__":
