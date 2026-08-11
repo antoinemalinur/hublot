@@ -122,6 +122,34 @@ struct AppModelTests {
         #expect(model.failure?.isEmpty == false)
     }
 
+    @Test("Une liste qui charge ne rend pas les boutons de l'ecran inertes")
+    func loadingTheListKeepsTheScreenUsable() async throws {
+        // « L'app est lente sur les clics » : un même drapeau `isBusy` servait
+        // aux actions et au simple rechargement de la liste. En arrivant sur un
+        // projet, « Nouvelle conversation » restait donc désactivé tant que le
+        // serveur n'avait pas répondu — le bouton ne réagissait pas, alors que
+        // rien n'empêchait de le toucher.
+        let transport = AppModelTransport(profile: .pausedSessionList)
+        let model = AppModel(environment: environment(for: transport))
+        await model.connect()
+        let project = try #require(model.projects.first { $0.name == "recent" })
+
+        let opening = Task { await model.open(project) }
+        while !(await transport.methods()).contains("session/list") {
+            await Task.yield()
+        }
+
+        // La liste est en vol : c'est exactement l'instant du reproche.
+        #expect(model.isLoadingSessions)
+        #expect(model.isBusy == false)
+
+        try await transport.releaseSessionList()
+        await opening.value
+
+        #expect(model.isLoadingSessions == false)
+        #expect(model.sessions.map(\.sessionId) == ["session-a", "session-b"])
+    }
+
     @Test("Un jeton refuse revient au formulaire; une panne temporaire reste en reprise")
     func authenticationAndTemporaryFailureAreDifferent() async {
         let rejected = AppModelTransport(profile: .rejected)
@@ -167,6 +195,9 @@ private actor AppModelTransport: ACPTransport {
         case rejected
         case offline
         case sessionListFailure
+        /// `session/list` reste sans réponse jusqu'à `releaseSessionList()` :
+        /// c'est la fenêtre pendant laquelle l'écran doit rester utilisable.
+        case pausedSessionList
     }
 
     private let profile: Profile
@@ -175,6 +206,7 @@ private actor AppModelTransport: ACPTransport {
     private var recordedMethods: [String] = []
     private var recordedDirectories: [String] = []
     private var disconnected = false
+    private var heldSessionList: Int?
 
     init(profile: Profile = .happy) { self.profile = profile }
 
@@ -215,6 +247,10 @@ private actor AppModelTransport: ACPTransport {
             )))
             return
         }
+        if profile == .pausedSessionList, method == "session/list" {
+            heldSessionList = id
+            return
+        }
         if profile == .sessionListFailure, method == "session/list" {
             continuation?.yield(try JSONCoding.encoder.encode(RPCErrorReply(
                 id: id, error: RPCError(code: -32010, message: "historique indisponible", data: nil)
@@ -223,6 +259,15 @@ private actor AppModelTransport: ACPTransport {
         }
         continuation?.yield(try JSONCoding.encoder.encode(RPCReply(
             id: id, result: result(for: method)
+        )))
+    }
+
+    /// Laisse enfin repartir la liste mise en attente.
+    func releaseSessionList() throws {
+        guard let id = heldSessionList else { return }
+        heldSessionList = nil
+        continuation?.yield(try JSONCoding.encoder.encode(RPCReply(
+            id: id, result: result(for: "session/list")
         )))
     }
 

@@ -62,7 +62,18 @@ final class AppModel {
     private(set) var projects: [ProjectListResult.Project] = []
     private(set) var sessions: [SessionListResult.Summary] = []
     private(set) var failure: String?
+    /// Vrai pendant une action que l'on ne veut pas voir doublée : se
+    /// connecter, créer une conversation, en reprendre une. Les boutons s'y
+    /// désactivent, et c'est voulu — deux touches ne doivent pas ouvrir deux
+    /// conversations.
     private(set) var isBusy = false
+    /// Vrai pendant le simple rechargement de la liste des conversations.
+    ///
+    /// Séparé de `isBusy` : lire ne se double pas, et confondre les deux rendait
+    /// « Nouvelle conversation » inerte à chaque arrivée sur l'écran, le temps
+    /// que la liste revienne du serveur. Toucher un bouton mort, c'est
+    /// exactement ce qui fait dire d'une app qu'elle ne répond pas.
+    private(set) var isLoadingSessions = false
     private(set) var chat: ChatSession?
 
     /// Vrai pendant une reprise silencieuse : la barre le signale sans renvoyer
@@ -475,8 +486,8 @@ final class AppModel {
 
     func loadSessions(for project: ProjectListResult.Project) async {
         guard let connection else { return }
-        isBusy = true
-        defer { isBusy = false }
+        isLoadingSessions = true
+        defer { isLoadingSessions = false }
         do {
             let result = try await connection.call(
                 "session/list", ListSessionsParams(cwd: project.path), as: SessionListResult.self

@@ -32,7 +32,10 @@ struct SessionsView: View {
                         .sessionListRow()
                 }
 
-                if model.sessions.isEmpty && !model.isBusy {
+                // « Aucune conversation » ne doit paraître qu'une fois la liste
+                // revenue : l'afficher pendant le chargement annonçait un vide
+                // qui se démentait une demi-seconde plus tard.
+                if model.sessions.isEmpty && !model.isLoadingSessions && !model.isBusy {
                     EmptyConversations()
                         .sessionListRow()
                 }

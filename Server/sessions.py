@@ -14,12 +14,29 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
 CLAUDE_PROJECTS = Path(os.environ.get("CLAUDE_PROJECTS", "/root/.claude/projects"))
+
+# Résumer une conversation coûte la lecture et le décodage de tout son fichier —
+# plusieurs mégaoctets pour un fil de travail, outils compris. Les listes le
+# faisaient à chaque affichage, pour chaque conversation, et l'écran d'accueil
+# les rouvrait toutes, tous projets confondus : le prix d'un simple retour en
+# arrière était la relecture de l'historique entier.
+#
+# Un fil déjà terminé ne change plus jamais. La signature du fichier — sa taille
+# et sa date — suffit à le savoir : identique, on garde le résumé ; différente,
+# on relit. Aucune invalidation à tenir à jour, et un fichier modifié par un
+# autre processus est vu immédiatement.
+_SUMMARY_CACHE: dict[str, tuple[tuple[float, int], tuple[str, int, str | None]]] = {}
+_SUMMARY_LOCK = threading.Lock()
+# De quoi couvrir très largement un VPS réel sans laisser la mémoire filer si
+# des milliers de fils s'accumulent.
+_SUMMARY_CACHE_MAX = 2_048
 
 
 def _iso(timestamp: float) -> str:
@@ -103,7 +120,38 @@ def list_sessions(cwd: str) -> list[dict[str, Any]]:
 
 
 def _summarise(path: Path) -> tuple[str, int, str | None]:
-    """Titre, nombre d'échanges et dernière demande, en lecture continue.
+    """Titre, nombre d'échanges et dernière demande — relus une seule fois.
+
+    Le résultat est retenu tant que le fichier ne bouge pas. Voir
+    `_SUMMARY_CACHE` : c'est ce qui sépare une liste instantanée d'une relecture
+    de tout l'historique à chaque affichage.
+    """
+    key = str(path)
+    try:
+        status = path.stat()
+        signature = (status.st_mtime, status.st_size)
+    except OSError:
+        # Sans signature, rien à retenir : on lit, et c'est tout.
+        return _read_summary(path)
+
+    with _SUMMARY_LOCK:
+        remembered = _SUMMARY_CACHE.get(key)
+        if remembered is not None and remembered[0] == signature:
+            return remembered[1]
+
+    summary = _read_summary(path)
+
+    with _SUMMARY_LOCK:
+        # Une éviction grossière suffit : ces entrées sont minuscules et le seuil
+        # n'est jamais atteint sur un VPS réel.
+        if len(_SUMMARY_CACHE) >= _SUMMARY_CACHE_MAX:
+            _SUMMARY_CACHE.clear()
+        _SUMMARY_CACHE[key] = (signature, summary)
+    return summary
+
+
+def _read_summary(path: Path) -> tuple[str, int, str | None]:
+    """La lecture elle-même, sans cache.
 
     Claude écrit lui-même un `ai-title` quand il en a produit un ; à défaut on
     prend la première demande. Un titre inventé ici serait moins bon que le

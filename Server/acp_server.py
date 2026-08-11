@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import hashlib
 import json
 import os
@@ -1470,27 +1471,72 @@ class QuotaCache:
         self.retry = retry
         self.value: dict[str, Any] = {}
         self.next_read = 0.0
+        # Vrai pendant qu'un thread va chercher la valeur suivante : les autres
+        # appels se contentent de l'ancienne au lieu d'ouvrir un second processus.
+        self.refreshing = False
         # Le verrou évite la ruée : dix conversations qui s'ouvrent ensemble ne
         # doivent produire qu'une seule lecture.
         self.lock = threading.Lock()
 
     def read(self, fetch: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        """La dernière valeur connue, tout de suite.
+
+        Relire coûte un processus — `claude -p /usage` démarre un CLI Node, et
+        la borne est à 25 s. Payer cette attente dans l'appel qui ouvre une
+        conversation faisait patienter l'écran pour une jauge, alors qu'une
+        mesure vieille de quelques minutes fait exactement le même office.
+        L'échéance passée, on rend donc l'ancienne valeur et on va chercher la
+        neuve derrière ; seul le tout premier remplissage attend.
+        """
         now = time.monotonic()
         with self.lock:
             if now < self.next_read:
                 return self.value
-            try:
-                fresh = fetch()
-            except Exception as exc:  # noqa: BLE001 — jamais fatal pour un tour
-                log(f"plafonds illisibles : {exc!r}")
+            if not self.value:
+                # Rien à montrer encore : cette fois-là, il faut bien attendre.
+                return self._renew(fetch, now)
+            if self.refreshing:
+                return self.value
+            self.refreshing = True
+
+        threading.Thread(
+            target=self._refresh, args=(fetch,), daemon=True,
+            name="hublot-quota",
+        ).start()
+        with self.lock:
+            return self.value
+
+    def _refresh(self, fetch: Callable[[], dict[str, Any]]) -> None:
+        """Le rafraîchissement de fond, verrou relâché pendant l'appel."""
+        try:
+            self._renew(fetch, time.monotonic(), locked=True)
+        finally:
+            with self.lock:
+                self.refreshing = False
+
+    def _renew(self, fetch: Callable[[], dict[str, Any]], now: float,
+               *, locked: bool = False) -> dict[str, Any]:
+        """Interroge le moteur et retient ce qu'il rend. Un échec ne vide jamais
+        la valeur : une jauge un peu vieille vaut mieux qu'une jauge qui
+        clignote."""
+        try:
+            fresh = fetch()
+        except Exception as exc:  # noqa: BLE001 — jamais fatal pour un tour
+            log(f"plafonds illisibles : {exc!r}")
+            with self._maybe_lock(locked):
                 self.next_read = now + self.retry
                 return self.value
+        with self._maybe_lock(locked):
             if fresh:
                 self.value = fresh
                 self.next_read = now + self.ttl
             else:
                 self.next_read = now + self.retry
             return self.value
+
+    def _maybe_lock(self, locked: bool):
+        """Le verrou, sauf quand l'appelant le tient déjà."""
+        return self.lock if locked else contextlib.nullcontext()
 
 
 CLAUDE_QUOTA = QuotaCache(CLAUDE_QUOTA_TTL, QUOTA_RETRY)
@@ -2021,10 +2067,15 @@ class Connection:
             return await self._new_session(params)
         if method == "session/load":
             return await self._load_session(params)
+        # Ces deux-là touchent le disque pour chaque conversation de chaque
+        # projet. Rendus depuis la boucle, ils y suspendaient tout le reste : le
+        # texte d'un tour en cours cessait d'arriver le temps d'un retour à la
+        # liste, et deux écrans ouverts se mettaient en file l'un derrière
+        # l'autre. Un thread rend la main immédiatement.
         if method == "session/list":
-            return self._list_sessions(params)
+            return await asyncio.to_thread(self._list_sessions, params)
         if method == "hublot/projects":
-            return self._list_projects()
+            return await asyncio.to_thread(self._list_projects)
         if method == "hublot/running":
             return {"turns": running_turns()}
         if method == "hublot/instructions":
