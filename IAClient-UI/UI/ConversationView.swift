@@ -41,6 +41,8 @@ struct ConversationView: View {
     /// Vrai pendant qu'un tour tourne : le bouton d'envoi devient un bouton
     /// d'arrêt, et c'est le seul moyen de reprendre la main avant la fin.
     var isWorking = false
+    /// Demandes déjà confiées au fil, qui partiront après le tour courant.
+    var queuedPromptCount = 0
     /// Vrai pendant qu'on se rebranche : le chrome le dit, plutôt que de laisser
     /// croire à une réponse qui met du temps à venir.
     var isReconnecting = false
@@ -129,6 +131,7 @@ struct ConversationView: View {
                     commands: commands,
                     onChoose: onChoose,
                     isWorking: isWorking,
+                    queuedPromptCount: queuedPromptCount,
                     onStop: onStop,
                     onDictate: onDictate,
                     onSend: onSend
@@ -688,6 +691,7 @@ struct Composer: View {
     var commands: [String] = []
     var onChoose: (ConfigOption, String) -> Void = { _, _ in }
     var isWorking = false
+    var queuedPromptCount = 0
     var onStop: () -> Void = {}
     var onDictate: ((Data) async -> String?)?
     let onSend: (String, [Attachment]) -> Void
@@ -704,7 +708,11 @@ struct Composer: View {
     private var hasSomethingToSend: Bool { !draft.isEmpty || !attachments.isEmpty }
 
     /// Ce que le bouton fait, dans l'ordre de priorité : arrêter un
-    /// enregistrement, arrêter un tour, envoyer ce qui est écrit, dicter.
+    /// enregistrement, envoyer ce qui est écrit, arrêter un tour, dicter.
+    ///
+    /// L'envoi passe avant l'arrêt lorsque le champ est rempli : pendant un
+    /// tour, il met ainsi le message en file. Un bouton d'arrêt séparé reste
+    /// alors visible juste à côté.
     private func act() {
         if dictation.phase == .recording {
             Task {
@@ -724,7 +732,6 @@ struct Composer: View {
             }
             return
         }
-        if isWorking { onStop(); return }
         if hasSomethingToSend {
             // Le champ et le bouton possèdent le même état. Quand le brouillon
             // vivait dans ``ConversationView``, le TextField focalisé pouvait
@@ -741,6 +748,7 @@ struct Composer: View {
             onSend(text, images)
             return
         }
+        if isWorking { onStop(); return }
         Task { await dictation.start() }
     }
 
@@ -760,13 +768,21 @@ struct Composer: View {
 
     private var glyph: String {
         if dictation.phase == .recording { "stop.fill" }
+        else if hasSomethingToSend { "arrow.up" }
         else if isWorking { "stop.fill" }
-        else if !hasSomethingToSend { "mic.fill" }
-        else { "arrow.up" }
+        else { "mic.fill" }
     }
 
     private var glyphSize: CGFloat {
         glyph == "arrow.up" ? 15 : 13
+    }
+
+    private var actionLabel: String {
+        if dictation.phase == .recording { return "Arrêter la dictée" }
+        if hasSomethingToSend {
+            return isWorking ? "Mettre le message en attente" : "Envoyer le message"
+        }
+        return isWorking ? "Arrêter la réponse" : "Démarrer la dictée"
     }
 
     /// L'invite dit ce qui bloque quand quelque chose bloque : un micro refusé
@@ -803,6 +819,20 @@ struct Composer: View {
 
         return GlassEffectContainer(spacing: Hublot.unit * 1.5) {
             VStack(alignment: .leading, spacing: Hublot.unit * 1.25) {
+                if queuedPromptCount > 0 {
+                    Label(
+                        queuedPromptCount == 1
+                            ? "1 message en attente"
+                            : "\(queuedPromptCount) messages en attente",
+                        systemImage: "clock.arrow.circlepath"
+                    )
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Hublot.ember)
+                    .padding(.horizontal, Hublot.unit * 1.5)
+                    .accessibilityIdentifier("composer-queue")
+                    .transition(.opacity.combined(with: .offset(y: 6)))
+                }
+
                 // Les réglages s'effacent pendant qu'on écrit : au moment de
                 // formuler une demande, le choix du modèle n'est plus la
                 // question.
@@ -918,10 +948,23 @@ struct Composer: View {
                             .lineLimit(1...6)
                     }
 
-                    // Un seul bouton, quatre offices. Deux ou trois boutons
-                    // côte à côte auraient demandé de viser ; là où il n'y en a
-                    // qu'un, le geste est le même et c'est l'état qui décide de
-                    // son sens.
+                    // Tant qu'il n'y a rien à envoyer, le bouton garde son
+                    // office historique : arrêter le tour. Dès qu'un brouillon
+                    // existe, l'arrêt reste distinct afin que l'autre bouton
+                    // puisse mettre le nouveau message en file.
+                    if isWorking && hasSomethingToSend {
+                        Button(action: onStop) {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 13, weight: .semibold))
+                                .frame(width: 34, height: 34)
+                        }
+                        .buttonStyle(.glass)
+                        .accessibilityIdentifier("composer-stop")
+                        .accessibilityLabel("Arrêter la réponse")
+                        .tint(Hublot.removed)
+                        .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                    }
+
                     Button(action: act) {
                         Group {
                             if dictation.phase == .transcribing {
@@ -936,6 +979,7 @@ struct Composer: View {
                     }
                     .buttonStyle(.glassProminent)
                     .accessibilityIdentifier("composer-action")
+                    .accessibilityLabel(actionLabel)
                     .tint(dictation.phase == .recording ? Hublot.removed : Hublot.ember)
                     .disabled(dictation.phase == .transcribing)
                     .animation(.snappy(duration: 0.2), value: isWorking)
@@ -951,6 +995,8 @@ struct Composer: View {
         }
         .background { EdgeScrim(edge: .bottom).ignoresSafeArea() }
         .animation(.snappy(duration: 0.28), value: isWriting)
+        .animation(.snappy(duration: 0.2), value: hasSomethingToSend)
+        .animation(.snappy(duration: 0.2), value: queuedPromptCount)
         .onChange(of: picked) { _, items in
             guard !items.isEmpty else { return }
             Task { await absorb(items) }
@@ -1115,6 +1161,18 @@ struct CommandPalette: View {
                     "five_hour": .init(percent: 17, resetsAt: .now.addingTimeInterval(14_400))
                 ]
             ))
+        }
+
+        /// Le même fil pendant un tour, avec une file pilotée par le témoin UI.
+        static func workingScreenTestDemo(
+            queuedPromptCount: Int,
+            onSend: @escaping (String, [Attachment]) -> Void
+        ) -> ConversationView {
+            var view = screenTestDemo
+            view.isWorking = true
+            view.queuedPromptCount = queuedPromptCount
+            view.onSend = onSend
+            return view
         }
 
         /// Le même fil, mené par Codex, avec **les deux** fenêtres remplies.

@@ -302,6 +302,35 @@ final class ComposerScreenTests: HublotUITestCase {
         XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 3))
         XCTAssertEqual(input.value as? String, "Message…")
     }
+
+    func testMessageCanBeQueuedWhileStopRemainsTouchable() {
+        launch("conversation-working")
+
+        let input = element("composer-input")
+        let action = element("composer-action")
+        XCTAssertTrue(input.waitForExistence(timeout: 5))
+        XCTAssertTrue(action.waitForExistence(timeout: 5))
+        XCTAssertEqual(action.label, "Arrêter la réponse")
+
+        input.tap()
+        input.typeText("Enchaine avec les tests")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+
+        let stop = element("composer-stop")
+        XCTAssertTrue(stop.waitForExistence(timeout: 3))
+        XCTAssertTrue(stop.isHittable)
+        XCTAssertEqual(stop.label, "Arrêter la réponse")
+        XCTAssertEqual(action.label, "Mettre le message en attente")
+
+        action.tap()
+
+        let queue = element("composer-queue")
+        XCTAssertTrue(queue.waitForExistence(timeout: 3))
+        XCTAssertTrue(queue.label.contains("1 message en attente"))
+        XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 3))
+        XCTAssertEqual(input.value as? String, "Message…")
+        XCTAssertEqual(action.label, "Arrêter la réponse")
+    }
 }
 
 final class ConversationBlocksScreenTests: HublotUITestCase {

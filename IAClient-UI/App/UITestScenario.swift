@@ -15,6 +15,7 @@
         case sessionsInstructions = "sessions-instructions"
         case concurrentConversations = "concurrent-conversations"
         case conversation
+        case conversationWorking = "conversation-working"
         case codexQuota = "codex-quota"
         case activeEngineLock = "active-engine-lock"
         case contextTide = "context-tide"
