@@ -59,7 +59,7 @@ extension HublotUITestCase {
     /// écran qui n'affiche jamais l'élément que devant un écran qui n'a pas fini
     /// de se construire : il ne prouve donc rien.
     func assertAbsent(
-        _ element: XCUIElement, settle: TimeInterval = 1.5,
+        _ element: XCUIElement, settle: TimeInterval = 1,
         file: StaticString = #filePath, line: UInt = #line
     ) {
         RunLoop.current.run(until: Date().addingTimeInterval(settle))

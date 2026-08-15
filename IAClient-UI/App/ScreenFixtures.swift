@@ -330,6 +330,98 @@
         }
     }
 
+    /// La même exigence que pour les dépôts, appliquée aux conversations : le
+    /// relais rend deux listes différentes.
+    ///
+    /// Sans ça, une liste rechargée et une liste jamais relue ont exactement la
+    /// même apparence — et le test qui prétendait vérifier la traction se
+    /// contentait de constater que rien n'avait disparu, ce qu'un rechargement
+    /// inerte réussit parfaitement.
+    struct SessionsReloadFixture: View {
+        @State private var model: AppModel
+
+        static let project = ProjectListResult.Project(
+            name: "hublot", path: "/root/repos/hublot", sessionCount: 1,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 808_000_000)
+        )
+
+        init() {
+            let transport = SessionsReloadTransport()
+            var environment = HublotEnvironment.ephemeral(
+                serverURL: "ws://127.0.0.1:8335", token: "ui-test",
+                makeConnection: { _, _ in ACPConnection(transport: transport) }
+            )
+            environment.sleep = { duration in try await Task.sleep(for: duration) }
+            _model = State(initialValue: AppModel(environment: environment))
+        }
+
+        var body: some View {
+            SessionsView(model: model, project: Self.project)
+                .task {
+                    await model.connect()
+                    await model.open(Self.project)
+                }
+        }
+    }
+
+    private actor SessionsReloadTransport: ACPTransport {
+        private let stream: AsyncThrowingStream<Data, Error>
+        private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+        private var reads = 0
+
+        init() {
+            let pair = AsyncThrowingStream<Data, Error>.makeStream()
+            stream = pair.stream
+            continuation = pair.continuation
+        }
+
+        var frames: AsyncThrowingStream<Data, Error> { stream }
+        func connect() async throws {}
+        func disconnect() async { continuation.finish() }
+
+        func send(_ frame: Data) async throws {
+            guard let request = try JSONSerialization.jsonObject(with: frame) as? [String: Any],
+                let method = request["method"] as? String,
+                let id = request["id"] as? Int
+            else { return }
+
+            switch method {
+            case "initialize":
+                reply(id, [
+                    "protocolVersion": 1,
+                    "agentCapabilities": ["loadSession": true,
+                                          "sessionCapabilities": ["list": [:]]],
+                ])
+            case "hublot/projects":
+                reply(id, ["projects": [[
+                    "name": "hublot", "path": "/root/repos/hublot",
+                    "sessionCount": 1, "updatedAt": "2026-08-12T09:15:00.000Z",
+                ]]])
+            case "session/list":
+                reads += 1
+                let title = reads <= 1 ? "avant-rechargement" : "apres-rechargement"
+                reply(id, ["sessions": [[
+                    "sessionId": "fil-\(title)", "cwd": "/root/repos/hublot",
+                    "title": title, "updatedAt": "2026-08-12T09:15:00.000Z",
+                    "exchanges": reads,
+                ]]])
+            case "hublot/running":
+                reply(id, ["turns": []])
+            case "hublot/instructions":
+                reply(id, ["instructions": NSNull()])
+            default:
+                reply(id, [:])
+            }
+        }
+
+        private func reply(_ id: Int, _ result: [String: Any]) {
+            guard let data = try? JSONSerialization.data(withJSONObject: [
+                "jsonrpc": "2.0", "id": id, "result": result,
+            ]) else { return }
+            continuation.yield(data)
+        }
+    }
+
     // MARK: - Attente
 
     /// L'écran d'attente et son issue de secours.

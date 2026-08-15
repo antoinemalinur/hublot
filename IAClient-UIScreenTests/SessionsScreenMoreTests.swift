@@ -109,32 +109,34 @@ final class SessionsScreenMoreTests: HublotUITestCase {
         XCTAssertTrue(path.waitForNonExistence(timeout: 5))
     }
 
-    /// S14 — tirer la liste vers le bas ne la vide pas.
+    /// S14 — tirer la liste des conversations la redemande vraiment au serveur.
     ///
-    /// Le rechargement lui-même est vérifié sur les dépôts, où le relais témoin
-    /// peut répondre deux choses. Ici, ce qui se vérifie est que le geste ne
-    /// coûte pas son contenu à la liste — c'est ce que fait un rechargement qui
-    /// échoue mal.
-    func testPullToRefreshKeepsTheConversations() {
-        launch("sessions-variants")
+    /// Le relais témoin répond deux choses différentes, exactement comme pour
+    /// les dépôts. Sans ça, une liste rechargée et une liste jamais relue ont la
+    /// même apparence, et le test se contenterait de constater que rien n'a
+    /// disparu — ce qu'un rechargement inerte réussit parfaitement.
+    func testPullToRefreshAsksTheServerForTheConversationsAgain() {
+        launch("sessions-reload")
 
-        let row = sessionRow("variante-recente")
-        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        let before = sessionRow("fil-avant-rechargement")
+        XCTAssertTrue(before.waitForExistence(timeout: 15))
 
-        let list = app.collectionViews.firstMatch.exists
-            ? app.collectionViews.firstMatch
-            : app.tables.firstMatch
-        let start = list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.1))
-        let finish = list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8))
+        // Même geste que sur les dépôts : les coordonnées de la fenêtre, un
+        // tirage lent, et le doigt tenu — c'est lui qui arme le rechargement.
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.28))
+        let finish = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.95))
         start.press(
-            forDuration: 0.1, thenDragTo: finish, withVelocity: .slow,
-            thenHoldForDuration: 0.2
+            forDuration: 0.2, thenDragTo: finish, withVelocity: .slow,
+            thenHoldForDuration: 1.5
         )
 
-        RunLoop.current.run(until: Date().addingTimeInterval(1.5))
-        XCTAssertTrue(row.exists, "la liste a perdu son contenu")
-        XCTAssertTrue(sessionRow("variante-unique").exists)
-        XCTAssertTrue(sessionRow("variante-ancienne").exists)
-        assertAbsent(app.staticTexts["Aucune conversation"], settle: 0)
+        XCTAssertTrue(
+            sessionRow("fil-apres-rechargement").waitForExistence(timeout: 15),
+            "la liste n'a pas été relue"
+        )
+        XCTAssertTrue(before.waitForNonExistence(timeout: 5))
+        // Et la liste reste une liste : le geste ne l'a pas vidée en chemin.
+        XCTAssertTrue(element("sessions-back").exists)
+        assertAbsent(app.staticTexts["Aucune conversation"], settle: 0.5)
     }
 }

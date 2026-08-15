@@ -33,6 +33,7 @@
         case projectsVariants = "projects-variants"
         case projectsReload = "projects-reload"
         case sessionsVariants = "sessions-variants"
+        case sessionsReload = "sessions-reload"
         /// Le même écran que `sessions-instructions`, mais avec un règlement
         /// assez long pour défiler. L'état court reste inchangé : c'est lui que
         /// la référence visuelle photographie.

@@ -113,15 +113,15 @@ final class ChromeScreenTests: HublotUITestCase {
     /// C'est le geste qui rendait une longue réponse illisible : on remontait
     /// pour relire, et le tour suivant ramenait l'écran en bas.
     func testThreadDoesNotJumpWhenATurnArrivesWhileReadingHigherUp() {
-        // Remonter un fil de dix tours prend plusieurs balayages, et un
-        // balayage sous quatre simulateurs en parallèle prend son temps. Le
-        // délai est donc large : le tour ne doit pas tomber pendant qu'on se
-        // place, sinon ce test observerait l'arrivée au lieu de la lecture.
-        launch("thread-growing", extraArguments: ["-HublotGrowingDelay", "25"])
+        // Le tour ne doit pas tomber pendant qu'on se place, sinon ce test
+        // observerait l'arrivée au lieu de la lecture. Deux balayages suffisent
+        // à quitter le bas du fil ; le délai leur laisse le double du temps
+        // qu'ils prennent sous quatre simulateurs en parallèle.
+        launch("thread-growing", extraArguments: ["-HublotGrowingDelay", "14"])
 
         let thread = app.scrollViews.firstMatch
         XCTAssertTrue(thread.waitForExistence(timeout: 10))
-        for _ in 0..<3 { thread.swipeDown() }
+        for _ in 0..<2 { thread.swipeDown() }
 
         // Le repère : un tour ancien, visible là où on s'est arrêté.
         let anchor = app.staticTexts.matching(
@@ -136,7 +136,7 @@ final class ChromeScreenTests: HublotUITestCase {
         // l'écran : s'il fait ce qu'il doit, il naît hors du champ, et une vue
         // hors champ n'existe pas dans un `LazyVStack`. C'est le retour au
         // direct, plus bas, qui prouvera qu'il est bien arrivé.
-        RunLoop.current.run(until: Date().addingTimeInterval(28))
+        RunLoop.current.run(until: Date().addingTimeInterval(17))
 
         XCTAssertTrue(anchor.exists, "le repère a disparu de l'écran")
         XCTAssertEqual(

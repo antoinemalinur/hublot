@@ -94,6 +94,8 @@ struct IAClient_UIApp: App {
                     ProjectsVariantsFixture()
                 case .projectsReload:
                     ProjectsReloadFixture()
+                case .sessionsReload:
+                    SessionsReloadFixture()
                 case .threadBlocks:
                     ThreadBlocksFixture()
                 case .threadGrowing:
