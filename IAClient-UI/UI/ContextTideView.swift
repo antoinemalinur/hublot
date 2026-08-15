@@ -438,6 +438,11 @@ private struct SampleInspector: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(Hublot.unit * 1.5)
         .glassEffect(.regular, in: .rect(cornerRadius: 18, style: .continuous))
+        // `contain` et non `combine` : le compte de jetons porte déjà son propre
+        // identifiant, et le fondre dans l'inspecteur le ferait disparaître des
+        // tests qui le visent depuis la barre de statut.
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("tide-inspector")
     }
 }
 

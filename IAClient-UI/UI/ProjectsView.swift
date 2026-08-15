@@ -90,6 +90,7 @@ struct ProjectsView: View {
                     .font(.hublotMetaEmphasis)
                     .buttonStyle(.glass)
                     .tint(Hublot.meta)
+                    .accessibilityIdentifier("disconnect")
             }
 
             HStack(spacing: Hublot.unit) {
@@ -175,6 +176,10 @@ struct ProjectRow: View {
         .buttonStyle(.plain)
         .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 16, style: .continuous))
         .accessibilityLabel("\(project.name), \(subtitle)")
+        // Le nom tel quel : le test connaît le dépôt par son scénario, et viser
+        // une rangée par son libellé la ferait dépendre du sous-titre calculé
+        // qu'elle sert justement à vérifier.
+        .accessibilityIdentifier("project-row-\(project.name)")
     }
 
     /// Ce qu'on veut savoir avant d'ouvrir : ce qui tourne s'il y a quelque
@@ -223,6 +228,7 @@ struct NewProjectRow: View {
                 .buttonStyle(.glassProminent)
                 .tint(Hublot.ember)
                 .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                .accessibilityIdentifier("create-project")
         }
         .padding(.horizontal, Hublot.unit * 1.75)
         .padding(.vertical, Hublot.unit * 1.25)

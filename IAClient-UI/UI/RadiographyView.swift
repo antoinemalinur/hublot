@@ -240,7 +240,10 @@ private struct RadiographyField: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private var animates: Bool { isLive && !reduceMotion }
+    // Par `HublotMotion`, comme la marée et le fond : trois vues lisaient le
+    // réglage brut et continuaient donc de peindre là où les autres s'étaient
+    // arrêtées — y compris sous le mode capture, censé tout figer.
+    private var animates: Bool { isLive && !HublotMotion.isReduced(reduceMotion) }
 
     var body: some View {
         GeometryReader { geometry in
@@ -399,7 +402,9 @@ private struct RegionNode: View {
                             .scaleEffect(pulse ? 1.4 : 1)
                             .opacity(pulse ? 0 : 0.8)
                             .animation(
-                                reduceMotion ? nil : .easeOut(duration: 1.4).repeatForever(autoreverses: false),
+                                HublotMotion.isReduced(reduceMotion)
+                                    ? nil
+                                    : .easeOut(duration: 1.4).repeatForever(autoreverses: false),
                                 value: pulse
                             )
                     }
@@ -449,6 +454,7 @@ private struct RegionNode: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(region.name), \(region.count) actions, \(stateLabel)")
+        .accessibilityIdentifier("region-\(region.name)")
         .onAppear { pulse = true }
     }
 
@@ -830,6 +836,8 @@ private struct RegionInspector: View {
         }
         .padding(Hublot.unit * 1.5)
         .glassEffect(.regular, in: .rect(cornerRadius: 18, style: .continuous))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("region-inspector")
     }
 }
 
@@ -847,6 +855,8 @@ private struct RadiographyLegend: View {
                 .foregroundStyle(Hublot.meta)
         }
         .padding(.horizontal, Hublot.unit * 0.5)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("radiography-legend")
     }
 
     private func item(_ label: String, tint: Color) -> some View {

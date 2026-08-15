@@ -306,6 +306,7 @@ struct CodeBlockView: View {
                     .foregroundStyle(copied ? Hublot.accent : Hublot.meta)
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("copy-code")
             .accessibilityLabel("Copier le bloc de code")
         }
         .padding(.horizontal, Hublot.unit * 1.5)
