@@ -240,7 +240,10 @@ private struct RadiographyField: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private var animates: Bool { isLive && !reduceMotion }
+    // Par `HublotMotion`, comme la marée et le fond : trois vues lisaient le
+    // réglage brut et continuaient donc de peindre là où les autres s'étaient
+    // arrêtées — y compris sous le mode capture, censé tout figer.
+    private var animates: Bool { isLive && !HublotMotion.isReduced(reduceMotion) }
 
     var body: some View {
         GeometryReader { geometry in
@@ -399,7 +402,9 @@ private struct RegionNode: View {
                             .scaleEffect(pulse ? 1.4 : 1)
                             .opacity(pulse ? 0 : 0.8)
                             .animation(
-                                reduceMotion ? nil : .easeOut(duration: 1.4).repeatForever(autoreverses: false),
+                                HublotMotion.isReduced(reduceMotion)
+                                    ? nil
+                                    : .easeOut(duration: 1.4).repeatForever(autoreverses: false),
                                 value: pulse
                             )
                     }

@@ -93,11 +93,33 @@
     }
 #endif
 
+/// « Réduire les animations », tel que l'app doit l'entendre.
+///
+/// En production, c'est le réglage du système et rien d'autre.
+///
+/// En développement, deux entrées s'y ajoutent, pour une raison mesurée le
+/// 15 août 2026 sur iOS 26 : **l'argument de lancement
+/// `-UIAccessibilityReduceMotionEnabled YES` ne change pas
+/// `accessibilityReduceMotion`**. Un test qui le passe croit couper les
+/// animations et ne coupe rien — la marée continuait de peindre à 1,6 % de
+/// pixels par seconde, contre 0,07 % avec le vrai réglage posé par
+/// `defaults write com.apple.Accessibility ReduceMotionEnabled`.
+///
+/// Ce réglage-là ne se pose que depuis l'extérieur du simulateur, donc hors de
+/// portée d'un test hermétique. L'argument est donc lu ici, à la main : ce qui
+/// est vérifié reste le chemin de code qui arrête la peinture, seule son entrée
+/// change.
 enum HublotMotion {
     static func isReduced(_ systemSetting: Bool) -> Bool {
         #if DEBUG
+            let arguments = ProcessInfo.processInfo.arguments
+            if arguments.contains("-HublotSnapshotMode") { return true }
+            if let index = arguments.firstIndex(of: "-UIAccessibilityReduceMotionEnabled"),
+                arguments.indices.contains(index + 1)
+            {
+                return systemSetting || arguments[index + 1] == "YES"
+            }
             return systemSetting
-                || ProcessInfo.processInfo.arguments.contains("-HublotSnapshotMode")
         #else
             return systemSetting
         #endif

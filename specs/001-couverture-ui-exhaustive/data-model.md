@@ -147,7 +147,8 @@ de l'écran, et la rangée voisine n'est pas chassée.
 | A1 | Paysage sur le fil | tout reste touchable | ✅ `testLandscapeChromeAndComposerRemainTouchable` |
 | A2 | Paysage sur projets et conversations | idem | ✅ `testProjectsStayReachableInLandscape`, `testConversationsStayReachableInLandscape` |
 | A3 | Grande taille de caractères | rangées lisibles, actions atteignables | ✅ `testProjectsRemainUsableAtAccessibleTextSize`, `testConversationsRemainUsableAtAccessibleTextSize` |
-| A4 | Animations réduites | les écrans animés cessent de peindre | ✅ `testContextTideStopsPaintingWithReducedMotion`, `testRadiographyStaysSteadyAndTouchableWithReducedMotion` |
+| A4 | Animations réduites | les écrans animés restent complets, immobiles et utilisables | ✅ `testContextTideStaysCompleteAndStillWithReducedMotion`, `testRadiographyStaysSteadyAndTouchableWithReducedMotion` |
+| A5 | Animations réduites | les canevas cessent de peindre | 🚫 non observable — voir ci-dessous |
 
 ## Comptage
 
@@ -155,6 +156,46 @@ de l'écran, et la rangée voisine n'est pas chassée.
 - Couverts : 66
 - Hors de portée, justifiés : 2 (M9, M10 — leurs effets côté app sont couverts)
 - Tests d'interface : 102 (40 déjà livrés, 62 ajoutés)
+
+## Ce qui n'est pas observable — mesuré, pas supposé
+
+**Qu'un canevas cesse de peindre** (A5) ne se prouve pas depuis XCUITest.
+
+La tentative est instructive et vaut d'être gardée. Le test comparait deux
+captures d'écran espacées d'une seconde, en attendant que rien ne bouge. Trois
+mesures, sur le simulateur de référence, l'ont écartée :
+
+| état | pixels qui changent |
+|---|---|
+| animations réduites, code sain | 0,06 % |
+| animations réduites, `TideCurve.animates` forcé à `isLive` | 0,04 % |
+| animations réduites, anneau de région forcé à s'animer | 0,00 % |
+
+La mutation ne fait pas bouger l'écran **plus** que le code sain : la capture ne
+restitue tout simplement pas ces animations. L'anneau de pulsation fait un point
+de large à opacité décroissante, la braise voyageuse en fait quatorze — sous le
+seuil de différence chromatique, et probablement hors de ce que compose une
+capture. Un test fondé là-dessus n'aurait mesuré que du bruit, dans un sens
+comme dans l'autre.
+
+Ce qui reste vérifié sous « réduire les animations » est l'autre moitié, et elle
+a sa valeur : les deux écrans s'affichent **en entier**, ne se réorganisent plus
+une fois posés, et restent touchables.
+
+### Ce que cette mesure a corrigé au passage
+
+L'argument de lancement `-UIAccessibilityReduceMotionEnabled YES` **ne change pas**
+`accessibilityReduceMotion` sur iOS 26 : mesuré à 1,6 % de pixels en mouvement
+avec l'argument, contre 0,07 % avec le vrai réglage posé par
+`defaults write com.apple.Accessibility ReduceMotionEnabled`. Tous les tests qui
+passaient cet argument — le test de paysage livré avant cette feature compris —
+croyaient couper les animations sans rien couper.
+
+`HublotMotion.isReduced` lit donc désormais cet argument à la main, sous
+`#if DEBUG`. Et trois vues qui lisaient le réglage brut au lieu de passer par
+`HublotMotion` — la carte de radiographie, l'anneau de ses régions, le point qui
+bat du chrome — y passent maintenant comme les autres : elles continuaient
+d'animer sous le mode capture, censé pourtant tout figer.
 
 ## Ce qui n'est pas testable parce que ce n'est pas atteignable
 

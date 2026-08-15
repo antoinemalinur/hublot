@@ -46,7 +46,7 @@ final class VisualSnapshotScreenTests: HublotUITestCase {
     /// Compare en RGBA avec une petite tolerance d'anticrenelage. Les 60
     /// premiers points appartiennent a iOS (heure, reseau, batterie), pas a
     /// Hublot; ils varient meme lorsque l'ecran de l'app est identique.
-    static func difference(_ lhs: UIImage, _ rhs: UIImage) -> (
+    private static func difference(_ lhs: UIImage, _ rhs: UIImage) -> (
         mean: Double, changedRatio: Double
     ) {
         guard let right = rgba(rhs),

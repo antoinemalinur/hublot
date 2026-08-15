@@ -601,7 +601,7 @@ struct PulseDot: View {
             .shadow(color: tint.opacity(beating ? 0.9 : 0), radius: pulse ? 6 : 2)
             .opacity(beating && pulse ? 0.5 : 1)
             .animation(
-                reduceMotion || !beating
+                HublotMotion.isReduced(reduceMotion) || !beating
                     ? nil
                     : .easeInOut(duration: 0.9).repeatForever(autoreverses: true),
                 value: pulse
