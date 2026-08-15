@@ -36,6 +36,7 @@ tests à jour dans le même commit.
 | `tide-inspector` | l'inspecteur de mesure | lire modèle et heure |
 | `holding-escape` | l'issue de secours de l'écran d'attente | prouver son apparition tardive |
 | `copy-code` | le bouton de copie d'un bloc de code | il n'a qu'un libellé |
+| `message-image` | une vignette dans la demande de l'utilisateur | prouver qu'elle précède le texte |
 
 ## Règles
 

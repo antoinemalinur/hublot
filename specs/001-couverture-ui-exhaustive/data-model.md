@@ -57,7 +57,7 @@ de l'écran, et la rangée voisine n'est pas chassée.
 | S11 | Lire une conversation à un échange | « 1 échange », au singulier | ✅ `testSingleExchangeIsWrittenInTheSingular` |
 | S12 | Ouvrir un dépôt sans fichier d'instructions | aucun bouton d'instructions | ✅ `testInstructionsButtonIsAbsentWithoutADocument` |
 | S13 | Faire défiler la feuille d'instructions | le chemin du document reste en tête | ✅ `testInstructionsSheetScrollsUnderItsHeader` |
-| S14 | Tirer la liste vers le bas | elle garde son contenu | ✅ `testPullToRefreshKeepsTheConversations` |
+| S14 | Tirer la liste vers le bas | elle se recharge, le contenu neuf apparaît | ✅ `testPullToRefreshAsksTheServerForTheConversationsAgain` |
 
 ## Fil et chrome
 
@@ -156,6 +156,9 @@ de l'écran, et la rangée voisine n'est pas chassée.
 - Couverts : 66
 - Hors de portée, justifiés : 2 (M9, M10 — leurs effets côté app sont couverts)
 - Tests d'interface : 102 (40 déjà livrés, 62 ajoutés)
+- Vérifiés par mutation : 60 sur 62 — chacun vu rouge sur une version de l'app
+  privée du comportement qu'il protège. Les deux exceptions sont les tests A4,
+  dont la cible propre n'est pas observable (voir ci-dessous)
 
 ## Ce qui n'est pas observable — mesuré, pas supposé
 

@@ -252,11 +252,10 @@ comportement tactile soit exercé par un vrai test d'interface — pas seulement
 par une compilation.
 
 ```bash
-# 66 tests unitaires + 10 tests d'interface sur simulateur
-xcodebuild test -scheme IAClient-UI \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+# Tout : tests unitaires, 102 tests d'interface, couverture, serveur, Release
+Tools/test-local.sh full
 
-# 28 tests serveur, sans VPS (bot.py et handoff.py sont doublés)
+# 72 tests serveur, sans VPS (bot.py et handoff.py sont doublés)
 cd Server && python3 -m unittest discover
 
 # 20 scénarios contre le vrai serveur ; --fast en saute les 10 qui
@@ -264,6 +263,38 @@ cd Server && python3 -m unittest discover
 HUBLOT_TOKEN=… node Tools/e2e.mjs --fast
 HUBLOT_TOKEN=… node Tools/e2e.mjs --only=vol
 ```
+
+### Voir un écran témoin à l'œil nu
+
+Chaque test d'interface part d'un **état déterministe** : un écran nommé, rendu
+toujours à l'identique, sans réseau. Ils servent aussi à regarder un écran sans
+avoir à reproduire les conditions qui y mènent — un jeton refusé, un moteur muet
+depuis une minute, une carte sans la moindre région.
+
+```bash
+xcrun simctl launch --terminate-running-process booted antoinemalinur.IAClient-UI \
+  -HublotUITestScenario chrome-lost
+```
+
+Les états disponibles sont déclarés dans `IAClient-UI/App/UITestScenario.swift`,
+et construits dans `App/ScreenFixtures.swift` et `App/ThreadFixtures.swift` :
+
+| Famille | États |
+|---|---|
+| Connexion | `connection`, `connection-busy`, `connection-failure` |
+| Dépôts | `projects`, `projects-variants`, `projects-empty`, `projects-error`, `projects-prompt-age`, `projects-reload` |
+| Conversations | `sessions`, `sessions-variants`, `sessions-empty`, `sessions-error`, `sessions-instructions`, `sessions-instructions-long`, `sessions-reload` |
+| Fil | `conversation`, `conversation-working`, `conversation-age`, `thread-blocks`, `thread-growing`, `concurrent-conversations` |
+| Chrome | `chrome-plan`, `chrome-lost`, `chrome-quiet`, `chrome-reconnecting`, `chrome-silent`, `codex-quota`, `engine-switch-quota`, `active-engine-lock` |
+| Composer | `composer-attachment`, `composer-refused-mic` |
+| Analyse | `context-tide`, `context-tide-empty`, `context-tide-finished`, `radiography`, `radiography-dense`, `radiography-empty` |
+| Attente | `holding-launch`, `holding-reconnect` |
+| Navigation | `navigation` |
+
+Trois arguments les accompagnent : `-HublotSnapshotMode YES` fige les animations
+pour les références visuelles, `-HublotHoldingDelay <s>` raccourcit l'attente
+avant l'issue de secours, et `-HublotGrowingDelay <s>` recule l'arrivée du tour
+supplémentaire de `thread-growing`.
 
 ## Outils
 

@@ -114,10 +114,14 @@ final class ChromeScreenTests: HublotUITestCase {
     /// pour relire, et le tour suivant ramenait l'écran en bas.
     func testThreadDoesNotJumpWhenATurnArrivesWhileReadingHigherUp() {
         // Le tour ne doit pas tomber pendant qu'on se place, sinon ce test
-        // observerait l'arrivée au lieu de la lecture. Deux balayages suffisent
-        // à quitter le bas du fil ; le délai leur laisse le double du temps
-        // qu'ils prennent sous quatre simulateurs en parallèle.
-        launch("thread-growing", extraArguments: ["-HublotGrowingDelay", "14"])
+        // observerait l'arrivée au lieu de la lecture.
+        //
+        // Le délai est franchement large, et c'est délibéré : un balayage coûte
+        // deux secondes sur une machine au repos et près de vingt sous quatre
+        // simulateurs qui travaillent. Ramené à quatorze secondes pour gagner du
+        // temps, ce test est retombé au premier run chargé. Un test dont la
+        // validité dépend de la charge ne protège rien.
+        launch("thread-growing", extraArguments: ["-HublotGrowingDelay", "40"])
 
         let thread = app.scrollViews.firstMatch
         XCTAssertTrue(thread.waitForExistence(timeout: 10))
@@ -136,7 +140,7 @@ final class ChromeScreenTests: HublotUITestCase {
         // l'écran : s'il fait ce qu'il doit, il naît hors du champ, et une vue
         // hors champ n'existe pas dans un `LazyVStack`. C'est le retour au
         // direct, plus bas, qui prouvera qu'il est bien arrivé.
-        RunLoop.current.run(until: Date().addingTimeInterval(17))
+        RunLoop.current.run(until: Date().addingTimeInterval(44))
 
         XCTAssertTrue(anchor.exists, "le repère a disparu de l'écran")
         XCTAssertEqual(
