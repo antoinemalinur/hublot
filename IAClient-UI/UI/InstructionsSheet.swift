@@ -106,6 +106,7 @@ struct InstructionsButton: View {
             }
             .buttonStyle(.plain)
             .glassEffect(.regular.interactive(), in: .circle)
+            .accessibilityIdentifier("instructions-button")
             .accessibilityLabel("Voir les instructions du dépôt")
         }
     }

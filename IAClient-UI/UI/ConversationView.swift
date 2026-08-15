@@ -50,6 +50,16 @@ struct ConversationView: View {
     /// Transcrit une dictée. `nil` désactive le micro — écrans témoins.
     var onDictate: ((Data) async -> String?)?
 
+    #if DEBUG
+        /// L'amorçage du composer pour les écrans témoins : une pièce jointe
+        /// déjà choisie, une phase de dictée imposée. Les deux gestes qui y
+        /// mènent sortent de l'app — sélecteur de photos et autorisation
+        /// micro — et ne sont donc pas pilotables ; ce que l'app en fait
+        /// ensuite, si.
+        var debugAttachments: [Attachment] = []
+        var debugDictationPhase: Dictation.Phase?
+    #endif
+
     @State private var showingRadiography = false
     @State private var showingContextTide = false
 
@@ -124,18 +134,7 @@ struct ConversationView: View {
                 )
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                Composer(
-                    engine: engine,
-                    configOptions: configOptions,
-                    status: status,
-                    commands: commands,
-                    onChoose: onChoose,
-                    isWorking: isWorking,
-                    queuedPromptCount: queuedPromptCount,
-                    onStop: onStop,
-                    onDictate: onDictate,
-                    onSend: onSend
-                )
+                composer
                 // Dans la marge haute du composer, là où il n'y a que du
                 // fondu : le bouton ne coûte donc aucune hauteur au fil et
                 // n'en déplace pas le contenu en apparaissant.
@@ -171,6 +170,25 @@ struct ConversationView: View {
         }
     }
 
+    private var composer: Composer {
+        var view = Composer(
+            engine: engine,
+            configOptions: configOptions,
+            status: status,
+            commands: commands,
+            onChoose: onChoose,
+            isWorking: isWorking,
+            queuedPromptCount: queuedPromptCount,
+            onStop: onStop,
+            onDictate: onDictate,
+            onSend: onSend
+        )
+        #if DEBUG
+            view.debugAttachments = debugAttachments
+            view.debugDictationPhase = debugDictationPhase
+        #endif
+        return view
+    }
 }
 
 /// Le retour au direct. Il n'apparaît que lorsqu'on a quitté le bas du fil —
@@ -403,6 +421,10 @@ struct SessionChrome: View {
                 .padding(.vertical, Hublot.unit * 0.5)
                 .glassEffect(.regular, in: .capsule)
                 .padding(.leading, Hublot.unit * 2.5)
+                // Le glyphe et le texte comptent pour un : sans fusion, deux
+                // éléments répondent au même nom — la leçon de `composer-queue`.
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("reconnecting-banner")
                 .transition(.opacity.combined(with: .offset(y: -6)))
             } else {
                 // Les deux mesures partagent une seule ligne : les plafonds à
@@ -629,6 +651,12 @@ struct PlanCapsule: View {
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
+            // Pas de libellé écrit à la main : celui que SwiftUI dérive porte le
+            // compteur lui-même — « 2/4 » — et c'est la seule valeur calculée
+            // que cette capsule affiche.
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("plan-capsule")
+            .accessibilityHint(isExpanded ? "Replier le plan" : "Déplier le plan")
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: Hublot.unit * 0.75) {
@@ -695,6 +723,11 @@ struct Composer: View {
     var onStop: () -> Void = {}
     var onDictate: ((Data) async -> String?)?
     let onSend: (String, [Attachment]) -> Void
+
+    #if DEBUG
+        var debugAttachments: [Attachment] = []
+        var debugDictationPhase: Dictation.Phase?
+    #endif
 
     @State private var draft = ""
     @State private var dictation = Dictation()
@@ -1006,6 +1039,18 @@ struct Composer: View {
             guard !items.isEmpty else { return }
             Task { await absorb(items) }
         }
+        #if DEBUG
+            // L'amorçage des écrans témoins. Il s'applique à l'apparition et
+            // pas à la construction : `attachments` et `dictation` sont des
+            // états de cette vue, et un `@State` ne se sème pas depuis une
+            // propriété de la structure qui le porte.
+            .onAppear {
+                if !debugAttachments.isEmpty { attachments = debugAttachments }
+                if let debugDictationPhase {
+                    dictation = Dictation(debugPhase: debugDictationPhase)
+                }
+            }
+        #endif
     }
 
     /// Pendant un tour, les descripteurs de réglages disent encore ce qui est
@@ -1047,6 +1092,12 @@ struct AttachmentChip: View {
                     .background(Hublot.abyss.opacity(0.75), in: .capsule)
                     .padding(3)
             }
+            // La vignette et son poids sont une seule information : fusionnés
+            // **avant** que la croix ne soit posée, sinon le bouton de retrait
+            // se fond dans la vignette et cesse d'être touchable par son nom.
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Image jointe, \(attachment.size)")
+            .accessibilityIdentifier("attachment-chip")
             .overlay(alignment: .topTrailing) {
                 Button(action: onRemove) {
                     Image(systemName: "xmark")
@@ -1059,6 +1110,7 @@ struct AttachmentChip: View {
                 }
                 .buttonStyle(.plain)
                 .offset(x: 6, y: -6)
+                .accessibilityIdentifier("attachment-remove")
                 .accessibilityLabel("Retirer l'image")
             }
     }

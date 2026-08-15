@@ -174,6 +174,8 @@ struct UserBlock: View {
                         HStack(spacing: Hublot.unit) {
                             ForEach(Array(turn.images.enumerated()), id: \.offset) { _, data in
                                 AttachedImage(data: data, side: 96)
+                                    .accessibilityLabel("Image de la demande")
+                                    .accessibilityIdentifier("message-image")
                             }
                         }
                     }

@@ -449,6 +449,7 @@ private struct RegionNode: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(region.name), \(region.count) actions, \(stateLabel)")
+        .accessibilityIdentifier("region-\(region.name)")
         .onAppear { pulse = true }
     }
 
@@ -830,6 +831,8 @@ private struct RegionInspector: View {
         }
         .padding(Hublot.unit * 1.5)
         .glassEffect(.regular, in: .rect(cornerRadius: 18, style: .continuous))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("region-inspector")
     }
 }
 
@@ -847,6 +850,8 @@ private struct RadiographyLegend: View {
                 .foregroundStyle(Hublot.meta)
         }
         .padding(.horizontal, Hublot.unit * 0.5)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("radiography-legend")
     }
 
     private func item(_ label: String, tint: Color) -> some View {

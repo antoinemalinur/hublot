@@ -103,6 +103,7 @@ struct HoldingView: View {
                         .font(.system(size: 14, weight: .medium))
                         .buttonStyle(.glass)
                         .tint(Hublot.ember)
+                        .accessibilityIdentifier("holding-escape")
                         .transition(.opacity.combined(with: .offset(y: 8)))
                 }
             }
@@ -110,9 +111,24 @@ struct HoldingView: View {
         .preferredColorScheme(.dark)
         .task {
             withAnimation(.smooth(duration: 0.65)) { hasArrived = true }
-            try? await Task.sleep(for: .seconds(10))
+            try? await Task.sleep(for: .seconds(Self.patience))
             withAnimation(.snappy(duration: 0.3)) { isLong = true }
         }
+    }
+
+    /// Dix secondes. C'est la durée au-delà de laquelle une attente cesse d'être
+    /// un chargement.
+    ///
+    /// Un test ne peut pas l'attendre : `waitForExistence` y passerait son
+    /// budget entier à ne rien faire, et l'apparition tardive du bouton est
+    /// justement ce qu'il faut prouver. `-HublotHoldingDelay 1` raccourcit donc
+    /// le compte à rebours — la valeur par défaut, elle, ne change pas.
+    private static var patience: TimeInterval {
+        #if DEBUG
+            return HublotLaunchDelay.seconds("-HublotHoldingDelay", fallback: 10)
+        #else
+            return 10
+        #endif
     }
 }
 

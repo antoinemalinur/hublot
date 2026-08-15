@@ -191,14 +191,20 @@ final class AppModel {
     var isConfigured: Bool { !serverURL.isEmpty && !token.isEmpty }
 
     #if DEBUG
+        /// - Parameter running: les tours en cours, quand l'écran témoin veut
+        ///   les choisir lui-même. `nil` garde le tour unique d'`office-chess`,
+        ///   celui des captures de référence.
         static func demo(
-            projects: [ProjectListResult.Project], failure: String? = nil
+            projects: [ProjectListResult.Project], failure: String? = nil,
+            running: [RunningResult.Turn]? = nil
         ) -> AppModel {
             let model = AppModel(environment: .ephemeral())
             model.isDemo = true
             model.projects = projects
             model.failure = failure
-            if let active = projects.first(where: { $0.name == "office-chess" }) {
+            if let running {
+                model.running = running
+            } else if let active = projects.first(where: { $0.name == "office-chess" }) {
                 model.running = [.init(
                     sessionId: "screen-running", cwd: active.path, engine: "claude",
                     phase: .tool, label: "pytest", elapsed: 134, quiet: 1
@@ -208,10 +214,23 @@ final class AppModel {
             return model
         }
 
+        /// Le fichier d'instructions du dépôt témoin.
+        ///
+        /// Trois cas, parce que trois choses différentes s'y vérifient : le
+        /// document des captures de référence, son absence — qui doit retirer le
+        /// bouton — et un règlement assez long pour que la feuille défile sous
+        /// son en-tête.
+        enum DemoInstructions {
+            case standard
+            case absent
+            case long
+        }
+
         static func demoSessions(
             project: ProjectListResult.Project,
             sessions: [SessionListResult.Summary]? = nil,
-            failure: String? = nil
+            failure: String? = nil,
+            instructions: DemoInstructions = .standard
         ) -> AppModel {
             let model = AppModel(environment: .ephemeral())
             model.isDemo = true
@@ -232,13 +251,39 @@ final class AppModel {
                 sessionId: "screen-running", cwd: project.path, engine: "claude",
                 phase: .tool, label: "/root/repos/office-chess/pytest", elapsed: 134, quiet: 1
             )]
-            model.instructions = .init(
-                path: "/root/repos/office-chess/CLAUDE.md",
-                content: "# Instructions\n\nValider chaque changement avant livraison.",
-                bytes: 58, updatedAt: model.environment.now()
-            )
+            switch instructions {
+            case .absent:
+                model.instructions = nil
+            case .standard:
+                model.instructions = .init(
+                    path: "/root/repos/office-chess/CLAUDE.md",
+                    content: "# Instructions\n\nValider chaque changement avant livraison.",
+                    bytes: 58, updatedAt: model.environment.now()
+                )
+            case .long:
+                model.instructions = .init(
+                    path: "/root/repos/office-chess/CLAUDE.md",
+                    content: Self.longInstructions,
+                    bytes: 4_312, updatedAt: model.environment.now()
+                )
+            }
             model.screen = .sessions(project)
             return model
+        }
+
+        /// Un règlement qui dépasse la hauteur de l'écran. Sans cette longueur,
+        /// « faire défiler la feuille » n'est pas un geste : il n'y a rien à
+        /// faire défiler, et l'en-tête tient en place sans avoir rien à tenir.
+        private static var longInstructions: String {
+            var lines = ["# Instructions", "", "Valider chaque changement avant livraison.", ""]
+            for index in 1...40 {
+                lines.append("## Règle \(index)")
+                lines.append("")
+                lines.append("Vérifier le point \(index) avant de livrer quoi que ce soit.")
+                lines.append("")
+            }
+            lines.append("FIN DU RÈGLEMENT — dernière ligne du document.")
+            return lines.joined(separator: "\n")
         }
     #endif
 

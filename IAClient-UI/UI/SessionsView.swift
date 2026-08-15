@@ -109,6 +109,7 @@ struct SessionsView: View {
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("sessions-back")
 
             if model.isReconnecting { ReconnectingBadge() }
             Spacer()
@@ -191,6 +192,7 @@ struct SessionRow: View {
         .buttonStyle(.plain)
         .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 16, style: .continuous))
         .accessibilityLabel("\(session.displayTitle), \(subtitle)")
+        .accessibilityIdentifier("session-row-\(session.sessionId)")
         .contextMenu {
             Button("Supprimer", systemImage: "trash", role: .destructive, action: onDelete)
         }

@@ -59,6 +59,20 @@ final class Dictation {
     /// ferait un fichier de plusieurs mégaoctets pour rien.
     private static let limit = Duration.seconds(180)
 
+    init() {}
+
+    #if DEBUG
+        /// Une phase imposée, pour les écrans témoins.
+        ///
+        /// Le micro lui-même sort de l'app — l'autorisation système n'est pas
+        /// pilotable par XCUITest. Ce que l'app **dit** d'un micro refusé, si :
+        /// l'invite qui renvoie aux Réglages est un texte de cette app, et rien
+        /// ne le vérifiait.
+        init(debugPhase: Phase) {
+            phase = debugPhase
+        }
+    #endif
+
     // MARK: Enregistrement
 
     func start() async {

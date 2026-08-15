@@ -43,6 +43,18 @@ struct IAClient_UIApp: App {
                         project: project,
                         initiallyShowsInstructions: HublotUITestScenario.current == .sessionsInstructions
                     )
+                case .sessionsInstructionsLong:
+                    let project = ProjectListResult.Project.samples[1]
+                    SessionsScreenFixture(
+                        project: project, instructions: .long,
+                        initiallyShowsInstructions: true
+                    )
+                case .sessionsVariants:
+                    let project = ProjectListResult.Project.samples[1]
+                    SessionsScreenFixture(
+                        project: project, sessions: SessionsScreenFixture.variants(in: project),
+                        instructions: .absent
+                    )
                 case .sessionsEmpty:
                     let project = ProjectListResult.Project.samples[1]
                     SessionsScreenFixture(project: project, sessions: [])
@@ -68,6 +80,49 @@ struct IAClient_UIApp: App {
                     )
                 case .connection:
                     ConnectionScreenFixture()
+
+                // Les états de la couverture exhaustive. Leurs fixtures vivent
+                // dans `ScreenFixtures.swift` et `ThreadFixtures.swift` : ce
+                // fichier ne porte que l'aiguillage.
+                case .navigation:
+                    NavigationFixture()
+                case .connectionBusy:
+                    ConnectionBusyFixture()
+                case .connectionFailure:
+                    ConnectionFailureFixture()
+                case .projectsVariants:
+                    ProjectsVariantsFixture()
+                case .projectsReload:
+                    ProjectsReloadFixture()
+                case .threadBlocks:
+                    ThreadBlocksFixture()
+                case .threadGrowing:
+                    ThreadGrowingFixture()
+                case .chromePlan:
+                    ChromeFixture(state: .plan)
+                case .chromeLost:
+                    ChromeFixture(state: .lost)
+                case .chromeQuiet:
+                    ChromeFixture(state: .quiet)
+                case .chromeReconnecting:
+                    ChromeFixture(state: .reconnecting)
+                case .chromeSilent:
+                    ChromeFixture(state: .silent)
+                case .composerAttachment:
+                    ComposerAttachmentFixture()
+                case .composerRefusedMic:
+                    ComposerRefusedMicFixture()
+                case .contextTideEmpty:
+                    ContextTideView.emptyDemo
+                case .contextTideFinished:
+                    ContextTideView.finishedDemo
+                case .radiographyEmpty:
+                    RadiographyView.emptyDemo
+                case .holdingLaunch:
+                    HoldingLaunchFixture()
+                case .holdingReconnect:
+                    HoldingReconnectFixture()
+
                 case nil:
                     RootView()
                 }
@@ -107,13 +162,44 @@ struct IAClient_UIApp: App {
             project: ProjectListResult.Project,
             sessions: [SessionListResult.Summary]? = nil,
             failure: String? = nil,
+            instructions: AppModel.DemoInstructions = .standard,
             initiallyShowsInstructions: Bool = false
         ) {
             self.project = project
             self.initiallyShowsInstructions = initiallyShowsInstructions
             _model = State(initialValue: .demoSessions(
-                project: project, sessions: sessions, failure: failure
+                project: project, sessions: sessions, failure: failure,
+                instructions: instructions
             ))
+        }
+
+        /// Les trois formes qu'une rangée de conversation peut prendre : la plus
+        /// récente, celle qui n'a qu'un échange, et une ancienne. Le singulier
+        /// d'« 1 échange » et la marque « dernière » sont des libellés calculés
+        /// que rien ne vérifiait.
+        static func variants(
+            in project: ProjectListResult.Project
+        ) -> [SessionListResult.Summary] {
+            [
+                .init(
+                    sessionId: "variante-recente", cwd: project.path,
+                    title: "Reprendre la couverture", updatedAt: .now.addingTimeInterval(-120),
+                    exchanges: 4
+                ),
+                .init(
+                    sessionId: "variante-unique", cwd: project.path,
+                    title: "Question posée une seule fois",
+                    updatedAt: .now.addingTimeInterval(-3_600), exchanges: 1
+                ),
+                // Aucun de ces titres ne porte le mot « dernière » : c'est la
+                // marque que la rangée du haut doit être seule à afficher, et un
+                // titre qui la contiendrait rendrait le test complaisant.
+                .init(
+                    sessionId: "variante-ancienne", cwd: project.path,
+                    title: "Conversation d'il y a longtemps",
+                    updatedAt: .now.addingTimeInterval(-604_800), exchanges: 12
+                ),
+            ]
         }
 
         var body: some View {
