@@ -24,6 +24,12 @@ final class ChatSession {
     }
 
     private(set) var turns: [Turn] = []
+    /// Identité de la version du document remise à SwiftUI.
+    ///
+    /// Elle ne bouge que lorsque le **fil** change. Les battements, plafonds et
+    /// réglages ont leur propre rendu : les laisser faire avancer cette valeur
+    /// obligerait un historique de mille tours à se regrouper pour une horloge.
+    private(set) var documentRevision = 0
     private(set) var plan: [PlanEntry] = []
     private(set) var status: Status = .idle
     private(set) var title = "Nouvelle session"
@@ -77,7 +83,9 @@ final class ChatSession {
     private(set) var activity: Activity?
     private(set) var activityAt: Date?
 
-    var machine: MachineState { .derive(from: turns) }
+    /// Dérivé une fois par publication du document, pas à chaque lecture de la
+    /// vue. `ConversationView` le lit aussi quand seul le chrome s'actualise.
+    private(set) var machine: MachineState = .idle
 
     /// Vrai tant que l'agent a la main. L'interface s'en sert pour remplacer le
     /// bouton d'envoi par un bouton d'arrêt — sans ça, un tour parti pour dix
@@ -115,6 +123,28 @@ final class ChatSession {
     private var sessionId: String?
     private var capabilities: InitializeResult.AgentCapabilities?
     private var pump: Task<Void, Never>?
+
+    /// Une rafale ACP peut porter des centaines de minuscules fragments dans
+    /// la même image. Les publier un par un accaparait le MainActor au détriment
+    /// du clavier et du défilement. On ne retient qu'un fragment **contigu** :
+    /// changer de type ou d'identifiant est une frontière d'ordre.
+    private final class PendingStreamFragment {
+        enum Kind { case message, thought }
+
+        let kind: Kind
+        let id: String
+        var text: String
+
+        init(kind: Kind, id: String, text: String) {
+            self.kind = kind
+            self.id = id
+            self.text = text
+        }
+    }
+
+    private var pendingStreamFragment: PendingStreamFragment?
+    private var streamFlushTask: Task<Void, Never>?
+    private static let streamPublicationInterval = Duration.milliseconds(25)
 
     /// Où vit chaque `messageId` dans le fil. Sans cette table, deux réponses
     /// successives fusionneraient en une seule.
@@ -186,6 +216,7 @@ final class ChatSession {
     /// sert aussi à lister les sessions. La couper ici obligerait à refaire une
     /// poignée de main à chaque aller-retour vers la liste.
     func disconnect() async {
+        flushPendingStream()
         pump?.cancel()
         pump = nil
         status = .idle
@@ -250,6 +281,9 @@ final class ChatSession {
         // zéro.
         activity = .init(running: true, phase: .starting, engine: engine.rawValue)
         activityAt = environment.now()
+        // Une demande saisie pendant l'ultime fragment d'un tour doit venir
+        // après ce fragment, même s'il attend encore sa prochaine image.
+        flushPendingStream()
         turns.append(
             .user(
                 .init(
@@ -258,6 +292,7 @@ final class ChatSession {
                 )
             )
         )
+        documentDidChange()
         // Dans la liste, le serveur garde son résumé persistant. Une fois le
         // fil ouvert, le titre sert plutôt à rappeler la demande à laquelle on
         // répond maintenant : sur une conversation longue, le nom du projet ou
@@ -400,55 +435,65 @@ final class ChatSession {
                 present(request, respond: respond)
             case .turnFinished(let id, let reason):
                 guard id == sessionId else { continue }
+                flushPendingStream()
                 finishStreaming(reason: reason)
                 release()
 
             case .historyFinished(let id):
                 guard id == sessionId else { continue }
+                flushPendingStream()
                 isReplaying = false
                 historySettlement?.resume()
                 historySettlement = nil
 
             case .disconnected(let error):
+                flushPendingStream()
                 status = error.map { .failed($0.localizedDescription) } ?? .idle
                 release()
             }
         }
         // La boucle ne s'arrête que si la liaison tombe ou si le fil se ferme :
         // dans les deux cas, personne ne doit rester en attente.
+        flushPendingStream()
         release()
     }
 
     private func apply(_ update: SessionUpdate) {
         switch update {
         case .userMessageChunk(_, let content):
+            flushPendingStream()
             guard let text = content.text, !text.isEmpty else { return }
             turns.append(.user(.init(id: UUID().uuidString, text: text)))
+            documentDidChange()
             // `session/load` rejoue les demandes dans l'ordre : en adoptant
             // chacune d'elles, le titre finit naturellement sur la plus
             // récente, comme lors d'un envoi en direct.
             title = Self.shorten(text)
 
         case .agentMessageChunk(let messageId, let content):
-            guard let text = content.text else { return }
-            appendMessage(text, messageId: messageId ?? "unique")
+            guard let text = content.text, !text.isEmpty else { return }
+            enqueueMessage(text, messageId: messageId ?? "unique")
 
         case .agentThoughtChunk(let messageId, let content):
-            guard let text = content.text else { return }
-            appendThought(text, messageId: messageId ?? "unique")
+            guard let text = content.text, !text.isEmpty else { return }
+            enqueueThought(text, messageId: messageId ?? "unique")
 
         case .toolCall(let payload):
+            flushPendingStream()
             upsertTool(payload)
 
         case .toolCallUpdate(let payload):
+            flushPendingStream()
             upsertTool(payload)
 
         case .plan(let entries):
+            flushPendingStream()
             plan = entries.enumerated().map { index, entry in
                 PlanEntry(id: "plan-\(index)", content: entry.content, status: entry.status)
             }
 
         case .usage(let used, let size, let pushed, let at):
+            flushPendingStream()
             contextUsed = used
             contextSize = size
             if let pushed { adopt(pushed) }
@@ -462,22 +507,96 @@ final class ChatSession {
             )
 
         case .activity(let beat):
+            flushPendingStream()
             adopt(beat)
 
         case .availableCommands(let list):
+            flushPendingStream()
             // Annoncées par le moteur, jamais écrites en dur : un plugin
             // installé sur le VPS apparaît dans la palette sans toucher à l'app.
             commands = list.map(\.name).sorted()
 
         case .currentMode:
+            flushPendingStream()
             break
 
         case .unrecognised(let kind):
+            flushPendingStream()
             log.notice("variante de session/update ignorée : \(kind, privacy: .public)")
         }
     }
 
     // MARK: Fusion dans le fil
+
+    /// Retient un morceau jusqu'à la prochaine image d'affichage. Une même
+    /// rafale reste exacte au caractère près, mais SwiftUI ne reçoit plus mille
+    /// invalidations qu'il ne pourrait de toute façon pas peindre.
+    private func enqueueMessage(_ text: String, messageId: String) {
+        if let pendingStreamFragment,
+            pendingStreamFragment.kind == .message,
+            pendingStreamFragment.id == messageId
+        {
+            pendingStreamFragment.text.append(contentsOf: text)
+        } else {
+            flushPendingStream()
+            pendingStreamFragment = .init(kind: .message, id: messageId, text: text)
+        }
+        scheduleStreamFlush()
+    }
+
+    private func enqueueThought(_ text: String, messageId: String) {
+        if let pendingStreamFragment,
+            pendingStreamFragment.kind == .thought,
+            pendingStreamFragment.id == messageId
+        {
+            pendingStreamFragment.text.append(contentsOf: text)
+        } else {
+            flushPendingStream()
+            pendingStreamFragment = .init(kind: .thought, id: messageId, text: text)
+        }
+        scheduleStreamFlush()
+    }
+
+    private func scheduleStreamFlush() {
+        guard streamFlushTask == nil else { return }
+        streamFlushTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: Self.streamPublicationInterval)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.publishPendingStream()
+        }
+    }
+
+    /// Frontière synchrone : appelée avant tout événement qui ne peut pas être
+    /// réordonné derrière le texte déjà reçu.
+    private func flushPendingStream() {
+        streamFlushTask?.cancel()
+        streamFlushTask = nil
+        publishPendingStream()
+    }
+
+    /// Chemin du minuteur. Il ne se réannule pas lui-même : il rend simplement
+    /// la place disponible pour la fenêtre suivante.
+    private func publishPendingStream() {
+        streamFlushTask = nil
+        guard let pendingStreamFragment else { return }
+        self.pendingStreamFragment = nil
+
+        switch pendingStreamFragment.kind {
+        case .message:
+            appendMessage(pendingStreamFragment.text, messageId: pendingStreamFragment.id)
+        case .thought:
+            appendThought(pendingStreamFragment.text, messageId: pendingStreamFragment.id)
+        }
+    }
+
+    private func documentDidChange() {
+        machine = .derive(from: turns)
+        documentRevision += 1
+    }
 
     /// Adopte l'état poussé par le serveur — plafonds, modèle, et **moteur**.
     ///
@@ -527,6 +646,7 @@ final class ChatSession {
             // grandit à nouveau, il est vivant et doit le montrer.
             if isWorking && !turn.isStreaming { turn.isStreaming = true }
             turns[index] = .assistant(turn)
+            documentDidChange()
             return
         }
         // Un message rejoué est déjà écrit : le marquer « en cours » faisait
@@ -540,12 +660,14 @@ final class ChatSession {
         turn.append(text)
         turns.append(.assistant(turn))
         messageIndex[messageId] = turns.count - 1
+        documentDidChange()
     }
 
     private func appendThought(_ text: String, messageId: String) {
         if let index = thoughtIndex[messageId], case .thought(var turn) = turns[index] {
             turn.markdown += text
             turns[index] = .thought(turn)
+            documentDidChange()
             return
         }
         turns.append(
@@ -554,6 +676,7 @@ final class ChatSession {
             ))
         )
         thoughtIndex[messageId] = turns.count - 1
+        documentDidChange()
     }
 
     /// Fusionne une charge d'outil dans le fil.
@@ -573,6 +696,7 @@ final class ChatSession {
             if !content.isEmpty { turn.content = content }
             if let detail = Self.detail(payload) { turn.detail = detail }
             turns[index] = .toolCall(turn)
+            documentDidChange()
             return
         }
 
@@ -590,6 +714,7 @@ final class ChatSession {
             )
         )
         toolIndex[payload.toolCallId] = turns.count - 1
+        documentDidChange()
     }
 
     /// Le titre affiché. `_meta.claudeCode.toolName` donne « Read » quand le
@@ -645,14 +770,18 @@ final class ChatSession {
     }
 
     private func finishStreaming(reason: StopReason?) {
+        flushPendingStream()
+        var changed = false
         for index in turns.indices {
             if case .assistant(var turn) = turns[index], turn.isStreaming {
                 turn.finish()
                 turns[index] = .assistant(turn)
+                changed = true
             }
             if case .thought(var turn) = turns[index], turn.isStreaming {
                 turn.isStreaming = false
                 turns[index] = .thought(turn)
+                changed = true
             }
         }
         isPrompting = false
@@ -663,8 +792,10 @@ final class ChatSession {
             log.notice("tour terminé sur \(reason.rawValue, privacy: .public)")
             if let note = Self.note(for: reason) {
                 turns.append(.notice(.init(id: UUID().uuidString, text: note.0, symbol: note.1)))
+                changed = true
             }
         }
+        if changed { documentDidChange() }
     }
 
     /// Ce qu'on écrit dans le fil quand un tour ne s'est pas terminé de
@@ -685,6 +816,7 @@ final class ChatSession {
         _ request: PermissionRequest,
         respond: @escaping @Sendable (PermissionResponse) async -> Void
     ) {
+        flushPendingStream()
         let turn = PermissionTurn(
             id: request.toolCall.toolCallId,
             toolTitle: request.toolCall.toolName ?? request.toolCall.title ?? "outil",
@@ -699,6 +831,7 @@ final class ChatSession {
             }
         )
         turns.append(.permission(turn))
+        documentDidChange()
         environment.notifyPermissionNeeded(turn.toolTitle, turn.detail)
     }
 

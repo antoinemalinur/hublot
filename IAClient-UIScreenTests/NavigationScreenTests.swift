@@ -13,6 +13,36 @@ import XCTest
 @MainActor
 final class NavigationScreenTests: HublotUITestCase {
 
+    /// P8 — signalé depuis l'iPhone le 15 août 2026 : entrer dans un dépôt
+    /// additionnait deux attentes réseau et la destination restait vide. Le
+    /// relais retient liste et instructions trois secondes; l'écran doit donc
+    /// répondre avant elles et dire honnêtement ce qu'il attend.
+    func testProjectEntryIsImmediateWhileItsResourcesLoad() {
+        launch("project-loading")
+
+        let project = projectRow("hublot")
+        XCTAssertTrue(project.waitForExistence(timeout: 10))
+        project.tap()
+
+        let back = element("sessions-back")
+        let loading = element("sessions-loading")
+        // La destination et son état transitoire doivent appartenir ensemble
+        // à l'arbre accessible, avant que la vraie rangée réseau les remplace.
+        XCTAssertTrue(back.exists)
+        XCTAssertTrue(loading.exists)
+        expect(back, toContain: "hublot", timeout: 1)
+
+        let action = element("new-session")
+        XCTAssertTrue(action.waitForExistence(timeout: 1))
+        XCTAssertTrue(action.isEnabled)
+        XCTAssertTrue(action.isHittable)
+
+        // Les deux réponses finissent ensemble; le chargement cède alors la
+        // place à la vraie rangée, jamais à un faux état vide intermédiaire.
+        XCTAssertTrue(sessionRow("charge").waitForExistence(timeout: 6))
+        XCTAssertTrue(loading.waitForNonExistence(timeout: 1))
+    }
+
     /// P6 — toucher un dépôt ouvre ses conversations, sous son nom.
     func testTouchingAProjectOpensItsConversationsUnderItsName() {
         launch("navigation")
