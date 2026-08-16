@@ -68,6 +68,39 @@ struct AppModelTests {
         #expect(methods.contains("hublot/instructions"))
     }
 
+    @Test("Les deux ressources d'un projet partent sans s'attendre")
+    func projectResourcesStartConcurrently() async throws {
+        // Signalé sur l'iPhone le 15 août 2026 : la liste payait son aller-retour
+        // entier, puis les instructions seulement commençaient le leur. Le
+        // transport retient les deux réponses; elles ne peuvent être vues
+        // simultanément en vol que si AppModel les a réellement lancées ensemble.
+        let transport = AppModelTransport(profile: .retainedProjectResources)
+        let model = AppModel(environment: environment(for: transport))
+        await model.connect()
+        let project = try #require(model.projects.first { $0.name == "recent" })
+
+        let opening = Task { await model.open(project) }
+        var methods: [String] = []
+        for _ in 0..<2_000 {
+            methods = await transport.methods()
+            if methods.contains("session/list") && methods.contains("hublot/instructions") {
+                break
+            }
+            await Task.yield()
+        }
+
+        #expect(methods.contains("session/list"))
+        #expect(
+            methods.contains("hublot/instructions"),
+            "les instructions n'ont commencé qu'après la liste retenue"
+        )
+
+        try await transport.releaseProjectResources()
+        await opening.value
+        #expect(model.sessions.count == 2)
+        #expect(model.instructions != nil)
+    }
+
     @Test("Un nom de projet est normalise avant de creer sa premiere conversation")
     func projectNameIsNormalised() async {
         let transport = AppModelTransport()
@@ -198,6 +231,9 @@ private actor AppModelTransport: ACPTransport {
         /// `session/list` reste sans réponse jusqu'à `releaseSessionList()` :
         /// c'est la fenêtre pendant laquelle l'écran doit rester utilisable.
         case pausedSessionList
+        /// Liste et instructions restent toutes deux en vol jusqu'à leur
+        /// libération commune, afin de prouver que leurs attentes se chevauchent.
+        case retainedProjectResources
     }
 
     private let profile: Profile
@@ -207,6 +243,8 @@ private actor AppModelTransport: ACPTransport {
     private var recordedDirectories: [String] = []
     private var disconnected = false
     private var heldSessionList: Int?
+    private var heldInstructions: Int?
+    private var projectResourcesReleased = false
 
     init(profile: Profile = .happy) { self.profile = profile }
 
@@ -247,9 +285,16 @@ private actor AppModelTransport: ACPTransport {
             )))
             return
         }
-        if profile == .pausedSessionList, method == "session/list" {
+        if (profile == .pausedSessionList || profile == .retainedProjectResources),
+           method == "session/list" {
             heldSessionList = id
             return
+        }
+        if profile == .retainedProjectResources, method == "hublot/instructions" {
+            if !projectResourcesReleased {
+                heldInstructions = id
+                return
+            }
         }
         if profile == .sessionListFailure, method == "session/list" {
             continuation?.yield(try JSONCoding.encoder.encode(RPCErrorReply(
@@ -268,6 +313,19 @@ private actor AppModelTransport: ACPTransport {
         heldSessionList = nil
         continuation?.yield(try JSONCoding.encoder.encode(RPCReply(
             id: id, result: result(for: "session/list")
+        )))
+    }
+
+    func releaseProjectResources() async throws {
+        projectResourcesReleased = true
+        try releaseSessionList()
+        // Si elle était déjà en vol, on la libère ici. Si le chemin historique
+        // séquentiel ne la lance qu'ensuite, `send` verra le drapeau et répondra
+        // immédiatement : dans les deux cas, le test rouge peut se terminer.
+        guard let id = heldInstructions else { return }
+        heldInstructions = nil
+        continuation?.yield(try JSONCoding.encoder.encode(RPCReply(
+            id: id, result: result(for: "hublot/instructions")
         )))
     }
 

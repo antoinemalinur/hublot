@@ -149,4 +149,85 @@ struct RenderPerformanceTests {
         #expect(stream.text == document)
         #expect(elapsed < 1.0)
     }
+
+    @Test("Cent battements ne révisent pas un historique de mille entrées")
+    func heartbeatsLeaveTheDocumentAlone() async throws {
+        let harness = try await Harness()
+        let chat = await harness.session(id: harness.recordedSession)
+
+        for index in 0..<500 {
+            await harness.transport.emit(Self.userFrame(
+                session: harness.recordedSession, text: "Question \(index)"
+            ))
+            await harness.transport.emit(Self.messageFrame(
+                session: harness.recordedSession, id: "m-\(index)",
+                text: "Réponse \(index).\n\n"
+            ))
+        }
+        await harness.transport.emit(Self.usageFrame(session: harness.recordedSession))
+        #expect(await harness.until({ chat.turns.count == 1_000 }, limit: 5_000))
+
+        let revision = chat.documentRevision
+        let start = ContinuousClock.now
+        for index in 0..<100 {
+            await harness.transport.emit(Self.activityFrame(
+                session: harness.recordedSession, elapsed: index
+            ))
+        }
+        #expect(await harness.until({ chat.activity?.elapsed == 99 }, limit: 5_000))
+        let elapsed = start.duration(to: .now).seconds
+
+        print(String(
+            format: "\n  100 battements / 1 000 entrées : %.1f ms, révision %d → %d\n",
+            elapsed * 1_000, revision, chat.documentRevision
+        ))
+        #expect(chat.documentRevision == revision)
+        #expect(elapsed < 0.1)
+
+        // Le second verrou : même si le parent recrée la valeur de vue pour un
+        // nouveau battement, sa porte Equatable reste fermée à révision égale.
+        let pinned = Binding.constant(true)
+        let before = ThreadDocument(
+            turns: chat.turns, revision: revision, machine: chat.machine,
+            isPinned: pinned
+        )
+        let after = ThreadDocument(
+            turns: chat.turns, revision: revision, machine: chat.machine,
+            isPinned: pinned
+        )
+        #expect(before == after)
+    }
+
+    private static func userFrame(session: String, text: String) -> String {
+        """
+        {"jsonrpc":"2.0","method":"session/update","params":{
+          "sessionId":"\(session)","update":{"sessionUpdate":"user_message_chunk",
+          "content":{"type":"text","text":"\(text)"}}}}
+        """
+    }
+
+    private static func messageFrame(session: String, id: String, text: String) -> String {
+        let escaped = text.replacingOccurrences(of: "\n", with: "\\n")
+        return """
+            {"jsonrpc":"2.0","method":"session/update","params":{
+              "sessionId":"\(session)","update":{"sessionUpdate":"agent_message_chunk",
+              "messageId":"\(id)","content":{"type":"text","text":"\(escaped)"}}}}
+            """
+    }
+
+    private static func usageFrame(session: String) -> String {
+        """
+        {"jsonrpc":"2.0","method":"session/update","params":{
+          "sessionId":"\(session)","update":{"sessionUpdate":"usage_update",
+          "used":10,"size":100}}}
+        """
+    }
+
+    private static func activityFrame(session: String, elapsed: Int) -> String {
+        """
+        {"jsonrpc":"2.0","method":"session/update","params":{
+          "sessionId":"\(session)","update":{"sessionUpdate":"hublot_activity",
+          "running":true,"phase":"thinking","elapsed":\(elapsed),"quiet":0}}}
+        """
+    }
 }

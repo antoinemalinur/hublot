@@ -199,6 +199,48 @@ struct ConversationFlowTests {
         #expect(finalRead.calls.map(\.id) == ["read-2"])
     }
 
+    @Test("Une rafale ACP ne publie pas mille fois le document", .timeLimit(.minutes(1)))
+    @MainActor
+    func streamingBurstIsPublishedAtDisplayCadence() async throws {
+        // Signalé sur l'iPhone le 15 août 2026 : pendant une réponse dense, le
+        // clavier et le défilement disputaient le MainActor à une publication
+        // SwiftUI par trame. Cette rafale traverse le vrai décodage et le vrai
+        // ChatSession; elle ne préremplit jamais la réponse attendue.
+        let harness = try await Harness()
+        let chat = await harness.session(id: harness.recordedSession)
+        let initialRevision = chat.documentRevision
+
+        for _ in 0..<1_000 {
+            await harness.transport.emit(Self.agentMessage(
+                harness.recordedSession, id: "pression", text: "x"
+            ))
+        }
+        // Une frontière non textuelle doit vider le dernier lot avant de
+        // s'appliquer; sans elle, le test pourrait lire un tampon incomplet.
+        await harness.transport.emit(Self.usage(
+            harness.recordedSession, used: 1, size: 100
+        ))
+
+        #expect(await harness.until({
+            chat.turns.compactMap {
+                if case .assistant(let turn) = $0 { return turn.markdown }
+                return nil
+            }.joined().count == 1_000
+        }, limit: 20_000))
+
+        let prose = chat.turns.compactMap {
+            if case .assistant(let turn) = $0 { return turn.markdown }
+            return nil
+        }.joined()
+        let revisions = chat.documentRevision - initialRevision
+
+        #expect(prose == String(repeating: "x", count: 1_000))
+        #expect(
+            revisions <= 40,
+            "1 000 fragments ont produit \(revisions) révisions visibles"
+        )
+    }
+
     // MARK: L'état de la machine
 
     @Test("Un échec rattrapé n'alarme plus l'écran une fois la réponse rendue")
@@ -562,6 +604,14 @@ struct ConversationFlowTests {
         """
     }
 
+    private static func agentMessage(_ session: String, id: String, text: String) -> String {
+        """
+        {"jsonrpc":"2.0","method":"session/update","params":{
+          "sessionId":"\(session)","update":{"sessionUpdate":"agent_message_chunk",
+          "messageId":"\(id)","content":{"type":"text","text":"\(text)"}}}}
+        """
+    }
+
     private static func usage(
         _ session: String, used: Int, size: Int, at: String? = nil
     ) -> String {
@@ -634,7 +684,11 @@ final class Harness {
     func until(_ condition: () -> Bool, limit: Int = 500) async -> Bool {
         for _ in 0..<limit {
             if condition() { return true }
-            await Task.yield()
+            // Les publications du fil sont volontairement bornées à l'image
+            // suivante. `yield()` seul peut épuiser 500 tours avant que 25 ms
+            // de temps réel ne passent et ferait alors échouer le test plus
+            // vite que le comportement promis ne peut se produire.
+            try? await Task.sleep(for: .milliseconds(1))
         }
         return condition()
     }

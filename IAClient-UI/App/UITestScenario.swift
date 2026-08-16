@@ -40,6 +40,8 @@
         case sessionsInstructionsLong = "sessions-instructions-long"
         case threadBlocks = "thread-blocks"
         case threadGrowing = "thread-growing"
+        case streamingPressure = "streaming-pressure"
+        case projectLoading = "project-loading"
         case chromePlan = "chrome-plan"
         case chromeLost = "chrome-lost"
         case chromeQuiet = "chrome-quiet"

@@ -11,6 +11,41 @@ import XCTest
 @MainActor
 final class ComposerScreenMoreTests: HublotUITestCase {
 
+    /// M9 — signalé depuis l'iPhone le 15 août 2026 : une réponse dense
+    /// accaparait le MainActor au point que toucher puis écrire paraissait
+    /// retardé. Les mille morceaux passent ici par ACPConnection et ChatSession
+    /// pendant que le test reproduit le vrai geste au clavier.
+    func testComposerStaysResponsiveDuringAThousandChunkBurst() {
+        launch("streaming-pressure")
+
+        let input = element("composer-input")
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        XCTAssertTrue(element("streaming-pressure-ready").waitForExistence(timeout: 10))
+        input.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+
+        // L'apparition du clavier déclenche la rafale. La valeur et le bouton
+        // vérifient le résultat observable du geste, indépendamment du temps
+        // que les trois autres simulateurs font perdre au pilote XCUITest.
+        input.typeText("prochaine demande")
+        XCTAssertEqual(input.value as? String, "prochaine demande")
+        XCTAssertEqual(element("composer-action").label, "Envoyer le message")
+
+        let complete = element("streaming-pressure-complete")
+        XCTAssertTrue(complete.waitForExistence(timeout: 15))
+        let label = plainLabel(of: complete)
+        let digits = label.filter(\.isNumber)
+        guard let revisions = Int(digits) else {
+            XCTFail("compteur de révisions absent : \(label)")
+            return
+        }
+        XCTAssertLessThanOrEqual(
+            revisions, 40,
+            "la rafale a invalidé le document \(revisions) fois"
+        )
+        XCTAssertTrue((input.value as? String ?? "").contains("prochaine demande"))
+    }
+
     /// M3 — au repos le bouton propose la dictée ; dès qu'on écrit, l'envoi.
     ///
     /// C'est la seule chose qui distingue un champ vide d'un champ rempli sur

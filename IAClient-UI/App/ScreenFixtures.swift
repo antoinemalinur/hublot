@@ -56,6 +56,8 @@
                         ConversationView(
                             sessionTitle: chat.title, engine: chat.engine,
                             turns: chat.turns,
+                            documentRevision: chat.documentRevision,
+                            machineState: chat.machine,
                             onBack: { model.closeConversation() },
                             onDictate: { _ in nil }
                         )

@@ -100,6 +100,10 @@ struct IAClient_UIApp: App {
                     ThreadBlocksFixture()
                 case .threadGrowing:
                     ThreadGrowingFixture()
+                case .streamingPressure:
+                    StreamingPressureFixture()
+                case .projectLoading:
+                    ProjectLoadingFixture()
                 case .chromePlan:
                     ChromeFixture(state: .plan)
                 case .chromeLost:
@@ -241,6 +245,8 @@ struct IAClient_UIApp: App {
                             engine: chat.engine,
                             plan: chat.plan,
                             turns: chat.turns,
+                            documentRevision: chat.documentRevision,
+                            machineState: chat.machine,
                             onSend: { text, images in
                                 Task { await chat.send(text, attachments: images) }
                             },
@@ -411,6 +417,8 @@ struct IAClient_UIApp: App {
                         ConversationView(
                             sessionTitle: chat.title, engine: chat.engine,
                             turns: chat.turns,
+                            documentRevision: chat.documentRevision,
+                            machineState: chat.machine,
                             onBack: { model.closeConversation() },
                             onDictate: { _ in nil }
                         )
@@ -520,6 +528,8 @@ struct IAClient_UIApp: App {
                     ConversationView(
                         sessionTitle: chat.title, engine: chat.engine,
                         turns: chat.turns,
+                        documentRevision: chat.documentRevision,
+                        machineState: chat.machine,
                         onBack: { model.closeConversation() },
                         configOptions: chat.configOptions,
                         status: chat.metrics,
@@ -682,6 +692,8 @@ struct RootView: View {
                         engine: chat.engine,
                         plan: chat.plan,
                         turns: chat.turns,
+                        documentRevision: chat.documentRevision,
+                        machineState: chat.machine,
                         onSend: { text, images in
                             Task { await chat.send(text, attachments: images) }
                         },

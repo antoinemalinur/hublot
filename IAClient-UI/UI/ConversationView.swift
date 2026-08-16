@@ -20,6 +20,12 @@ struct ConversationView: View {
     let engine: Engine
     var plan: [PlanEntry] = []
     let turns: [Turn]
+    /// Révision bon marché du document, fournie par le vrai fil. Les écrans
+    /// témoins laissent `nil` et utilisent le nombre de tours comme repli.
+    var documentRevision: Int? = nil
+    /// État déjà dérivé lors de la publication du document. Le recalcul local
+    /// reste le repli des previews et fixtures statiques.
+    var machineState: MachineState? = nil
     /// Vide pour les écrans témoins, branché sur `ChatSession.send` en vrai.
     var onSend: (String, [Attachment]) -> Void = { _, _ in }
     /// `nil` masque le retour : sur un écran témoin il n'y a nulle part où aller.
@@ -76,39 +82,20 @@ struct ConversationView: View {
     /// silence. Viser un *bord* ne dépend d'aucune vue.
     @State private var position = ScrollPosition(edge: .bottom)
 
-    private static let bottomAnchor = "hublot.fil.bas"
-
-    private var machine: MachineState { .derive(from: turns) }
+    private var machine: MachineState { machineState ?? .derive(from: turns) }
 
     var body: some View {
         ZStack {
             AmbientBackground(state: machine)
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: Hublot.unit * 2) {
-                    // Regroupé à l'affichage seulement : le fil, lui, garde
-                    // chaque appel — cf. `threadRows`.
-                    ForEach(turns.threadRows()) { row in
-                        ThreadRowView(row: row)
-                    }
-                    // Le témoin qui dit si on est en bas. Un point de hauteur,
-                    // à l'intérieur de la pile : sa visibilité vaut mieux qu'un
-                    // calcul d'offsets, parce qu'un fil plus court que l'écran
-                    // est déjà « en bas » sans qu'aucune arithmétique ne le
-                    // dise — et c'est le cas au début de chaque conversation.
-                    Color.clear
-                        .frame(height: 1)
-                        .id(Self.bottomAnchor)
-                        .onScrollVisibilityChange(threshold: 0.01) { visible in
-                            isPinned = visible
-                        }
-                }
-                .padding(.horizontal, Hublot.unit * 2)
-                .padding(.top, Hublot.unit * 4)
-                .padding(.bottom, Hublot.unit * 12)
-                .background(alignment: .topLeading) {
-                    LightRail(state: machine)
-                }
+                ThreadDocument(
+                    turns: turns,
+                    revision: documentRevision ?? turns.count,
+                    machine: machine,
+                    isPinned: $isPinned
+                )
+                .equatable()
                 // Le texte doit être sélectionnable et copiable partout :
                 // c'est une demande explicite du périmètre v1.
                 .textSelection(.enabled)
@@ -188,6 +175,46 @@ struct ConversationView: View {
             view.debugDictationPhase = debugDictationPhase
         #endif
         return view
+    }
+}
+
+/// Le document long est une île de rendu. Le chrome (battement, quota,
+/// reconnexion, composer) peut changer plusieurs fois par seconde sans toucher
+/// sa révision; SwiftUI saute alors jusqu'au regroupement `threadRows()`.
+struct ThreadDocument: View, Equatable {
+    let turns: [Turn]
+    let revision: Int
+    let machine: MachineState
+    @Binding var isPinned: Bool
+
+    private static let bottomAnchor = "hublot.fil.bas"
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.revision == rhs.revision && lhs.machine == rhs.machine
+    }
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: Hublot.unit * 2) {
+            // Regroupé à l'affichage seulement : le fil, lui, garde chaque
+            // appel et la radiographie continue de tous les compter.
+            ForEach(turns.threadRows()) { row in
+                ThreadRowView(row: row)
+            }
+            // Sa visibilité vaut mieux qu'un calcul d'offsets : un fil plus
+            // court que l'écran est déjà en bas, sans arithmétique spéciale.
+            Color.clear
+                .frame(height: 1)
+                .id(Self.bottomAnchor)
+                .onScrollVisibilityChange(threshold: 0.01) { visible in
+                    isPinned = visible
+                }
+        }
+        .padding(.horizontal, Hublot.unit * 2)
+        .padding(.top, Hublot.unit * 4)
+        .padding(.bottom, Hublot.unit * 12)
+        .background(alignment: .topLeading) {
+            LightRail(state: machine)
+        }
     }
 }
 

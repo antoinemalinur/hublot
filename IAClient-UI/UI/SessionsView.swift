@@ -32,6 +32,14 @@ struct SessionsView: View {
                         .sessionListRow()
                 }
 
+                // L'écran paraît avant le réseau. Ce témoin distingue alors
+                // une liste en route d'un projet réellement vide, sans bloquer
+                // l'action de créer une conversation pendant l'attente.
+                if model.sessions.isEmpty && model.isLoadingSessions {
+                    LoadingConversations()
+                        .sessionListRow()
+                }
+
                 // « Aucune conversation » ne doit paraître qu'une fois la liste
                 // revenue : l'afficher pendant le chargement annonçait un vide
                 // qui se démentait une demi-seconde plus tard.
@@ -128,11 +136,29 @@ struct SessionsView: View {
             Task { await model.startSession(in: project) }
         }
         .disabled(model.isBusy)
+        .accessibilityIdentifier("new-session")
         .frame(maxWidth: .infinity)
         .padding(.horizontal, Hublot.unit * 2)
         .padding(.top, Hublot.unit * 6)
         .padding(.bottom, Hublot.unit)
         .background { EdgeScrim(edge: .bottom).ignoresSafeArea() }
+    }
+}
+
+struct LoadingConversations: View {
+    var body: some View {
+        HStack(spacing: Hublot.unit * 1.25) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(Hublot.ember)
+            Text("Chargement des conversations…")
+                .font(.hublotMeta)
+                .foregroundStyle(Hublot.meta)
+        }
+        .padding(.vertical, Hublot.unit * 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("sessions-loading")
     }
 }
 

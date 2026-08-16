@@ -497,8 +497,13 @@ final class AppModel {
         sessions = []
         instructions = nil
         screen = .sessions(project)
-        await loadSessions(for: project)
-        await loadInstructions(for: project)
+        // Ces ressources ne dépendent pas l'une de l'autre. Les attendre en
+        // série additionnait deux allers-retours au geste le plus fréquent de
+        // l'app; des enfants structurés gardent leur durée au maximum des deux
+        // et s'annulent avec l'ouverture si l'écran disparaît.
+        async let sessionsLoad: Void = loadSessions(for: project)
+        async let instructionsLoad: Void = loadInstructions(for: project)
+        _ = await (sessionsLoad, instructionsLoad)
     }
 
     private func loadInstructions(for project: ProjectListResult.Project) async {
