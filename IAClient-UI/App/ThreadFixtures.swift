@@ -127,6 +127,7 @@
     /// faut avoir le temps de se placer avant qu'elle ne tombe.
     struct ThreadGrowingFixture: View {
         @State private var turns: [Turn] = Self.initialTurns
+        @State private var delivered = false
 
         /// Quatre secondes : de quoi voir le fil au repos avant que le tour ne
         /// tombe. Le test qui doit d'abord défiler vers le haut se donne plus de
@@ -136,6 +137,20 @@
             .seconds(HublotLaunchDelay.seconds("-HublotGrowingDelay", fallback: 4))
         }
 
+        /// Le tour attend qu'on le demande, au lieu de tomber sur une minuterie.
+        ///
+        /// Un test qui doit d'abord se placer dans le fil ne sait pas combien de
+        /// temps ses balayages prendront : deux secondes sur une machine au
+        /// repos, près de vingt sous quatre simulateurs. Un délai fixe doit donc
+        /// couvrir le pire cas, et fait payer ce pire cas à chaque exécution —
+        /// quarante-quatre secondes d'attente aveugle, mesurées le 16 août 2026
+        /// comme 7 % du travail d'interface de toute la suite. Le raccourcir
+        /// rendrait la validité du test dépendante de la charge. Le déclencheur
+        /// supprime la course : le tour tombe quand le test est prêt.
+        private static var waitsForDemand: Bool {
+            ProcessInfo.processInfo.arguments.contains("-HublotGrowingOnDemand")
+        }
+
         var body: some View {
             ConversationView(
                 sessionTitle: "Fil qui grandit", engine: .claude,
@@ -143,12 +158,31 @@
                 onDictate: { _ in nil }
             )
             .task {
+                guard !Self.waitsForDemand else { return }
                 try? await Task.sleep(for: Self.arrivesAfter)
-                turns.append(.assistant(.init(
-                    id: "tour-onze",
-                    markdown: "TOUR ONZE — arrivé après l'affichage."
-                )))
+                deliver()
             }
+            .overlay(alignment: .topLeading) {
+                // Le bouton s'efface en livrant : sa disparition est la seule
+                // preuve observable que le tour est tombé, puisque le tour lui,
+                // s'il se comporte bien, naît hors du champ.
+                if Self.waitsForDemand, !delivered {
+                    Button("Faire tomber le tour", action: deliver)
+                        .accessibilityIdentifier("growing-trigger")
+                        .font(.caption2)
+                        .padding(4)
+                        .background(.thinMaterial, in: .rect(cornerRadius: 4))
+                        .padding(.leading, 4)
+                }
+            }
+        }
+
+        private func deliver() {
+            turns.append(.assistant(.init(
+                id: "tour-onze",
+                markdown: "TOUR ONZE — arrivé après l'affichage."
+            )))
+            delivered = true
         }
 
         private static var initialTurns: [Turn] {

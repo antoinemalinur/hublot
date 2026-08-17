@@ -116,12 +116,14 @@ final class ChromeScreenTests: HublotUITestCase {
         // Le tour ne doit pas tomber pendant qu'on se place, sinon ce test
         // observerait l'arrivée au lieu de la lecture.
         //
-        // Le délai est franchement large, et c'est délibéré : un balayage coûte
-        // deux secondes sur une machine au repos et près de vingt sous quatre
-        // simulateurs qui travaillent. Ramené à quatorze secondes pour gagner du
-        // temps, ce test est retombé au premier run chargé. Un test dont la
-        // validité dépend de la charge ne protège rien.
-        launch("thread-growing", extraArguments: ["-HublotGrowingDelay", "40"])
+        // Il tombe donc sur commande et non sur minuterie. Un délai fixe devait
+        // couvrir le pire cas de placement — un balayage coûte deux secondes sur
+        // une machine au repos et près de vingt sous quatre simulateurs — et
+        // faisait payer ce pire cas à chaque exécution. Le raccourcir à quatorze
+        // secondes avait fait retomber ce test au premier run chargé : un test
+        // dont la validité dépend de la charge ne protège rien. Le déclencheur
+        // enlève la course au lieu de la raccourcir.
+        launch("thread-growing", extraArguments: ["-HublotGrowingOnDemand"])
 
         let thread = app.scrollViews.firstMatch
         XCTAssertTrue(thread.waitForExistence(timeout: 10))
@@ -138,9 +140,17 @@ final class ChromeScreenTests: HublotUITestCase {
 
         // Le tour tombe pendant qu'on lit ailleurs. On ne peut pas l'attendre à
         // l'écran : s'il fait ce qu'il doit, il naît hors du champ, et une vue
-        // hors champ n'existe pas dans un `LazyVStack`. C'est le retour au
-        // direct, plus bas, qui prouvera qu'il est bien arrivé.
-        RunLoop.current.run(until: Date().addingTimeInterval(44))
+        // hors champ n'existe pas dans un `LazyVStack`. C'est le déclencheur qui
+        // s'efface en livrant qui prouve qu'il est bien tombé.
+        let trigger = element("growing-trigger")
+        XCTAssertTrue(trigger.waitForExistence(timeout: 5))
+        trigger.tap()
+        XCTAssertTrue(trigger.waitForNonExistence(timeout: 5), "le tour n'est pas tombé")
+
+        // Le répit laisse au saut le temps de se produire s'il doit se produire.
+        // Sans lui, le test constaterait que rien n'a bougé avant même que le fil
+        // ait eu l'occasion de bouger, et ne protégerait plus rien.
+        RunLoop.current.run(until: Date().addingTimeInterval(2))
 
         XCTAssertTrue(anchor.exists, "le repère a disparu de l'écran")
         XCTAssertEqual(
