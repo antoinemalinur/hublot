@@ -13,13 +13,17 @@ RESULT_BUNDLE="$RUN_DIRECTORY/Hublot.xcresult"
 TEST_LOG="$RUN_DIRECTORY/xcode-test.log"
 RELEASE_LOG="$RUN_DIRECTORY/xcode-release.log"
 
-# Quatre workers mesures comme l'optimum sur M5 (10 coeurs, 24 Go): a six, la
-# contention rallonge les tests d'interface de 161 s a 216 s.
+# Deux workers mesures comme l'optimum sur M5 (10 coeurs dont 4 de performance,
+# 24 Go) le 16 aout 2026. Le troisieme ne rend rien - 446 s dans les deux cas -
+# parce que la contention rallonge chaque test d'interface de 7,7 s a 11,0 s,
+# exactement ce que la division fait gagner. Le quatrieme effondre le run.
 # HUBLOT_WORKERS et HUBLOT_PARALLEL_RELEASE permettent de remesurer.
-WORKERS="${HUBLOT_WORKERS:-4}"
-# Mesure: le build Release en fond vole assez de CPU aux simulateurs pour
-# rallonger les tests de 161 s a 174 s, alors qu'il ne dure lui-meme que 5 s a
-# chaud. Sequentiel par defaut, donc.
+WORKERS="${HUBLOT_WORKERS:-2}"
+# Mesure du 9 aout 2026: le build Release en fond vole assez de CPU aux
+# simulateurs pour rallonger les tests de 161 s a 174 s, alors qu'il ne dure
+# lui-meme que 5 s a chaud. Sequentiel par defaut, donc. Les durees absolues ont
+# vieilli - la suite a grossi - mais le CPU vole aux simulateurs, lui, n'a pas
+# change de nature.
 PARALLEL_RELEASE="${HUBLOT_PARALLEL_RELEASE:-0}"
 RELEASE_PID=""
 
@@ -225,6 +229,39 @@ update_snapshots() {
     done
 }
 
+# Dans laquelle des deux suites vit cette classe? L'appelant ne devrait pas avoir
+# a le savoir pour lancer ses tests.
+locate_suite() {
+    local class_name="${1%%/*}"
+    if grep -rqE "(class|struct) ${class_name}\b" "$REPOSITORY/IAClient-UIScreenTests" 2>/dev/null; then
+        echo "IAClient-UIScreenTests"
+    elif grep -rqE "(class|struct) ${class_name}\b" "$REPOSITORY/IAClient-UITests" 2>/dev/null; then
+        echo "IAClient-UITests"
+    else
+        return 1
+    fi
+}
+
+# La boucle courte du developpement: quelques classes, rien d'autre. Pas de
+# couverture, pas de tests serveur, pas de Release, et pas de parallelisme - a
+# deux ou trois classes, le clonage des simulateurs coute plus qu'il ne rend.
+# Elle ne remplace jamais `full`, qui reste la porte de livraison.
+run_focus() {
+    local targets=() suite name
+    for name in "$@"; do
+        if ! suite="$(locate_suite "$name")"; then
+            echo "Erreur: classe introuvable dans les deux suites: ${name%%/*}" >&2
+            exit 2
+        fi
+        echo "Cible: $suite/$name"
+        targets+=(-only-testing:"$suite/$name")
+    done
+    xcodebuild build-for-testing "${XCODE_COMMON[@]}"
+    xcodebuild test-without-building "${XCODE_COMMON[@]}" \
+        "${targets[@]}" \
+        -parallel-testing-enabled NO
+}
+
 case "$MODE" in
     full)
         phase "build-for-testing" build_for_testing
@@ -255,10 +292,26 @@ case "$MODE" in
     update-snapshots)
         update_snapshots
         ;;
+    focus)
+        shift
+        if [[ $# -eq 0 ]]; then
+            echo "Usage: Tools/test-local.sh focus <Classe|Classe/testCas> [...]" >&2
+            echo "Exemple: Tools/test-local.sh focus ChromeScreenTests" >&2
+            echo "         Tools/test-local.sh focus ThreadBlocksScreenTests/testDiffCarriesItsAddedAndRemovedMarkers" >&2
+            exit 2
+        fi
+        phase "tests cibles" run_focus "$@"
+        report_timings
+        ;;
     *)
-        echo "Usage: Tools/test-local.sh {full|stress|update-snapshots}" >&2
+        echo "Usage: Tools/test-local.sh {full|stress|update-snapshots|focus}" >&2
         exit 2
         ;;
 esac
 
-echo "Validation $MODE terminee sur iPhone Air (iOS $IOS_VERSION)."
+if [[ "$MODE" == "focus" ]]; then
+    echo "Boucle courte terminee sur iPhone Air (iOS $IOS_VERSION)."
+    echo "Ceci ne vaut pas validation: executer Tools/test-local.sh full avant toute livraison."
+else
+    echo "Validation $MODE terminee sur iPhone Air (iOS $IOS_VERSION)."
+fi
