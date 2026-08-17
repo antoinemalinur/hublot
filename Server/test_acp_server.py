@@ -853,6 +853,152 @@ class QuotaCacheTests(unittest.TestCase):
         self.assertEqual(cache.read(failing)["five_hour"]["percent"], 55)
         self.assertEqual(len(boom), 1, "on ne réessaie pas à chaque mesure")
 
+    def test_a_measurement_too_old_is_dropped_instead_of_shown(self) -> None:
+        """Le bug rapporté : « 5H: 0 % » six jours durant.
+
+        Garder la dernière valeur protège d'un clignotement, mais sans borne
+        cette règle transforme un relevé mort en chiffre d'apparence nette. Le
+        journal du relais l'a montré : 239 mesures sur 245 portaient un zéro
+        pris à un instant où la fenêtre était vraiment vide, pendant que le
+        compte brûlait 61 % de sa session. Passé le seuil, la jauge se tait.
+        """
+        cache = acp_server.QuotaCache(ttl=900.0, retry=120.0, stale=3_600.0)
+        cache.read(lambda: {"five_hour": {"percent": 0, "resetsAt": None}})
+
+        def refused() -> dict[str, Any]:
+            raise urllib.error.HTTPError(
+                acp_server.CLAUDE_USAGE_URL, 429, "Too Many Requests",
+                {"Retry-After": "3600"}, None,
+            )
+
+        # Une heure de punition plus tard, la mesure n'a plus rien à décrire.
+        cache.measured_at -= 3_601
+        cache.next_read = 0.0
+        self.assertEqual(cache.read(refused), {}, "un chiffre mort ne s'affiche pas")
+
+        # Et la mesure suivante repart proprement, sans traîner l'ancienne.
+        cache.next_read = 0.0
+        self.assertEqual(
+            cache.read(lambda: {"five_hour": {"percent": 84, "resetsAt": None}}),
+            {"five_hour": {"percent": 84, "resetsAt": None}},
+        )
+
+    def test_a_measurement_still_within_the_delay_is_kept(self) -> None:
+        # La borne ne doit pas emporter le garde-fou qu'elle encadre : une
+        # jauge d'un quart d'heure reste une jauge.
+        cache = acp_server.QuotaCache(ttl=900.0, retry=120.0, stale=3_600.0)
+        cache.read(lambda: {"five_hour": {"percent": 55, "resetsAt": None}})
+        cache.measured_at -= 900
+        cache.next_read = 0.0
+        self.assertEqual(
+            cache.read(lambda: (_ for _ in ()).throw(RuntimeError("429")))
+            ["five_hour"]["percent"], 55)
+
+
+class UsageSnapshotTests(unittest.TestCase):
+    """La sonde locale, préférée à l'endpoint qui punit.
+
+    Quatre clients se partageaient `/api/oauth/usage` sur le VPS — la sonde de
+    `claude-usage-monitor`, le tableau de bord web, le rapport hebdomadaire et
+    Hublot. L'endpoint les limitait tous, et le relais était le seul à ne pas
+    savoir renouveler son jeton : quatorze échecs au journal depuis le 10 août,
+    des `429` jusqu'à 3 600 s de pénalité et des `401` les 16 et 17 août.
+    """
+
+    SNAPSHOT = {
+        "observed_at": "2026-08-17T11:20:02.644675+00:00",
+        "usage_raw": {
+            "five_hour": {"utilization": 61.0,
+                          "resets_at": "2026-08-17T15:50:00.324375+00:00"},
+            "seven_day": {"utilization": 49.0,
+                          "resets_at": "2026-08-17T17:00:00.324402+00:00"},
+        },
+    }
+
+    def write(self, directory: str, *, age_seconds: float,
+              payload: dict[str, Any] | None = None) -> Path:
+        """Le fichier de la sonde, daté par rapport à maintenant."""
+        from datetime import datetime, timedelta, timezone
+        raw = json.loads(json.dumps(payload if payload is not None else self.SNAPSHOT))
+        raw["observed_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        ).isoformat()
+        path = Path(directory) / "state.json"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        return path
+
+    def test_a_fresh_snapshot_is_read_without_touching_the_endpoint(self) -> None:
+        """Le fichier suffit : aucun appel réseau, donc aucun `429` possible."""
+        called = []
+        with tempfile.TemporaryDirectory() as home:
+            path = self.write(home, age_seconds=60)
+            with mock.patch.object(acp_server, "USAGE_SNAPSHOT", path), \
+                 mock.patch.object(acp_server, "claude_quota_windows",
+                                   lambda: called.append(1) or {}):
+                windows = acp_server.quota_snapshot("claude")
+
+        self.assertEqual(windows["five_hour"]["percent"], 61)
+        self.assertEqual(windows["seven_day"]["percent"], 49)
+        self.assertEqual(windows["five_hour"]["resetsAt"],
+                         "2026-08-17T15:50:00.324375+00:00")
+        self.assertEqual(called, [], "l'endpoint n'a pas à être dérangé")
+
+    def test_a_stale_snapshot_falls_back_to_the_endpoint(self) -> None:
+        # Sonde arrêtée, jeton mort : le relevé ne décrit plus rien. On
+        # redemande à l'endpoint plutôt que de servir un chiffre d'hier.
+        with tempfile.TemporaryDirectory() as home:
+            path = self.write(home, age_seconds=acp_server.USAGE_SNAPSHOT_MAX_AGE + 1)
+            with mock.patch.object(acp_server, "USAGE_SNAPSHOT", path):
+                self.assertEqual(acp_server.claude_snapshot_windows(), {})
+
+    def test_the_threshold_leaves_the_probe_room_to_be_late(self) -> None:
+        """La sonde passe toutes les quinze minutes ; le seuil doit l'admettre.
+
+        À 900 s pile, la moindre seconde de retard du cron périme un relevé
+        parfaitement bon — un défaut déjà observé ailleurs, 149 fois, sur des
+        âges de 905 à 915 s.
+        """
+        self.assertGreaterEqual(acp_server.USAGE_SNAPSHOT_MAX_AGE, 1_800.0)
+        with tempfile.TemporaryDirectory() as home:
+            path = self.write(home, age_seconds=910)
+            with mock.patch.object(acp_server, "USAGE_SNAPSHOT", path):
+                self.assertEqual(
+                    acp_server.claude_snapshot_windows()["five_hour"]["percent"], 61)
+
+    def test_an_absent_or_broken_snapshot_never_raises(self) -> None:
+        # Sur une machine sans sonde, la lecture doit simplement s'effacer :
+        # `send_status` passe ici toutes les huit secondes pendant un tour.
+        with tempfile.TemporaryDirectory() as home:
+            absent = Path(home) / "jamais-ecrit.json"
+            with mock.patch.object(acp_server, "USAGE_SNAPSHOT", absent):
+                self.assertEqual(acp_server.claude_snapshot_windows(), {})
+
+            broken = Path(home) / "state.json"
+            broken.write_text("{ pas du json", encoding="utf-8")
+            with mock.patch.object(acp_server, "USAGE_SNAPSHOT", broken):
+                self.assertEqual(acp_server.claude_snapshot_windows(), {})
+
+            undated = self.write(home, age_seconds=0, payload={"usage_raw": {}})
+            undated.write_text(json.dumps({"usage_raw": {}}), encoding="utf-8")
+            with mock.patch.object(acp_server, "USAGE_SNAPSHOT", undated):
+                self.assertEqual(acp_server.claude_snapshot_windows(), {})
+
+    def test_codex_keeps_its_own_source(self) -> None:
+        # La sonde ne relève que Claude. Servir son 5 h sous une pastille Codex
+        # serait une donnée vraie attribuée au mauvais moteur — donc fausse.
+        with tempfile.TemporaryDirectory() as home:
+            path = self.write(home, age_seconds=60)
+            with mock.patch.object(acp_server, "USAGE_SNAPSHOT", path), \
+                 mock.patch.object(acp_server, "codex_rate_limits", return_value={
+                     "primary": {"usedPercent": 12, "windowDurationMins": 10080,
+                                 "resetsAt": 1786830360}}):
+                acp_server.CODEX_QUOTA.value = {}
+                acp_server.CODEX_QUOTA.next_read = 0.0
+                windows = acp_server.quota_snapshot("codex")
+
+        self.assertEqual(windows["seven_day"]["percent"], 12)
+        self.assertNotIn("five_hour", windows)
+
 
 class ActiveTurnConfigurationTests(unittest.IsolatedAsyncioTestCase):
     async def test_engine_cannot_be_changed_under_a_running_turn(self) -> None:

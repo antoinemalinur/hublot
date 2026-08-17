@@ -1435,6 +1435,37 @@ CODEX_QUOTA_TTL = 300.0
 QUOTA_RETRY = 120.0
 QUOTA_TIMEOUT = 25.0
 
+# Au-delà de cet âge, une mesure n'est plus une mesure. « Un échec ne vide jamais
+# la valeur » protégeait la jauge d'un clignotement ; sans borne, la même règle
+# l'a laissée afficher « 5H: 0 % » pendant six jours — la fenêtre était vraiment
+# vide à la seconde du relevé, et plus jamais après. Relu dans le journal du
+# relais : 239 mesures sur 245 portaient ce zéro, toutes avec `resetsAt: null`,
+# pendant que le compte brûlait 61 % de sa session. Un chiffre faux est pire que
+# pas de chiffre : passé ce délai, la cellule disparaît au lieu de mentir.
+QUOTA_STALE = 3_600.0
+
+# La sonde de `claude-usage-monitor` passe toutes les quinze minutes, renouvelle
+# le jeton OAuth elle-même et écrit ce qu'elle a vu. C'est la bonne source pour
+# Hublot : lire un fichier ne coûte rien, ne peut pas se faire limiter, et ne
+# vieillit jamais de plus d'un quart d'heure.
+#
+# L'appel direct que faisait le relais était le vrai défaut. Quatre clients se
+# partageaient le même endpoint — cette sonde, le tableau de bord web, le rapport
+# hebdomadaire et Hublot — et l'endpoint les punissait tous : quatorze échecs au
+# journal depuis le 10 août, des `429` avec jusqu'à 3 600 s de pénalité, puis des
+# `401` le 16 et le 17 parce que le relais lisait le trousseau sans jamais
+# renouveler le jeton qui l'occupait. Entre deux, la jauge servait sa valeur
+# figée.
+USAGE_SNAPSHOT = Path(
+    os.environ.get("HUBLOT_USAGE_SNAPSHOT")
+    or (Path.home() / ".claude-usage-monitor" / "state.json")
+)
+# La sonde passe toutes les quinze minutes : le seuil doit lui laisser de la
+# marge. À 900 s pile, la moindre seconde de retard du cron périme un relevé
+# parfaitement bon — le défaut a déjà été observé ailleurs, 149 fois, sur des
+# âges de 905 à 915 s. Le double laisse passer un tour manqué sans rien inventer.
+USAGE_SNAPSHOT_MAX_AGE = 1_800.0
+
 MONTHS = {name: index for index, name in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun",
      "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
@@ -1465,13 +1496,19 @@ class QuotaCache:
     à un endpoint qui bannit — au même rythme.
 
     Un échec ne vide jamais la valeur : une jauge un peu vieille vaut mieux
-    qu'une jauge qui clignote.
+    qu'une jauge qui clignote. Mais « un peu » a une fin — `stale` la fixe, et
+    au-delà la valeur est rendue au néant plutôt qu'à l'écran.
     """
 
-    def __init__(self, ttl: float, retry: float) -> None:
+    def __init__(self, ttl: float, retry: float,
+                 stale: float = QUOTA_STALE) -> None:
         self.ttl = ttl
         self.retry = retry
+        self.stale = stale
         self.value: dict[str, Any] = {}
+        # L'instant du dernier relevé réussi, pour savoir quand il ne vaut plus
+        # rien. Distinct de `next_read`, qu'un échec repousse.
+        self.measured_at = 0.0
         self.next_read = 0.0
         # Vrai pendant qu'un thread va chercher la valeur suivante : les autres
         # appels se contentent de l'ancienne au lieu d'ouvrir un second processus.
@@ -1493,12 +1530,12 @@ class QuotaCache:
         now = time.monotonic()
         with self.lock:
             if now < self.next_read:
-                return self.value
+                return self._unexpired(now)
             if not self.value:
                 # Rien à montrer encore : cette fois-là, il faut bien attendre.
                 return self._renew(fetch, now)
             if self.refreshing:
-                return self.value
+                return self._unexpired(now)
             self.refreshing = True
 
         threading.Thread(
@@ -1506,7 +1543,20 @@ class QuotaCache:
             name="hublot-quota",
         ).start()
         with self.lock:
-            return self.value
+            return self._unexpired(now)
+
+    def _unexpired(self, now: float) -> dict[str, Any]:
+        """La valeur retenue, ou rien du tout si elle a trop vieilli.
+
+        Le verrou est tenu par l'appelant. C'est ici que se joue la différence
+        entre « une jauge un peu vieille » et un chiffre qui a cessé de décrire
+        quoi que ce soit.
+        """
+        if self.value and now - self.measured_at > self.stale:
+            log(f"plafonds périmés ({now - self.measured_at:.0f} s) : "
+                "la jauge s'efface plutôt que d'afficher un chiffre mort")
+            self.value = {}
+        return self.value
 
     def _refresh(self, fetch: Callable[[], dict[str, Any]]) -> None:
         """Le rafraîchissement de fond, verrou relâché pendant l'appel."""
@@ -1532,14 +1582,15 @@ class QuotaCache:
             log(f"plafonds illisibles : {exc!r} (nouvel essai dans {delay:.0f} s)")
             with self._maybe_lock(locked):
                 self.next_read = now + delay
-                return self.value
+                return self._unexpired(now)
         with self._maybe_lock(locked):
             if fresh:
                 self.value = fresh
+                self.measured_at = now
                 self.next_read = now + self.ttl
             else:
                 self.next_read = now + self.retry
-            return self.value
+            return self._unexpired(now)
 
     def _maybe_lock(self, locked: bool):
         """Le verrou, sauf quand l'appelant le tient déjà."""
@@ -1600,6 +1651,31 @@ def claude_quota_windows() -> dict[str, Any]:
 
 
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def claude_snapshot_windows() -> dict[str, Any]:
+    """Les plafonds relevés par la sonde locale, tant qu'ils sont frais.
+
+    `usage_raw` est la réponse de l'endpoint telle quelle : `claude_usage_windows`
+    la lit sans rien apprendre de nouveau. La sonde, elle, sait faire ce que le
+    relais ne faisait pas — renouveler le jeton OAuth avant qu'il expire, et
+    n'appeler l'endpoint qu'une fois par quart d'heure pour tout le monde.
+
+    Rend `{}` plutôt qu'une exception quand le fichier manque, ne se lit pas ou
+    date trop : l'appelant retombe alors sur l'endpoint. Muette à dessein — elle
+    est sur le chemin de `send_status`, qui passe toutes les huit secondes
+    pendant un tour, et un journal n'a rien à y gagner. Ce qui se voit, c'est la
+    jauge : fraîche, ou absente.
+    """
+    try:
+        raw = json.loads(USAGE_SNAPSHOT.read_text(encoding="utf-8"))
+        observed = datetime.fromisoformat(str(raw["observed_at"]))
+        age = (datetime.now(timezone.utc) - observed).total_seconds()
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    if age > USAGE_SNAPSHOT_MAX_AGE:
+        return {}
+    return claude_usage_windows(raw.get("usage_raw") or {})
 
 
 def claude_usage_windows(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1790,10 +1866,16 @@ def quota_snapshot(engine: str = "claude") -> dict[str, Any]:
 
     On ne mélange jamais les deux : montrer le 5 h de Claude sous une pastille
     Codex était une donnée vraie attribuée au mauvais moteur — donc fausse.
+
+    Pour Claude, la sonde locale passe avant l'endpoint. Elle relève toutes les
+    quinze minutes, renouvelle son jeton et ne peut pas se faire limiter ; le
+    cache et son appel réseau ne servent plus que de repli, sur une machine qui
+    n'a pas de sonde. Lire un fichier à chaque mesure ne coûte rien — c'est
+    justement ce qui rend la jauge vivante plutôt que figée à l'heure passée.
     """
     if engine == "codex":
         return CODEX_QUOTA.read(codex_quota_windows)
-    return CLAUDE_QUOTA.read(claude_quota_windows)
+    return claude_snapshot_windows() or CLAUDE_QUOTA.read(claude_quota_windows)
 
 
 def running_turns() -> list[dict[str, Any]]:
