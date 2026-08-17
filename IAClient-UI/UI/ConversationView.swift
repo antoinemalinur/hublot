@@ -26,8 +26,14 @@ struct ConversationView: View {
     /// État déjà dérivé lors de la publication du document. Le recalcul local
     /// reste le repli des previews et fixtures statiques.
     var machineState: MachineState? = nil
+    /// Le shell est déjà ouvert, mais l'historique traverse encore sa barrière
+    /// FIFO. Le masquer évite un rattrapage visible et un rendu Markdown répété.
+    var isLoadingHistory = false
     /// Vide pour les écrans témoins, branché sur `ChatSession.send` en vrai.
     var onSend: (String, [Attachment]) -> Void = { _, _ in }
+    /// Couture d'observation utilisée par la reproduction de pression UI. La
+    /// production laisse le callback vide; le brouillon reste possédé ici.
+    var onDraftChange: (String) -> Void = { _ in }
     /// `nil` masque le retour : sur un écran témoin il n'y a nulle part où aller.
     var onBack: (() -> Void)?
     /// Les réglages tels que l'agent les décrit. Vide sur un écran témoin.
@@ -89,16 +95,21 @@ struct ConversationView: View {
             AmbientBackground(state: machine)
 
             ScrollView {
-                ThreadDocument(
-                    turns: turns,
-                    revision: documentRevision ?? turns.count,
-                    machine: machine,
-                    isPinned: $isPinned
-                )
-                .equatable()
-                // Le texte doit être sélectionnable et copiable partout :
-                // c'est une demande explicite du périmètre v1.
-                .textSelection(.enabled)
+                if isLoadingHistory {
+                    ConversationHistoryLoading()
+                        .containerRelativeFrame([.horizontal, .vertical])
+                } else {
+                    ThreadDocument(
+                        turns: turns,
+                        revision: documentRevision ?? turns.count,
+                        machine: machine,
+                        isPinned: $isPinned
+                    )
+                    .equatable()
+                    // Le texte doit être sélectionnable et copiable partout :
+                    // c'est une demande explicite du périmètre v1.
+                    .textSelection(.enabled)
+                }
             }
             // On ouvre une conversation pour voir où elle en est, pas comment
             // elle a commencé. L'ancrage bas fait aussi suivre le flux pendant
@@ -121,23 +132,25 @@ struct ConversationView: View {
                 )
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                composer
-                // Dans la marge haute du composer, là où il n'y a que du
-                // fondu : le bouton ne coûte donc aucune hauteur au fil et
-                // n'en déplace pas le contenu en apparaissant.
-                .overlay(alignment: .topTrailing) {
-                    if !isPinned {
-                        JumpToLatest {
-                            withAnimation(.easeOut(duration: 0.25)) {
-                                position.scrollTo(edge: .bottom)
+                if !isLoadingHistory {
+                    composer
+                    // Dans la marge haute du composer, là où il n'y a que du
+                    // fondu : le bouton ne coûte donc aucune hauteur au fil et
+                    // n'en déplace pas le contenu en apparaissant.
+                    .overlay(alignment: .topTrailing) {
+                        if !isPinned {
+                            JumpToLatest {
+                                withAnimation(.easeOut(duration: 0.25)) {
+                                    position.scrollTo(edge: .bottom)
+                                }
                             }
+                            .padding(.trailing, Hublot.unit * 2)
+                            .padding(.top, Hublot.unit * 2)
+                            .transition(.opacity.combined(with: .scale(scale: 0.8)))
                         }
-                        .padding(.trailing, Hublot.unit * 2)
-                        .padding(.top, Hublot.unit * 2)
-                        .transition(.opacity.combined(with: .scale(scale: 0.8)))
                     }
+                    .animation(.snappy(duration: 0.22), value: isPinned)
                 }
-                .animation(.snappy(duration: 0.22), value: isPinned)
             }
             // `scrollEdgeEffectStyle` n'est pas utilisé : mesuré sur capture,
             // il ne s'applique qu'aux barres système, pas à un `safeAreaInset`
@@ -168,13 +181,29 @@ struct ConversationView: View {
             queuedPromptCount: queuedPromptCount,
             onStop: onStop,
             onDictate: onDictate,
-            onSend: onSend
+            onSend: onSend,
+            onDraftChange: onDraftChange
         )
         #if DEBUG
             view.debugAttachments = debugAttachments
             view.debugDictationPhase = debugDictationPhase
         #endif
         return view
+    }
+}
+
+struct ConversationHistoryLoading: View {
+    var body: some View {
+        VStack(spacing: Hublot.unit * 1.5) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(Hublot.ember)
+            Text("Chargement de la discussion…")
+                .font(.hublotMeta)
+                .foregroundStyle(Hublot.meta)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("conversation-loading")
     }
 }
 
@@ -750,6 +779,7 @@ struct Composer: View {
     var onStop: () -> Void = {}
     var onDictate: ((Data) async -> String?)?
     let onSend: (String, [Attachment]) -> Void
+    var onDraftChange: (String) -> Void = { _ in }
 
     #if DEBUG
         var debugAttachments: [Attachment] = []
@@ -1009,6 +1039,7 @@ struct Composer: View {
                             .font(.system(size: 16))
                             .foregroundStyle(Hublot.prose)
                             .focused($isWriting)
+                            .onChange(of: draft) { _, value in onDraftChange(value) }
                             .accessibilityIdentifier("composer-input")
                             .lineLimit(1...6)
                     }

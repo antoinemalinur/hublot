@@ -29,8 +29,14 @@
     struct NavigationFixture: View {
         @State private var model: AppModel
 
-        init() {
-            let transport = NavigationTransport()
+        init(
+            sessionLoadDelay: Duration = .zero,
+            replaysHistory: Bool = false
+        ) {
+            let transport = NavigationTransport(
+                sessionLoadDelay: sessionLoadDelay,
+                replaysHistory: replaysHistory
+            )
             var environment = HublotEnvironment.ephemeral(
                 serverURL: "ws://127.0.0.1:8330", token: "ui-test",
                 makeConnection: { _, _ in ACPConnection(transport: transport) }
@@ -58,6 +64,7 @@
                             turns: chat.turns,
                             documentRevision: chat.documentRevision,
                             machineState: chat.machine,
+                            isLoadingHistory: chat.isLoadingHistory,
                             onBack: { model.closeConversation() },
                             onDictate: { _ in nil }
                         )
@@ -75,11 +82,15 @@
     private actor NavigationTransport: ACPTransport {
         private let stream: AsyncThrowingStream<Data, Error>
         private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+        private let sessionLoadDelay: Duration
+        private let replaysHistory: Bool
 
-        init() {
+        init(sessionLoadDelay: Duration, replaysHistory: Bool) {
             let pair = AsyncThrowingStream<Data, Error>.makeStream()
             stream = pair.stream
             continuation = pair.continuation
+            self.sessionLoadDelay = sessionLoadDelay
+            self.replaysHistory = replaysHistory
         }
 
         var frames: AsyncThrowingStream<Data, Error> { stream }
@@ -113,6 +124,18 @@
                     "exchanges": 3,
                 ]]])
             case "session/load":
+                try? await Task.sleep(for: sessionLoadDelay)
+                if replaysHistory {
+                    update([
+                        "sessionUpdate": "user_message_chunk",
+                        "content": ["type": "text", "text": "Question retrouvée"],
+                    ])
+                    update([
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "replayed-answer",
+                        "content": ["type": "text", "text": "Réponse retrouvée"],
+                    ])
+                }
                 reply(id, ["configOptions": []])
             case "hublot/running":
                 reply(id, ["turns": []])
@@ -126,6 +149,14 @@
         private func reply(_ id: Int, _ result: [String: Any]) {
             guard let data = try? JSONSerialization.data(withJSONObject: [
                 "jsonrpc": "2.0", "id": id, "result": result,
+            ]) else { return }
+            continuation.yield(data)
+        }
+
+        private func update(_ update: [String: Any]) {
+            guard let data = try? JSONSerialization.data(withJSONObject: [
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": ["sessionId": "fil-a-reprendre", "update": update],
             ]) else { return }
             continuation.yield(data)
         }

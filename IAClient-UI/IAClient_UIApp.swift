@@ -104,6 +104,10 @@ struct IAClient_UIApp: App {
                     StreamingPressureFixture()
                 case .projectLoading:
                     ProjectLoadingFixture()
+                case .discussionLoading:
+                    NavigationFixture(
+                        sessionLoadDelay: .seconds(3), replaysHistory: true
+                    )
                 case .chromePlan:
                     ChromeFixture(state: .plan)
                 case .chromeLost:
@@ -247,6 +251,7 @@ struct IAClient_UIApp: App {
                             turns: chat.turns,
                             documentRevision: chat.documentRevision,
                             machineState: chat.machine,
+                            isLoadingHistory: chat.isLoadingHistory,
                             onSend: { text, images in
                                 Task { await chat.send(text, attachments: images) }
                             },
@@ -419,6 +424,7 @@ struct IAClient_UIApp: App {
                             turns: chat.turns,
                             documentRevision: chat.documentRevision,
                             machineState: chat.machine,
+                            isLoadingHistory: chat.isLoadingHistory,
                             onBack: { model.closeConversation() },
                             onDictate: { _ in nil }
                         )
@@ -530,6 +536,7 @@ struct IAClient_UIApp: App {
                         turns: chat.turns,
                         documentRevision: chat.documentRevision,
                         machineState: chat.machine,
+                        isLoadingHistory: chat.isLoadingHistory,
                         onBack: { model.closeConversation() },
                         configOptions: chat.configOptions,
                         status: chat.metrics,
@@ -694,6 +701,7 @@ struct RootView: View {
                         turns: chat.turns,
                         documentRevision: chat.documentRevision,
                         machineState: chat.machine,
+                        isLoadingHistory: chat.isLoadingHistory,
                         onSend: { text, images in
                             Task { await chat.send(text, attachments: images) }
                         },

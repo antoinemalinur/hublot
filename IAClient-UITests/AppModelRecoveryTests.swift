@@ -39,6 +39,33 @@ struct AppModelRecoveryTests {
         #expect(await transport.methods().contains("session/load"))
     }
 
+    @Test("Le shell du fil paraît avant le retour de son historique")
+    func resumeRevealsTheConversationBeforeHistoryReturns() async throws {
+        // Signalé sur l'iPhone le 16 août 2026 : ce délai a toujours existé.
+        // Retenir la réponse reproduit le coût réseau sans préremplir le résultat.
+        let transport = RecoveryTransport(retainSessionLoad: true)
+        let model = AppModel(environment: environment(for: transport))
+        await model.connect()
+        let project = try #require(model.projects.first { $0.name == "recent" })
+        await model.open(project)
+        let summary = try #require(model.sessions.first)
+
+        let opening = Task { await model.resume(summary) }
+        var methods = await transport.methods()
+        for _ in 0..<500 where !methods.contains("session/load") {
+            await Task.yield()
+            methods = await transport.methods()
+        }
+        #expect(methods.contains("session/load"))
+
+        #expect(model.screen == .conversation)
+        #expect(model.chat != nil)
+
+        try await transport.releaseSessionLoad()
+        await opening.value
+        #expect(model.screen == .conversation)
+    }
+
     @Test("Une reprise refusee ramene aux conversations en nommant le fil perdu")
     func failedResumeFallsBackToTheList() async throws {
         let transport = RecoveryTransport(failures: ["session/load"])
@@ -300,11 +327,17 @@ private actor RecoveryTransport: ACPTransport {
     private var recorded: [String] = []
     private var failures: Set<String>
     private let failProjectsAtCall: Int?
+    private let retainSessionLoad: Bool
     private var projectCalls = 0
+    private var heldSessionLoad: Int?
 
-    init(failures: Set<String> = [], failProjectsAtCall: Int? = nil) {
+    init(
+        failures: Set<String> = [], failProjectsAtCall: Int? = nil,
+        retainSessionLoad: Bool = false
+    ) {
         self.failures = failures
         self.failProjectsAtCall = failProjectsAtCall
+        self.retainSessionLoad = retainSessionLoad
     }
 
     var frames: AsyncThrowingStream<Data, Error> {
@@ -362,8 +395,20 @@ private actor RecoveryTransport: ACPTransport {
             )))
             return
         }
+        if retainSessionLoad, method == "session/load" {
+            heldSessionLoad = id
+            return
+        }
         continuation?.yield(try JSONCoding.encoder.encode(RPCReply(
             id: id, result: result(for: method)
+        )))
+    }
+
+    func releaseSessionLoad() async throws {
+        guard let id = heldSessionLoad else { return }
+        heldSessionLoad = nil
+        continuation?.yield(try JSONCoding.encoder.encode(RPCReply(
+            id: id, result: result(for: "session/load")
         )))
     }
 

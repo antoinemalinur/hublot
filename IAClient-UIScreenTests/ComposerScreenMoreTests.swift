@@ -23,13 +23,18 @@ final class ComposerScreenMoreTests: HublotUITestCase {
         XCTAssertTrue(element("streaming-pressure-ready").waitForExistence(timeout: 10))
         input.tap()
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+        XCTAssertTrue(element("streaming-pressure-running").waitForExistence(timeout: 3))
 
         // L'apparition du clavier déclenche la rafale. La valeur et le bouton
-        // vérifient le résultat observable du geste, indépendamment du temps
-        // que les trois autres simulateurs font perdre au pilote XCUITest.
-        input.typeText("prochaine demande")
-        XCTAssertEqual(input.value as? String, "prochaine demande")
-        XCTAssertEqual(element("composer-action").label, "Envoyer le message")
+        // vérifient le résultat observable du geste pendant une vraie réponse
+        // active, indépendamment du temps que les trois autres simulateurs font
+        // perdre au pilote XCUITest.
+        input.typeText("message pendant flux")
+        XCTAssertEqual(input.value as? String, "message pendant flux")
+        XCTAssertTrue(
+            ["Envoyer le message", "Mettre le message en attente"]
+                .contains(element("composer-action").label)
+        )
 
         let complete = element("streaming-pressure-complete")
         XCTAssertTrue(complete.waitForExistence(timeout: 15))
@@ -43,7 +48,7 @@ final class ComposerScreenMoreTests: HublotUITestCase {
             revisions, 40,
             "la rafale a invalidé le document \(revisions) fois"
         )
-        XCTAssertTrue((input.value as? String ?? "").contains("prochaine demande"))
+        XCTAssertTrue((input.value as? String ?? "").contains("message pendant flux"))
     }
 
     /// M3 — au repos le bouton propose la dictée ; dès qu'on écrit, l'envoi.

@@ -28,7 +28,9 @@
                             turns: chat.turns,
                             documentRevision: chat.documentRevision,
                             machineState: chat.machine,
+                            isLoadingHistory: chat.isLoadingHistory,
                             onSend: { _, _ in },
+                            onDraftChange: { model.inputDidChange(to: $0) },
                             onBack: {},
                             activity: chat.activity,
                             activityAt: chat.activityAt,
@@ -78,6 +80,8 @@
         private let transport: StreamingPressureTransport
         private let connection: ACPConnection
         private var started = false
+        private var burstStarted = false
+        private var inputLength = 0
         private var baselineRevision = 0
 
         private(set) var chat: ChatSession?
@@ -126,28 +130,54 @@
         }
 
         func beginBurst() {
-            guard isReady, !isRunning, !isComplete else { return }
-            isRunning = true
+            guard isReady, !burstStarted, !isComplete else { return }
+            burstStarted = true
             Task { await runBurst() }
+        }
+
+        func inputDidChange(to text: String) {
+            guard burstStarted else { return }
+            inputLength = text.count
         }
 
         private func runBurst() async {
             guard let chat else { return }
             await transport.activity(session: Self.sessionID, running: true)
-            for _ in 0..<40 {
-                for _ in 0..<25 {
-                    await transport.message(
-                        session: Self.sessionID, id: "pression", text: "x"
-                    )
-                }
-                try? await Task.sleep(for: .milliseconds(20))
+
+            // Le témoin tactile commence quand le même état que la production
+            // a traversé ACPConnection et ChatSession. Sans cette barrière, le
+            // clavier pouvait gagner ou perdre la course et le bouton oscillait
+            // entre « Envoyer » et « Mettre en attente » selon la charge.
+            for _ in 0..<500 where !chat.isWorking {
+                try? await Task.sleep(for: .milliseconds(2))
             }
+            guard chat.isWorking else { return }
+            isRunning = true
+
+            // XCUITest a vu l'état actif; la première vraie frappe libère la
+            // rafale afin que les caractères suivants soient saisis pendant
+            // son traitement. Les 1 000 trames sont reçues en moins d'une
+            // seconde, conformément au budget mesuré par SC-003.
+            for _ in 0..<1_500 where inputLength == 0 {
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+            guard inputLength > 0 else { return }
+            await transport.messages(
+                session: Self.sessionID, id: "pression", text: "x", count: 1_000
+            )
             // Les deux événements sont des barrières : le texte doit être
             // publié avant la mesure, puis le curseur arrêté avant le bilan.
             await transport.usage(session: Self.sessionID)
+
+            // Garde le tour actif jusqu'à ce que le geste observable soit
+            // complet; sinon une machine rapide pouvait finir la réponse entre
+            // le premier et le dernier caractère.
+            for _ in 0..<1_500 where inputLength < 20 {
+                try? await Task.sleep(for: .milliseconds(2))
+            }
             await transport.activity(session: Self.sessionID, running: false)
 
-            for _ in 0..<500 {
+            for _ in 0..<5_000 {
                 let count = chat.turns.compactMap {
                     if case .assistant(let turn) = $0, turn.id == "pression" {
                         return turn.markdown.count
@@ -203,6 +233,10 @@
                 "sessionUpdate": "agent_message_chunk", "messageId": id,
                 "content": ["type": "text", "text": text],
             ])
+        }
+
+        func messages(session: String, id: String, text: String, count: Int) {
+            for _ in 0..<count { message(session: session, id: id, text: text) }
         }
 
         func usage(session: String) {
@@ -261,6 +295,7 @@
                             turns: chat.turns,
                             documentRevision: chat.documentRevision,
                             machineState: chat.machine,
+                            isLoadingHistory: chat.isLoadingHistory,
                             onBack: { model.closeConversation() }, onDictate: { _ in nil }
                         )
                     }

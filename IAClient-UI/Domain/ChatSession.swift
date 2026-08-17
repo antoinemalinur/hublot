@@ -159,6 +159,10 @@ final class ChatSession {
     private var messageIndex: [String: Int] = [:]
     private var thoughtIndex: [String: Int] = [:]
     private var toolIndex: [String: Int] = [:]
+    /// État d'interface distinct de la nature des morceaux reçus. Il reste vrai
+    /// jusqu'à la barrière FIFO de fin d'historique, même si un battement vivant
+    /// arrive pendant le rejeu et transforme les morceaux suivants en direct.
+    private(set) var isLoadingHistory = false
     /// Vrai tant qu'on rejoue un historique — donc jusqu'au premier envoi.
     private var isReplaying = false
     /// Vrai entre l'envoi et le `stopReason`. C'est ce qui distingue un morceau
@@ -198,6 +202,7 @@ final class ChatSession {
         self.sessionId = sessionId
         self.title = title
         self.status = .ready
+        self.isLoadingHistory = isResuming
         self.isReplaying = isResuming
         // Les plafonds sont ceux de la machine, pas d'une conversation : les
         // reprendre d'emblée évite une barre vide jusqu'au premier tour.
@@ -220,6 +225,7 @@ final class ChatSession {
         pump?.cancel()
         pump = nil
         status = .idle
+        isLoadingHistory = false
         release()
     }
 
@@ -227,7 +233,7 @@ final class ChatSession {
     /// Contrairement à un délai arbitraire, elle reste exacte quelle que soit
     /// la longueur du fil ou la vitesse de l'appareil.
     func finishReplay() async {
-        guard isReplaying, let sessionId, pump != nil else { return }
+        guard isLoadingHistory, let sessionId, pump != nil else { return }
         await withCheckedContinuation { continuation in
             historySettlement = continuation
             Task { await connection.finishHistory(session: sessionId) }
@@ -442,12 +448,14 @@ final class ChatSession {
             case .historyFinished(let id):
                 guard id == sessionId else { continue }
                 flushPendingStream()
+                isLoadingHistory = false
                 isReplaying = false
                 historySettlement?.resume()
                 historySettlement = nil
 
             case .disconnected(let error):
                 flushPendingStream()
+                isLoadingHistory = false
                 status = error.map { .failed($0.localizedDescription) } ?? .idle
                 release()
             }
@@ -455,6 +463,7 @@ final class ChatSession {
         // La boucle ne s'arrête que si la liaison tombe ou si le fil se ferme :
         // dans les deux cas, personne ne doit rester en attente.
         flushPendingStream()
+        isLoadingHistory = false
         release()
     }
 

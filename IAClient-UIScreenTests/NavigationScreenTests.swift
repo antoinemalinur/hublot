@@ -13,6 +13,35 @@ import XCTest
 @MainActor
 final class NavigationScreenTests: HublotUITestCase {
 
+    /// F21 — signalé depuis l'iPhone le 16 août 2026 : ouvrir une discussion
+    /// a toujours laissé la liste immobile pendant environ une seconde. Le
+    /// relais retient ici le rejeu trois secondes pour rendre cette latence
+    /// historique déterministe, puis fournit un vrai contenu ACP.
+    func testDiscussionShellAppearsBeforeItsHistoryReturns() {
+        launch("discussion-loading")
+
+        let project = projectRow("hublot")
+        XCTAssertTrue(project.waitForExistence(timeout: 10))
+        project.tap()
+
+        let session = sessionRow("fil-a-reprendre")
+        XCTAssertTrue(session.waitForExistence(timeout: 10))
+        session.tap()
+
+        // Le nouvel écran répond au doigt; il ne dépend pas de la réponse
+        // réseau qui est encore explicitement retenue par le relais.
+        let back = element("conversation-back")
+        XCTAssertTrue(back.waitForExistence(timeout: 1))
+        expect(back, toContain: "Reprendre le fil", timeout: 1)
+        XCTAssertTrue(element("conversation-loading").exists)
+
+        // Le chargement ne fabrique pas le résultat : le texte attendu traverse
+        // ensuite le vrai décodage, ACPConnection et ChatSession.
+        XCTAssertTrue(labelled("Réponse retrouvée").waitForExistence(timeout: 6))
+        XCTAssertTrue(element("conversation-loading").waitForNonExistence(timeout: 1))
+        XCTAssertTrue(element("composer-input").exists)
+    }
+
     /// P8 — signalé depuis l'iPhone le 15 août 2026 : entrer dans un dépôt
     /// additionnait deux attentes réseau et la destination restait vide. Le
     /// relais retient liste et instructions trois secondes; l'écran doit donc

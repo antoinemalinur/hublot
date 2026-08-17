@@ -42,6 +42,7 @@
         case threadGrowing = "thread-growing"
         case streamingPressure = "streaming-pressure"
         case projectLoading = "project-loading"
+        case discussionLoading = "discussion-loading"
         case chromePlan = "chrome-plan"
         case chromeLost = "chrome-lost"
         case chromeQuiet = "chrome-quiet"

@@ -94,11 +94,24 @@ before either retained network response.
   394 s: four distinct workers, no failure or skip, 92.3% overall coverage,
   critical files at or above 90%, 72 server tests green, and Release build
   successful.
+- 2026-08-16: the discussion-opening follow-up first failed at the domain seam
+  with the sessions screen still visible; restoring the old await order then
+  made the UI regression fail on the still-visible back control after one
+  second. The final, user-approved exceptional run
+  `HUBLOT_WORKERS=2 Tools/test-local.sh full` succeeded in 465 s on iPhone Air /
+  iOS 26.5: 241/241 tests passed with no failure or skip, two distinct clones,
+  92.3% overall coverage, critical files at or above 90%, 72 server tests green,
+  and the Release build successful.
 - Device exception requested by the user: the signed build was installed on
   “iPhone de Antoine Malinur” before the complete gate ended. Automatic launch
   first met the locked device, then the phone disconnected; the real-device
   navigation/keyboard/scroll smoke check remains unavailable, so T019 stays
   open.
+- 2026-08-16: after the successful two-worker gate, `Tools/deploy-iphone.sh`
+  built, installed and launched the signed application on the connected iPhone.
+  The terminal can attest installation and launch, but not the tactile
+  navigation/keyboard/scroll smoke check; T019 therefore remains open pending
+  confirmation on the physical screen.
 
 ## Dependencies & execution order
 
@@ -114,3 +127,14 @@ Ship no partial slice. US1 removes main-thread pressure, US2 removes perceived
 navigation latency, and US3 proves the gains persist at realistic history size.
 The complete local gate precedes device deployment, which precedes PR creation and
 squash merge.
+
+## Phase 6: Convergence
+
+- [x] T021 CRITICAL Add a retained `session/load` domain seam and deterministic
+  discussion-opening XCTest that taps the real row, observes the conversation
+  shell/loading state before the reply, then observes the replayed content per
+  Constitution II–IV and FR-010
+- [x] T022 Reveal the prepared `ChatSession` immediately from `AppModel.resume`,
+  expose an accessible history-loading state without showing progressive replay,
+  preserve back/failure behavior, and prove the pre-fix await order turns T021
+  red per FR-009 and plan performance goals

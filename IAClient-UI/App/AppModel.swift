@@ -403,19 +403,24 @@ final class AppModel {
             sessionId: open.sessionId, cwd: open.cwd, title: open.title,
             setup: nil, isResuming: true
         ) else { return }
+        // La destination existe dès que son consommateur est prêt. Le rejeu
+        // reste masqué par son propre état de chargement jusqu'à la barrière.
+        reveal(session, sessionId: open.sessionId, cwd: open.cwd, title: open.title)
         do {
             let setup = try await connection.call(
                 "session/load",
                 LoadSessionParams(sessionId: open.sessionId, cwd: open.cwd),
                 as: SessionSetup.self
             )
+            guard chat === session else {
+                await session.disconnect()
+                return
+            }
             session.apply(setup)
             await session.finishReplay()
-            reveal(
-                session, sessionId: open.sessionId, cwd: open.cwd, title: open.title
-            )
         } catch {
             await session.disconnect()
+            guard chat === session else { return }
             // On retombe sur la liste des conversations : un écran vide n'est
             // jamais une réponse acceptable à un échec.
             log.error("reprise du fil impossible : \(error.localizedDescription, privacy: .public)")
@@ -578,26 +583,31 @@ final class AppModel {
 
         // Le consommateur est ouvert AVANT la demande : l'agent rejoue
         // l'historique par `session/update` avant de répondre à `session/load`.
-        // L'écran, lui, ne paraît qu'après la barrière de fin de rejeu.
         guard let session = await prepare(
             sessionId: summary.sessionId, cwd: cwd, title: summary.displayTitle,
             setup: nil, isResuming: true
         ) else { return }
-
+        // Le toucher change d'écran maintenant. Le document reste remplacé par
+        // un chargement stable jusqu'à la barrière de fin de rejeu.
+        reveal(
+            session, sessionId: summary.sessionId, cwd: cwd,
+            title: summary.displayTitle
+        )
         do {
             let setup = try await connection.call(
                 "session/load",
                 LoadSessionParams(sessionId: summary.sessionId, cwd: cwd),
                 as: SessionSetup.self
             )
+            guard chat === session else {
+                await session.disconnect()
+                return
+            }
             session.apply(setup)
             await session.finishReplay()
-            reveal(
-                session, sessionId: summary.sessionId, cwd: cwd,
-                title: summary.displayTitle
-            )
         } catch {
             await session.disconnect()
+            guard chat === session else { return }
             closeConversation()
             failure = "« \(summary.displayTitle) » : \(error.localizedDescription)"
         }

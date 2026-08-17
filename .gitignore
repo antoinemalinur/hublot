@@ -3,6 +3,9 @@ build/
 *.xcuserdatad/
 xcuserdata/
 .swiftpm/
+.build/
+DerivedData/
+Packages/
 node_modules/
 __pycache__/
 *.py[cod]
